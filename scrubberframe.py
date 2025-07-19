@@ -11,13 +11,14 @@ from tagpanel import TagPanel
 
 class ScrubberFrame(wx.Frame):
     __boxes: List[BoxData] = []  # Or load from your data source
+    __image_panel: ImagePanel
 
     @property
     def current_index(self) -> int:
         return self._current_index
 
     def __init__(self, parent: wx.Panel, title: str, num_frames: int):
-        super().__init__(parent, title=title, size=(800, 600))
+        super().__init__(parent, title=title, size=wx.Size(800, 600))
 
         self._current_index = 0
         self._rotation_angle = 0
@@ -29,17 +30,19 @@ class ScrubberFrame(wx.Frame):
 
         image_and_tag_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
-        self.image_panel = ImagePanel(main_panel)
+        self.__image_panel = ImagePanel(main_panel)
+        # self.image_panel.Bind(EVT_BOX_ADDED, self.image_box_added)
 
-        image_and_tag_sizer.Add(self.image_panel, 1, wx.EXPAND | wx.ALL, 10)
+        image_and_tag_sizer.Add(self.__image_panel, 1, wx.EXPAND | wx.ALL, 10)
 
         self.tag_panel = TagPanel(
             main_panel,
-            self.__boxes,
-            self.image_panel.on_delete_box,
-            self.image_panel.on_add_tag,
-            self.image_panel.on_remove_tag
+            self.__boxes
         )
+        print(f'ScrubberFrame.__init__: TagPanel referencing {hex(id(self.__boxes))}=>{self.__boxes}')
+        self.tag_panel.bind_box_events(self.__image_panel)
+        # self.image_panel.Bind(EVT_BOX_ADDED, self.tag_panel.Refresh)
+
         image_and_tag_sizer.Add(self.tag_panel, 0, wx.EXPAND | wx.ALL, 10)
 
         vbox.Add(image_and_tag_sizer, 1, wx.EXPAND | wx.ALL, 5)
@@ -70,11 +73,11 @@ class ScrubberFrame(wx.Frame):
         img = self.get_frame(self._current_index, self._rotation_angle)
         if img is None:
             return
-        panel_size = self.image_panel.GetSize()
+        panel_size = self.__image_panel.GetSize()
         if panel_size.GetWidth() < 10 or panel_size.GetHeight() < 10:
             return  # Panel not yet sized, skip
 
-        self.image_panel.set_image(img, self._rotation_angle)
+        self.__image_panel.set_image(img, self._rotation_angle)
         self.slider.SetValue(self._current_index)
         self.Refresh()
 
@@ -98,12 +101,12 @@ class ScrubberFrame(wx.Frame):
 
     def on_rotate_cw(self, event: wx.CommandEvent) -> None:
         self._rotation_angle = (self._rotation_angle + 90) % 360
-        self.image_panel.rotate_boxes(self._rotation_angle)
+        self.__image_panel.rotate_boxes(self._rotation_angle)
         self.display_image()
 
     def on_rotate_ccw(self, event: wx.CommandEvent) -> None:
         self._rotation_angle = (self._rotation_angle - 90) % 360
-        self.image_panel.rotate_boxes(self._rotation_angle)
+        self.__image_panel.rotate_boxes(self._rotation_angle)
         self.display_image()
 
     def on_show(self, event):
@@ -118,10 +121,10 @@ class ScrubberFrame(wx.Frame):
         shift_down = event.ShiftDown()
         # Ctrl+Z for undo
         if control_down and keycode == ord('Z') and not shift_down:
-            self.image_panel.undo()
+            self.__image_panel.undo()
         # Ctrl+Shift+Z for redo
         elif control_down and keycode == ord('Z') and shift_down:
-            self.image_panel.redo()
+            self.__image_panel.redo()
         else:
             event.Skip()
 

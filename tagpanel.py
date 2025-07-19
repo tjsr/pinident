@@ -1,22 +1,22 @@
 import wx
-from typing import Callable, List
+from typing import List
 
 from boxdata import BoxData
 from boxtagpanel import BoxTagPanelEdit
+from events.BoxEditedEvent import BoxEditedEvent
+from events.BoxRemovedEvent import BoxRemovedEvent
+from events.BoxUpdatedEvent import BoxUpdatedEvent
+from imagepanel import ImagePanel
+from events.BoxAddedEvent import BoxAddedEvent
+from events.events import EVT_BOX_UPDATED, EVT_BOX_ADDED, EVT_BOX_REMOVED, EVT_BOX_EDITED, wxEVT_BOX_ADDED
 
 
-class TagPanel(wx.Panel):
+class TagPanel(wx.Panel, wx.PyEventBinder):
     boxes: List[BoxData]
     __box_panels: List[BoxTagPanelEdit] = []
-    # on_delete_box: Callable[[BoxData], None]
-    on_add_tag: Callable[[BoxData, int, str], None]
-    on_remove_tag: Callable[[BoxData, int, str], None]
-    __on_box_updated: Callable[[BoxData], None]
-    __on_boxes_updated: Callable[[], None]
 
     vbox: wx.BoxSizer
-    box_sizers: List[wx.BoxSizer]
-    tag_sizers: List[wx.BoxSizer]
+    __box_sizers: List[wx.BoxSizer]
     pin_cb: wx.CheckBox
     set_cb: wx.CheckBox
     card_cb: wx.CheckBox
@@ -24,25 +24,14 @@ class TagPanel(wx.Panel):
     def __init__(
         self,
         parent: wx.Window,
-        boxes: List[BoxData],
-        on_delete_box: Callable[[BoxData], None],
-        on_add_tag: Callable[[BoxData, int, str], None],
-        on_remove_tag: Callable[[BoxData, int, str], None]
+        boxes: List[BoxData]
     ) -> None:
         super().__init__(parent)
         self.boxes = boxes
-        self.on_delete_box = on_delete_box
-        self.on_add_tag = on_add_tag
-        self.on_remove_tag = on_remove_tag
 
         self.vbox = wx.BoxSizer(wx.VERTICAL)
-        self.box_sizers = []
-        self.heading_texts = []
-        self.del_buttons = []
-        self.tag_sizers = []
-        self.combo_boxes = []
-        self.rem_buttons = []
-        self.add_buttons = []
+        self.__box_sizers = []
+        self.__box_panels = []
 
         self.pin_cb = wx.CheckBox(self, label="Contains pin")
         self.set_cb = wx.CheckBox(self, label="Contains set")
@@ -55,27 +44,39 @@ class TagPanel(wx.Panel):
         self.set_ui()
         self.SetSizer(self.vbox)
 
+    def find_panel_for_box(self, box: BoxData) -> BoxTagPanelEdit:
+        """Find the BoxTagPanelEdit for a given box."""
+        for panel in self.__box_panels:
+            if panel.is_box(box):
+                return panel
+        raise ValueError("No BoxTagPanelEdit found for the given box.")
+
     def set_ui(self) -> None:
         # Remove all box/tag controls but keep checkboxes
-        for sizer in self.box_sizers:
+        for sizer in self.__box_sizers:
             self.vbox.Remove(sizer)
-        self.box_sizers.clear()
-        self.heading_texts.clear()
-        self.del_buttons.clear()
-        self.tag_sizers.clear()
-        self.combo_boxes.clear()
-        self.rem_buttons.clear()
-        self.add_buttons.clear()
+        self.__box_sizers.clear()
 
         while len(self.__box_panels) > 0:
             panel = self.__box_panels.pop()
             panel.Destroy()
 
+        box_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        print(f'TagPanel.set_ui: Creating UI for {len(self.boxes)} boxes from {hex(id(self.boxes))}')
+
         for idx, box in enumerate(self.boxes):
-            box_tag_panel = BoxTagPanelEdit(self, box)
-            self.__box_panels.append(box_tag_panel)
-            box_sizer = wx.BoxSizer(wx.VERTICAL)
+            try:
+                box_tag_panel = self.find_panel_for_box(box)
+                print(f'TagPanel.set_ui: Reusing panel for box {idx+1} with coords {box.coords}')
+            except ValueError:
+                print(f'TagPanel.set_ui: Creating new panel for box {idx+1} with coords {box.coords}')
+                # If no existing panel found, create a new one
+                box_tag_panel = BoxTagPanelEdit(self, box)
+                self.__box_panels.append(box_tag_panel)
+                box_tag_panel.Bind(EVT_BOX_EDITED, self.__on_box_edited)
             box_sizer.Add(box_tag_panel, 0, wx.EXPAND)
+
 
             # coords: Tuple[int, int, int, int] = box['coords']
             # heading = wx.StaticText(self, label=f"Box {idx+1}: x={coords[0]}, y={coords[1]}, w={coords[2]}, h={coords[3]}")
@@ -103,7 +104,7 @@ class TagPanel(wx.Panel):
             # tag_sizer.Add(add_btn, 0, wx.ALL, 2)
             # box_sizer.Add(tag_sizer, 0, wx.EXPAND)
             #
-            self.box_sizers.append(box_sizer)
+            self.__box_sizers.append(box_sizer)
             # self.heading_texts.append(heading)
             # self.del_buttons.append(del_btn)
             # self.tag_sizers.append(tag_sizer)
@@ -117,3 +118,45 @@ class TagPanel(wx.Panel):
     def update_boxes(self, boxes: List[BoxData]) -> None:
         self.boxes = boxes
         self.set_ui()
+
+    def update_box(self, box: BoxData) -> None:
+        """Update a specific box."""
+        try:
+            box_panel = self.find_panel_for_box(box)
+            box_panel.repaint_box()
+        except ValueError:
+            raise ValueError("Box not found in current panels.")
+
+    def __on_box_edited(self, event: BoxEditedEvent) -> None:
+        """Handle box edited event."""
+        self.update_box(event.box)
+
+    def __on_boxes_updated(self, event: BoxUpdatedEvent) -> None:
+        """Handle box edited event."""
+        self.update_boxes(event.boxes)
+
+    def __on_box_added(self, event: BoxAddedEvent) -> None:
+        """Handle box updated event."""
+        print(f'TagPanel.__on_box_added has self.__boxes {hex(id(self.boxes))} and event {type(event)} {event.GetEventType()} {wxEVT_BOX_ADDED}')
+        if isinstance(event, BoxAddedEvent):
+            print(f'TagPanel.__on_box_added: Adding box {event.box.coords} to panel')
+            self.boxes.append(event.box)
+        else:
+            print(f'TagPanel.__on_box_added: event parameter is not a BoxAddedEvent, skipping')
+        self.set_ui()
+
+    def __on_box_removed(self, event: BoxRemovedEvent) -> None:
+        """Handle box removed event."""
+        try:
+            box_panel = self.find_panel_for_box(event.box)
+            box_panel.Destroy()
+            self.__box_panels.remove(box_panel)
+            self.set_ui()
+        except ValueError:
+            pass
+
+    def bind_box_events(self, image_panel: ImagePanel) -> None:
+        """Bind box events to the image panel."""
+        image_panel.Bind(EVT_BOX_ADDED, self.__on_box_added)
+        image_panel.Bind(EVT_BOX_REMOVED, self.__on_box_removed)
+        image_panel.Bind(EVT_BOX_UPDATED, self.__on_boxes_updated)

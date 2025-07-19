@@ -3,7 +3,7 @@ import wx
 
 class MarkerPanel(wx.Panel):
     def __init__(self, parent, num_images, interval=5):
-        super().__init__(parent, size=(-1, 30))
+        super().__init__(parent, size=wx.Size(-1, 30))
         self.num_images = num_images
         self.interval = interval
         self.Bind(wx.EVT_PAINT, self.on_paint)

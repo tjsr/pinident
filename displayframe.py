@@ -1,11 +1,16 @@
 import wx
 import cv2
 import os
+
+from markerpanel import MarkerPanel
+
+DEFAULT_IMAGE_HEIGHT:int = 600
+DEFAULT_IMAGE_WIDTH:int = 800
 # import numpy as np
 
 class ImageScrubber(wx.Frame):
-    def __init__(self, parent, title, image_dir):
-        super().__init__(parent, title=title, size=(800, 600))
+    def __init__(self, parent, title, image_dir, image_height=DEFAULT_IMAGE_HEIGHT, image_width=DEFAULT_IMAGE_WIDTH):
+        super().__init__(parent, title=title, size=wx.Size(image_width, image_height))
         self.image_dir = image_dir
         self.image_files = [f for f in os.listdir(image_dir) if f.lower().endswith('.jpg')]
         self.image_files.sort()

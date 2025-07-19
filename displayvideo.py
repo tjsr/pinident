@@ -1,6 +1,6 @@
 import wx
 
-from imagescrubber import ImageScrubber
+# from imagescrubber import ImageScrubber
 from videoscrubber import VideoScrubber
 
 file_name: str = "e:\\pindev\\PXL_20250715_015847092.mp4"

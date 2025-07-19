@@ -3,9 +3,14 @@ import wx
 import copy
 
 from boxdata import BoxData
+from events.BoxAddedEvent import BoxAddedEvent
+from events.BoxUpdatedEvent import BoxUpdatedEvent
 
+RotationAngle = int
+ImageSize = tuple[int, int] # (width, height)
+UserAction = str  # 'draw_box', 'rotate', etc.
 
-class ImagePanel(wx.Panel):
+class ImagePanel(wx.Panel, wx.PyEventBinder):
     image: np.ndarray | None
     bitmap: wx.Bitmap | None
     __boxes: list[BoxData]
@@ -13,11 +18,11 @@ class ImagePanel(wx.Panel):
     start_pos: wx.Point | None
     end_pos: wx.Point | None
     scale: float
-    img_size: tuple[int, int]
-    bmp_size: tuple[int, int]
-    rotation_angle: int
-    undo_stack: list[tuple[str, int, list] | tuple[str, list]]
-    redo_stack: list[tuple[str, int, list] | tuple[str, list]]
+    img_size: ImageSize
+    bmp_size: ImageSize
+    rotation_angle: RotationAngle
+    undo_stack: list[tuple[UserAction, RotationAngle, list[BoxData]] | tuple[UserAction, list[BoxData]]]
+    redo_stack: list[tuple[UserAction, RotationAngle, list[BoxData]] | tuple[UserAction, list[BoxData]]]
 
     def __init__(self, parent: wx.Window):
         super().__init__(parent)
@@ -94,6 +99,8 @@ class ImagePanel(wx.Panel):
 
         self.__boxes = new_boxes
         self.rotation_angle = new_angle
+        update_event = BoxUpdatedEvent(self, self.__boxes)
+        wx.PostEvent(self, update_event)
         self.Refresh()
 
     def get_image_offset(self) -> tuple[int, int]:
@@ -154,9 +161,8 @@ class ImagePanel(wx.Panel):
             )
             self.undo_stack.append(('draw_box', copy.deepcopy(self.__boxes)))
             self.redo_stack.clear()
-            self.__boxes.append(BoxData(coords, []))
+            self.add_new_box(coords)
             self.dragging = False
-            self.Refresh()
 
     def on_motion(self, event: wx.MouseEvent):
         if self.dragging and event.Dragging() and event.LeftIsDown():
@@ -215,10 +221,23 @@ class ImagePanel(wx.Panel):
         if action[0] == 'draw_box':
             self.redo_stack.append(('draw_box', copy.deepcopy(self.__boxes)))
             self.__boxes = copy.deepcopy(action[1])
+            # box_removed_event = BoxRemovedEvent(self, box)
+            # wx.PostEvent(self, box_removed_event)
         elif action[0] == 'rotate':
             self.redo_stack.append(('rotate', self.rotation_angle, copy.deepcopy(self.__boxes)))
             self.rotation_angle = action[1]
             self.__boxes = copy.deepcopy(action[2])
+        update_event = BoxUpdatedEvent(self, self.__boxes)
+        wx.PostEvent(self, update_event)
+        self.Refresh()
+
+    def add_new_box(self, coords: tuple[int, int, int, int]) -> None:
+        """Add a new box with the given coordinates."""
+        new_box = BoxData(coords, [])
+        self.__boxes.append(new_box)
+        box_added_event = BoxAddedEvent(self, new_box)
+        print("ImagePanel.add_new_box: New box added:", new_box, box_added_event)
+        wx.PostEvent(self, box_added_event)
         self.Refresh()
 
     def redo(self):

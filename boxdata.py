@@ -2,6 +2,9 @@ Coordinate = tuple[int, int, int, int]
 TagLabel = str
 
 class BoxData:
+    _tags: list[TagLabel]
+    _coords: Coordinate
+
     def __init__(self, coords: Coordinate, tags: list[TagLabel]):
         self._coords = coords
         self._tags = tags
@@ -27,3 +30,10 @@ class BoxData:
         if 0 <= index < len(self._tags):
             return self._tags[index]
         raise IndexError("Tag index out of range")
+
+    def set_tag(self, index: int, tag: TagLabel) -> None:
+        """Set the tag at the specified index."""
+        if 0 <= index < len(self._tags):
+            self._tags[index] = tag
+        else:
+            raise IndexError("Tag index out of range")
