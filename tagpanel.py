@@ -16,7 +16,8 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
     __box_panels: List[BoxTagPanelEdit] = []
 
     vbox: wx.BoxSizer
-    __box_sizers: List[wx.BoxSizer]
+    # __box_sizers: List[wx.BoxSizer]
+    __box_sizer: wx.BoxSizer
     pin_cb: wx.CheckBox
     set_cb: wx.CheckBox
     card_cb: wx.CheckBox
@@ -30,19 +31,21 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         self.boxes = boxes
 
         self.vbox = wx.BoxSizer(wx.VERTICAL)
-        self.__box_sizers = []
+        # self.__box_sizers = []
         self.__box_panels = []
 
         self.pin_cb = wx.CheckBox(self, label="Contains pin")
         self.set_cb = wx.CheckBox(self, label="Contains set")
         self.card_cb = wx.CheckBox(self, label="With backing card")
+        self.__box_sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.vbox.Add(self.pin_cb, 0, wx.ALL, 5)
         self.vbox.Add(self.set_cb, 0, wx.ALL, 5)
         self.vbox.Add(self.card_cb, 0, wx.ALL, 5)
+        self.vbox.Add(self.__box_sizer, 1, wx.EXPAND | wx.ALL, 5)
 
         self.set_ui()
-        self.SetSizer(self.vbox)
+        self.SetSizerAndFit(self.vbox)
 
     def find_panel_for_box(self, box: BoxData) -> BoxTagPanelEdit:
         """Find the BoxTagPanelEdit for a given box."""
@@ -53,17 +56,18 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
 
     def set_ui(self) -> None:
         # Remove all box/tag controls but keep checkboxes
-        for sizer in self.__box_sizers:
-            self.vbox.Remove(sizer)
-        self.__box_sizers.clear()
+        # for sizer in self.__box_sizers:
+        #     self.vbox.Remove(sizer)
+        # self.__box_sizers.clear()
 
         while len(self.__box_panels) > 0:
             panel = self.__box_panels.pop()
             panel.Destroy()
 
-        box_sizer = wx.BoxSizer(wx.VERTICAL)
-
         print(f'TagPanel.set_ui: Creating UI for {len(self.boxes)} boxes from {hex(id(self.boxes))}')
+
+        self.__box_sizer.Clear(True)
+        self.__box_panels.clear()
 
         for idx, box in enumerate(self.boxes):
             try:
@@ -75,7 +79,8 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
                 box_tag_panel = BoxTagPanelEdit(self, box)
                 self.__box_panels.append(box_tag_panel)
                 box_tag_panel.Bind(EVT_BOX_EDITED, self.__on_box_edited)
-            box_sizer.Add(box_tag_panel, 0, wx.EXPAND)
+            self.__box_sizer.Add(box_tag_panel, 0, wx.EXPAND | wx.ALL, 2)
+            # self.__box_sizers.append(box_sizer)
 
 
             # coords: Tuple[int, int, int, int] = box['coords']
@@ -104,7 +109,6 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
             # tag_sizer.Add(add_btn, 0, wx.ALL, 2)
             # box_sizer.Add(tag_sizer, 0, wx.EXPAND)
             #
-            self.__box_sizers.append(box_sizer)
             # self.heading_texts.append(heading)
             # self.del_buttons.append(del_btn)
             # self.tag_sizers.append(tag_sizer)
@@ -112,7 +116,7 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
             # self.rem_buttons.append(rem_btn_list)
             # self.add_buttons.append(add_btn)
 
-            self.vbox.Add(box_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        self.vbox.Layout()
         self.Layout()
 
     def update_boxes(self, boxes: List[BoxData]) -> None:

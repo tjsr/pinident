@@ -85,7 +85,7 @@ class BoxTagPanelEdit(wx.Panel):
     ):
         super().__init__(parent)
         self.__box = box
-        self.__heading_text = wx.StaticText(parent, label=f"Box: {box.coords}")
+        self.__heading_text = wx.StaticText(self, label=f"Box: {box.coords}")
 
     def repaint_box(self) -> None:
         tag_index: int = 0
