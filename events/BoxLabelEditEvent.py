@@ -11,6 +11,7 @@ class BoxLabelEditedEvent(wx.CommandEvent):
 	"""Custom event for box label updates."""
 	def __init__(self, source: wx.Panel, label_index: int, new_label: TagLabel):
 		super().__init__(wxEVT_BOX_LABEL_EDITED, source.GetId())
+		self.SetEventObject(source)
 		self.__new_label = new_label
 		self._label_index = label_index
 

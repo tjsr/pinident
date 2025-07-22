@@ -12,7 +12,7 @@ from events.events import EVT_BOX_UPDATED, EVT_BOX_ADDED, EVT_BOX_REMOVED, EVT_B
 
 
 class TagPanel(wx.Panel, wx.PyEventBinder):
-    boxes: List[BoxData]
+    boxes: List[BoxData] | None
     __box_panels: List[BoxTagPanelEdit] = []
 
     vbox: wx.BoxSizer
@@ -24,11 +24,10 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
 
     def __init__(
         self,
-        parent: wx.Window,
-        boxes: List[BoxData]
+        parent: wx.Window
     ) -> None:
         super().__init__(parent)
-        self.boxes = boxes
+        self.boxes = None
 
         self.vbox = wx.BoxSizer(wx.VERTICAL)
         # self.__box_sizers = []
@@ -64,14 +63,17 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
             panel = self.__box_panels.pop()
             panel.Destroy()
 
-        print(f'TagPanel.set_ui: Creating UI for {len(self.boxes)} boxes from {hex(id(self.boxes))}')
-
         self.__box_sizer.Clear(True)
         self.__box_panels.clear()
+
+        if self.boxes is None:
+            print('TagPanel.set_ui: No boxes to display')
+            return
 
         for idx, box in enumerate(self.boxes):
             try:
                 box_tag_panel = self.find_panel_for_box(box)
+                self.__box_sizer.Detach(box_tag_panel)
                 print(f'TagPanel.set_ui: Reusing panel for box {idx+1} with coords {box.coords}')
             except ValueError:
                 print(f'TagPanel.set_ui: Creating new panel for box {idx+1} with coords {box.coords}')
@@ -124,6 +126,7 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         self.set_ui()
 
     def update_box(self, box: BoxData) -> None:
+        print(f'TagPanel.update_box: Updating box {box.coords} in TagPanel with {len(self.boxes)} boxes')
         """Update a specific box."""
         try:
             box_panel = self.find_panel_for_box(box)
@@ -133,6 +136,7 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
 
     def __on_box_edited(self, event: BoxEditedEvent) -> None:
         """Handle box edited event."""
+        print('TagPanel.__on_box_edited', f'Box {event.box} edited in {event.GetEventObject()}')
         self.update_box(event.box)
 
     def __on_boxes_updated(self, event: BoxUpdatedEvent) -> None:

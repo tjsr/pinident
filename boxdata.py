@@ -25,7 +25,7 @@ class BoxData:
     def tags(self, value: list[TagLabel]) -> None:
         self._tags = value
 
-    def GetTag(self, index: int) -> TagLabel:
+    def get_tag(self, index: int) -> TagLabel:
         """Get the tag at the specified index."""
         if 0 <= index < len(self._tags):
             return self._tags[index]
@@ -37,3 +37,8 @@ class BoxData:
             self._tags[index] = tag
         else:
             raise IndexError("Tag index out of range")
+
+    def add_tag(self, tag: TagLabel) -> int:
+        """Add a new tag to the box."""
+        self._tags.append(tag)
+        return len(self._tags)

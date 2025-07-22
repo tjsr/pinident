@@ -1,5 +1,8 @@
+import json
+
 import wx
 
+from boxdata import BoxData
 # from imagescrubber import ImageScrubber
 from videoscrubber import VideoScrubber
 
@@ -12,5 +15,6 @@ if __name__ == '__main__':
     # For video:
     frame = VideoScrubber(None, 'Pinny Arcade video pin tagging tool', file_name)
     frame.get_frame(1)
+    frame.load_box_data()
     frame.Show()
     app.MainLoop()

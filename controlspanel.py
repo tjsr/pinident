@@ -20,3 +20,9 @@ class ControlsPanel(wx.Panel):
         self.next_btn.Bind(wx.EVT_BUTTON, next_handler)
         self.rotate_ccw_btn.Bind(wx.EVT_BUTTON, rotate_ccw_handler)
         self.rotate_cw_btn.Bind(wx.EVT_BUTTON, rotate_cw_handler)
+
+    def set_prev_enabled(self, enabled: bool):
+        self.prev_btn.Enable(enabled)
+
+    def set_next_enabled(self, enabled: bool):
+        self.next_btn.Enable(enabled)

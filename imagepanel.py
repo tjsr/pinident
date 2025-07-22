@@ -70,47 +70,27 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self.Refresh()
 
     def rotate_boxes(self, new_angle: int) -> None:
-        # Save current state for undo
+        # Store undo state
         self.undo_stack.append(('rotate', self.rotation_angle, copy.deepcopy(self.__boxes)))
         self.redo_stack.clear()
 
-        """Rotate all boxes to match the new image rotation."""
-        angle_diff = (new_angle - self.rotation_angle) % 360
-        w, h = self.img_size
-        def rotate_point(x: int, y: int) -> tuple[int, int]:
-            if angle_diff == 90:
-                return h - y - 1, x
-            elif angle_diff == 180:
-                return w - x - 1, h - y - 1
-            elif angle_diff == 270:
-                return y, w - x - 1
-            else:
-                return x, y
-
-        new_boxes: list[BoxData] = []
-        for box in self.__boxes:
-            coords = box.coords
-            x1, y1 = coords[0], coords[1]
-            x2, y2 = coords[0] + coords[2], coords[1] + coords[3]
-            new_start = rotate_point(x1, y1)
-            new_end = rotate_point(x2, y2)
-            new_coords = (new_start[0], new_start[1], new_end[0] - new_start[0], new_end[1] - new_start[1])
-            new_boxes.append(BoxData(new_coords, box.tags.copy()))
-
-        self.__boxes = new_boxes
+        # Only update the rotation angle
         self.rotation_angle = new_angle
+
+        # Trigger box update event and refresh
         update_event = BoxUpdatedEvent(self, self.__boxes)
         wx.PostEvent(self, update_event)
         self.Refresh()
 
     def get_image_offset(self) -> tuple[int, int]:
-        """Return the (x, y) offset of the image inside the panel."""
+        """Return the (x, y) offset of the image inside the panel, accounting for rotation."""
         panel_w: int = self.GetSize().GetWidth()
         panel_h: int = self.GetSize().GetHeight()
-        img_w: int = self.bmp_size[0]
-        img_h: int = self.bmp_size[1]
-        offset_x: int = (panel_w - img_w) // 2
-        offset_y: int = (panel_h - img_h) // 2
+        bmp_w, bmp_h = self.bmp_size
+        if self.rotation_angle in (90, 270):
+            bmp_w, bmp_h = bmp_h, bmp_w
+        offset_x: int = (panel_w - bmp_w) // 2
+        offset_y: int = (panel_h - bmp_h) // 2
         return offset_x, offset_y
 
     def clamp_to_image(self, x: int, y: int) -> tuple[int, int]:
@@ -178,28 +158,42 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         dc = wx.BufferedPaintDC(self)
         dc.Clear()
         if self.bitmap:
-            dc.DrawBitmap(self.bitmap, (self.GetSize().GetWidth() - self.bmp_size[0]) // 2,
-                          (self.GetSize().GetHeight() - self.bmp_size[1]) // 2)
-            # Draw boxes
+            offset_x, offset_y = self.get_image_offset()
+            dc.DrawBitmap(self.bitmap, offset_x, offset_y)
+            # Swap image and bitmap dimensions for 90/270 degree rotations
+            img_w, img_h = self.img_size
+            bx, by = self.bmp_size
+            if self.rotation_angle in (90, 270):
+                img_w, img_h = img_h, img_w
+                bx, by = by, bx
             for box in self.__boxes:
-                coords = box.coords
-                bx, by = self.bmp_size
-                iw, ih = self.img_size
+                coords = box.coords  # (x, y, w, h) in original image space
 
-                def to_bmp_coords(ix, iy):
-                    bmp_x = int(ix / iw * bx)
-                    bmp_y = int(iy / ih * by)
-                    return bmp_x, bmp_y
+                def rotate_point(x, y, w, h, angle, orig_w, orig_h):
+                    if angle == 90:
+                        return orig_h - y - h, x, h, w
+                    elif angle == 180:
+                        return orig_w - x - w, orig_h - y - h, w, h
+                    elif angle == 270:
+                        return y, orig_w - x - w, h, w
+                    else:
+                        return x, y, w, h
 
-                bmp_start = to_bmp_coords(coords[0], coords[1])
-                bmp_end = to_bmp_coords(coords[0] + coords[2], coords[1] + coords[3])
-                offset_x = (self.GetSize().GetWidth() - bx) // 2
-                offset_y = (self.GetSize().GetHeight() - by) // 2
-                rect = wx.Rect(bmp_start[0] + offset_x, bmp_start[1] + offset_y,
-                               bmp_end[0] - bmp_start[0], bmp_end[1] - bmp_start[1])
+                # Use original image size for rotation
+                x, y, w, h = rotate_point(coords[0], coords[1], coords[2], coords[3], self.rotation_angle,
+                                          self.img_size[0], self.img_size[1])
+
+                # Map image coordinates to bitmap coordinates using swapped dimensions
+                bmp_x1 = int(x / img_w * bx)
+                bmp_y1 = int(y / img_h * by)
+                bmp_x2 = int((x + w) / img_w * bx)
+                bmp_y2 = int((y + h) / img_h * by)
+
+                rect = wx.Rect(bmp_x1 + offset_x, bmp_y1 + offset_y, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
                 dc.SetPen(wx.Pen(wx.RED, 2))
                 dc.SetBrush(wx.TRANSPARENT_BRUSH)
                 dc.DrawRectangle(rect)
+
             # Draw current drag box
             if self.dragging and self.start_pos and self.end_pos:
                 offset_x, offset_y = self.get_image_offset()
@@ -213,6 +207,22 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 dc.SetBrush(wx.TRANSPARENT_BRUSH)
                 dc.DrawRectangle(rect)
 
+    # def to_original_image_coords(x: int, y: int) -> tuple[int, int]:
+    #     bx, by = self.bmp_size
+    #     iw, ih = self.img_size
+    #     # Convert from bitmap to image coordinates
+    #     img_x = int(x / bx * iw)
+    #     img_y = int(y / by * ih)
+    #     # Reverse rotation
+    #     angle = self.rotation_angle
+    #     if angle == 90:
+    #         return img_y, iw - img_x - 1
+    #     elif angle == 180:
+    #         return iw - img_x - 1, ih - img_y - 1
+    #     elif angle == 270:
+    #         return ih - img_y - 1, img_x
+    #     else:
+    #         return img_x, img_y
 
     def undo(self):
         if not self.undo_stack:
@@ -233,7 +243,9 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
 
     def add_new_box(self, coords: tuple[int, int, int, int]) -> None:
         """Add a new box with the given coordinates."""
-        new_box = BoxData(coords, [])
+        box_number = len(self.__boxes) + 1
+        new_box_label = f"unknown-{box_number}"
+        new_box = BoxData(coords, [new_box_label])
         self.__boxes.append(new_box)
         box_added_event = BoxAddedEvent(self, new_box)
         print("ImagePanel.add_new_box: New box added:", new_box, box_added_event)

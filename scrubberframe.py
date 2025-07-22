@@ -1,4 +1,6 @@
-from typing import List
+import json
+import os
+from typing import List, Dict
 
 import wx
 
@@ -9,9 +11,73 @@ from markerpanel import MarkerPanel  # Adjust import as needed
 from tagpanel import TagPanel
 
 
+def save_boxes_to_stream(stream, frame_boxes: dict[int, list[BoxData]]) -> None:
+    # frame_boxes: {frame_number: [BoxData, ...]}
+    serializable = {
+        frame: [
+            {"coords": box.coords, "tags": box.tags}
+            for box in boxes
+        ]
+        for frame, boxes in frame_boxes.items()
+    }
+    json.dump(serializable, stream)
+
+def save_boxes_to_file(filename: str, frame_boxes: dict[int, list[BoxData]]) -> None:
+    with open(filename, "w", encoding="utf-8") as f:
+        save_boxes_to_stream(f, frame_boxes)
+
+def load_boxes_from_stream(stream) -> dict[int, list[BoxData]]:
+    data = json.load(stream)
+    return {
+        int(frame): [BoxData(tuple(box["coords"]), list(box["tags"])) for box in boxes]
+        for frame, boxes in data.items()
+    }
+
+def load_boxes_from_file(filename: str) -> dict[int, list[BoxData]]:
+    with open(filename, "r", encoding="utf-8") as f:
+        return load_boxes_from_stream(f)
+
+
 class ScrubberFrame(wx.Frame):
-    __boxes: List[BoxData] = []  # Or load from your data source
+    __frame_boxes: Dict[int, List[BoxData]] = {}  # Map of frame index to BoxData
+    # __boxes: List[BoxData] = []  # Or load from your data source
     __image_panel: ImagePanel
+    __button_panel: ControlsPanel
+    __box_data_filename: str | None = None
+
+    @staticmethod
+    def create_box_data_name_from_filename(file_name: str) -> str:
+        """Create a box data name from the file name."""
+        """Return the filename with its extension replaced by .json."""
+        base, _ = os.path.splitext(file_name)
+        return base + ".json"
+
+    @property
+    def box_data_filename(self) -> str | None:
+        """Get the filename for saving/loading box data."""
+        return self.__box_data_filename
+
+    @box_data_filename.setter
+    def box_data_filename(self, filename: str | None) -> None:
+        """Set the filename for saving/loading box data."""
+        if filename is not None and not filename.endswith('.json'):
+            raise ValueError("Box data filename must end with .json")
+        self.__box_data_filename = filename
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def load_box_data(self) -> Dict[int, List[BoxData]]:
+        """Load box data from the specified file."""
+        if self.box_data_filename and os.path.exists(self.box_data_filename):
+            try:
+                self.__frame_boxes = load_boxes_from_file(self.box_data_filename)
+                count = self.count_boxes()
+                print(f"Loaded {count} boxes in data from {self.box_data_filename}")
+                return self.__frame_boxes
+            except Exception as e:
+                print(f"Error loading box data: {e}")
+        else:
+            print("No box data file specified or file does not exist.")
+        return {}
 
     @property
     def current_index(self) -> int:
@@ -37,9 +103,10 @@ class ScrubberFrame(wx.Frame):
 
         self.tag_panel = TagPanel(
             main_panel,
-            self.__boxes
         )
-        print(f'ScrubberFrame.__init__: TagPanel referencing {hex(id(self.__boxes))}=>{self.__boxes}')
+        frame_boxes = self.__get_frame_boxes(self._current_index)
+        self.tag_panel.update_boxes(frame_boxes)
+        # print(f'ScrubberFrame.__init__: TagPanel referencing {hex(id(self.__boxes))}=>{self.__boxes}')
         self.tag_panel.bind_box_events(self.__image_panel)
         # self.image_panel.Bind(EVT_BOX_ADDED, self.tag_panel.Refresh)
 
@@ -48,9 +115,9 @@ class ScrubberFrame(wx.Frame):
         vbox.Add(image_and_tag_sizer, 1, wx.EXPAND | wx.ALL, 5)
 
         # Add ControlsPanel below image_panel
-        button_panel = ControlsPanel(main_panel)
-        vbox.Add(button_panel, 0, wx.CENTER, 0)
-        button_panel.bind_buttons(self.on_prev, self.on_next, self.on_rotate_ccw, self.on_rotate_cw)
+        self.__button_panel = ControlsPanel(main_panel)
+        vbox.Add(self.__button_panel, 0, wx.CENTER, 0)
+        self.__button_panel.bind_buttons(self.on_prev, self.on_next, self.on_rotate_ccw, self.on_rotate_cw)
 
         # Add MarkerPanel below image_panel
         self.marker_panel = MarkerPanel(main_panel, num_frames)
@@ -69,6 +136,13 @@ class ScrubberFrame(wx.Frame):
     def get_frame(self, index: int, rotation_angle: int = 0):
         raise NotImplementedError
 
+    def __get_frame_boxes(self, index: int) -> List[BoxData]:
+        """Get the boxes for the current frame index."""
+        if not index in self.__frame_boxes:
+            self.__frame_boxes[index] = []
+
+        return self.__frame_boxes[index]
+
     def display_image(self):
         img = self.get_frame(self._current_index, self._rotation_angle)
         if img is None:
@@ -78,6 +152,14 @@ class ScrubberFrame(wx.Frame):
             return  # Panel not yet sized, skip
 
         self.__image_panel.set_image(img, self._rotation_angle)
+        self.__image_panel.boxes = self.__current_boxes
+
+        frame_boxes = self.__get_frame_boxes(self._current_index)
+        self.tag_panel.update_boxes(frame_boxes)
+
+        self.__button_panel.set_prev_enabled(self._current_index > 0)
+        self.__button_panel.set_next_enabled(self._current_index < self.num_frames)
+
         self.slider.SetValue(self._current_index)
         self.Refresh()
 
@@ -128,9 +210,14 @@ class ScrubberFrame(wx.Frame):
         else:
             event.Skip()
 
+    @property
+    def __current_boxes(self) -> List[BoxData]:
+        """Get the boxes for the current frame index."""
+        return self.__get_frame_boxes(self._current_index)
+
     def on_box_update(self) -> None:
         """Called when a box is updated, e.g., after adding or removing a tag."""
-        self.tag_panel.update_boxes(self.__boxes)
+        self.tag_panel.update_boxes(self.__current_boxes)
         self.Refresh()
 
     @current_index.setter
@@ -142,3 +229,17 @@ class ScrubberFrame(wx.Frame):
                 self.display_image()
         else:
             raise ValueError("Index out of bounds")
+
+    def count_boxes(self):
+        count = 0
+        for box_list in self.__frame_boxes.values():
+            count += len(box_list)
+        """Count the number of boxes in the current frame."""
+        return count
+
+    def on_close(self, event):
+        # Save boxes before exiting
+        count = self.count_boxes()
+        save_boxes_to_file(self.__box_data_filename, self.__frame_boxes)
+        print(f'{count} boxes saved to {self.__box_data_filename}')
+        event.Skip()  # Continue closing
