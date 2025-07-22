@@ -141,7 +141,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             )
             self.undo_stack.append(('draw_box', copy.deepcopy(self.__boxes)))
             self.redo_stack.clear()
-            self.add_new_box(coords)
+            self.add_new_box(coords, 'user')
             self.dragging = False
 
     def on_motion(self, event: wx.MouseEvent):
@@ -190,7 +190,12 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 bmp_y2 = int((y + h) / img_h * by)
 
                 rect = wx.Rect(bmp_x1 + offset_x, bmp_y1 + offset_y, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
-                dc.SetPen(wx.Pen(wx.RED, 2))
+                if box.source == 'user':
+                    dc.SetPen(wx.Pen(wx.RED, 2))
+                elif box.source == 'automatic':
+                    dc.SetPen(wx.Pen(wx.BLUE, 2))
+                else:
+                    dc.SetPen(wx.Pen(wx.YELLOW, 2))
                 dc.SetBrush(wx.TRANSPARENT_BRUSH)
                 dc.DrawRectangle(rect)
 
@@ -241,11 +246,11 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         wx.PostEvent(self, update_event)
         self.Refresh()
 
-    def add_new_box(self, coords: tuple[int, int, int, int]) -> None:
+    def add_new_box(self, coords: tuple[int, int, int, int], source: str) -> None:
         """Add a new box with the given coordinates."""
         box_number = len(self.__boxes) + 1
         new_box_label = f"unknown-{box_number}"
-        new_box = BoxData(coords, [new_box_label])
+        new_box = BoxData(coords, [new_box_label], 'user')
         self.__boxes.append(new_box)
         box_added_event = BoxAddedEvent(self, new_box)
         print("ImagePanel.add_new_box: New box added:", new_box, box_added_event)

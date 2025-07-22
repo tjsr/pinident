@@ -4,10 +4,14 @@ TagLabel = str
 class BoxData:
     _tags: list[TagLabel]
     _coords: Coordinate
+    _source: str | None = None
 
-    def __init__(self, coords: Coordinate, tags: list[TagLabel]):
+    def __init__(self, coords: Coordinate, tags: list[TagLabel], source: str):
+        if source not in ['user', 'automatic']:
+            raise ValueError("Source must be 'user' or 'automatic'")
         self._coords = coords
         self._tags = tags
+        self._source = source
 
     @property
     def coords(self) -> Coordinate:
@@ -42,3 +46,15 @@ class BoxData:
         """Add a new tag to the box."""
         self._tags.append(tag)
         return len(self._tags)
+
+    @property
+    def source(self) -> str | None:
+        """Get the source of the box data."""
+        return self._source
+
+    @source.setter
+    def source(self, value: str | None) -> None:
+        """Set the source of the box data."""
+        if value is not None and not isinstance(value, str):
+            raise ValueError("Source must be a string or None")
+        self._source = value

@@ -1,10 +1,13 @@
 import json
 import os
+from copy import copy
 from typing import List, Dict
 
+import cv2
+import numpy as np
 import wx
 
-from boxdata import BoxData
+from boxdata import BoxData, Coordinate
 from controlspanel import ControlsPanel
 from imagepanel import ImagePanel
 from markerpanel import MarkerPanel  # Adjust import as needed
@@ -138,10 +141,11 @@ class ScrubberFrame(wx.Frame):
 
     def __get_frame_boxes(self, index: int) -> List[BoxData]:
         """Get the boxes for the current frame index."""
-        if not index in self.__frame_boxes:
-            self.__frame_boxes[index] = []
+        fb = self.__frame_boxes
+        if not index in fb:
+            fb[index] = []
 
-        return self.__frame_boxes[index]
+        return fb[index]
 
     def display_image(self):
         img = self.get_frame(self._current_index, self._rotation_angle)
@@ -172,9 +176,36 @@ class ScrubberFrame(wx.Frame):
             self._current_index -= 1
             self.display_image()
 
+    def frame_has_boxes(self, index: int) -> bool:
+        """Check if the current frame has boxes."""
+        return index in self.__frame_boxes and len(self.__frame_boxes[index]) > 0
+
     def on_next(self, event):
         if self._current_index < self.num_frames - 1:
+            next_index = self._current_index + 1
+
+            current_frame: np.ndarray | None = None
+            next_frame: np.ndarray | None = None
+            if not self.frame_has_boxes(next_index) and self._current_index in self.__frame_boxes:
+                # locate boxes automatically
+                current_frame = self.get_frame(self._current_index, self._rotation_angle)
+                next_frame = self.get_frame(next_index, self._rotation_angle)
+
+            frame_boxes = self.__current_boxes
+
             self._current_index += 1
+            if next_frame is not None and current_frame is not None:
+                found_boxes: list[BoxData] = []
+                for box in frame_boxes:
+                    new_bbox = self.find_object_in_next_frame(current_frame, next_frame, box)
+                    if new_bbox is not None:
+                        print('ScrubberFrame.on_next: Found new coordinates for box:', box, '->', new_bbox)
+                        found_boxes.append(new_bbox)
+
+                if next_index not in self.__frame_boxes:
+                    self.__frame_boxes[next_index] = []
+                self.__frame_boxes[next_index].extend(found_boxes)
+
             self.display_image()
 
     def on_slider(self, event):
@@ -243,3 +274,58 @@ class ScrubberFrame(wx.Frame):
         save_boxes_to_file(self.__box_data_filename, self.__frame_boxes)
         print(f'{count} boxes saved to {self.__box_data_filename}')
         event.Skip()  # Continue closing
+
+    @staticmethod
+    def find_object_in_next_frame(
+        prev_frame: np.ndarray,
+        next_frame: np.ndarray,
+        bbox: BoxData
+    ) -> BoxData | None:
+        x: int
+        y: int
+        w: int
+        h: int
+        x, y, w, h = bbox.coords
+        template: np.ndarray = prev_frame[y:y + h, x:x + w]
+
+        orb: cv2.ORB = cv2.ORB_create()
+        kp1: list[cv2.KeyPoint]
+        des1: np.ndarray | None
+        kp1, des1 = orb.detectAndCompute(template, None)
+        kp2: list[cv2.KeyPoint]
+        des2: np.ndarray | None
+        kp2, des2 = orb.detectAndCompute(next_frame, None)
+
+        if des1 is None or des2 is None or len(kp1) == 0 or len(kp2) == 0:
+            return None
+
+        bf: cv2.BFMatcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches: list[cv2.DMatch] = bf.match(des1, des2)
+        matches = sorted(matches, key=lambda m: m.distance)
+
+        # src_pts: np.ndarray = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        # dst_pts: np.ndarray = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        src_pts = np.float32([np.array(kp1[m.queryIdx].pt) for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([np.array(kp2[m.trainIdx].pt) - np.array([x, y]) for m in matches]).reshape(-1, 1, 2)
+
+        if src_pts.shape[0] >= 3:
+            M: np.ndarray | None
+            mask: np.ndarray | None
+            M, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+            if M is not None:
+                corners: np.ndarray = np.float32([
+                    [x, y],
+                    [x + w, y],
+                    [x + w, y + h],
+                    [x, y + h]
+                ]).reshape(-1, 1, 2)
+                new_corners: np.ndarray = cv2.transform(corners, M)
+                new_bbox: tuple[int, int, int, int] = cv2.boundingRect(new_corners)
+
+                new_data = BoxData(
+                    coords=(new_bbox[0], new_bbox[1], new_bbox[2], new_bbox[3]),
+                    tags=copy(bbox.tags),
+                    source='automatic'
+                )
+                return new_data
+        return None
