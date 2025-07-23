@@ -54,14 +54,17 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         raise ValueError("No BoxTagPanelEdit found for the given box.")
 
     def set_ui(self) -> None:
-        # Remove all box/tag controls but keep checkboxes
-        # for sizer in self.__box_sizers:
-        #     self.vbox.Remove(sizer)
-        # self.__box_sizers.clear()
+        # Save focus info before clearing panels
+        focused: wx.Window | None = wx.Window.FindFocus()
+        focused_value: str | None = None
+        focused_pos: int | None = None
+        if isinstance(focused, wx.TextCtrl):
+            focused_value = focused.GetValue()
+            focused_pos = focused.GetInsertionPoint()
 
-        while len(self.__box_panels) > 0:
-            panel = self.__box_panels.pop()
-            panel.Destroy()
+        # while len(self.__box_panels) > 0:
+        #     panel = self.__box_panels.pop()
+        #     panel.Destroy()
 
         self.__box_sizer.Clear(True)
         self.__box_panels.clear()
@@ -82,44 +85,43 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
                 self.__box_panels.append(box_tag_panel)
                 box_tag_panel.Bind(EVT_BOX_EDITED, self.__on_box_edited)
             self.__box_sizer.Add(box_tag_panel, 0, wx.EXPAND | wx.ALL, 2)
-            # self.__box_sizers.append(box_sizer)
 
+        panel_index: int = 0
+        for panel_index, panel in enumerate(self.__box_panels):
+            found = False
+            if panel is not None:
+                for idx, box in enumerate(self.boxes):
+                    if panel.is_box(box):
+                        found = True
+                        break
+                if not found:
+                    panel_box = panel.box
+                    print(f'TagPanel.set_ui removed panel for box {panel_box}')
+                    self.__box_panels.remove(panel)
+                    self.__box_sizer.Remove(panel_index)
+                    panel.Destroy()
 
-            # coords: Tuple[int, int, int, int] = box['coords']
-            # heading = wx.StaticText(self, label=f"Box {idx+1}: x={coords[0]}, y={coords[1]}, w={coords[2]}, h={coords[3]}")
-            # del_btn = wx.BitmapButton(self, bitmap=wx.ArtProvider.GetBitmap(wx.ART_DELETE, wx.ART_BUTTON))
-            # del_btn.Bind(wx.EVT_BUTTON, lambda evt, i=idx: self.on_delete_box(i))
-            # heading_sizer = wx.BoxSizer(wx.HORIZONTAL)
-            # heading_sizer.Add(heading, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-            # heading_sizer.Add(del_btn, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-            # box_sizer.Add(heading_sizer, 0, wx.EXPAND)
-            #
-            # tag_sizer = wx.BoxSizer(wx.HORIZONTAL)
-            # combo_list: List[wx.ComboBox] = []
-            # rem_btn_list: List[wx.BitmapButton] = []
-            # for t_idx, tag in enumerate(box['tags']):
-            #     combo = wx.ComboBox(self, value=tag, choices=[], style=wx.CB_DROPDOWN)
-            #     combo.Bind(wx.EVT_TEXT, lambda evt, i=idx, ti=t_idx: self.on_add_tag(i, ti, evt.GetString()))
-            #     combo_list.append(combo)
-            #     tag_sizer.Add(combo, 0, wx.ALL, 2)
-            #     rem_btn = wx.BitmapButton(self, bitmap=wx.ArtProvider.GetBitmap(wx.ART_MINUS, wx.ART_BUTTON))
-            #     rem_btn.Bind(wx.EVT_BUTTON, lambda evt, i=idx, ti=t_idx: self.on_remove_tag(i, ti))
-            #     rem_btn_list.append(rem_btn)
-            #     tag_sizer.Add(rem_btn, 0, wx.ALL, 2)
-            # add_btn = wx.BitmapButton(self, bitmap=wx.ArtProvider.GetBitmap(wx.ART_PLUS, wx.ART_BUTTON))
-            # add_btn.Bind(wx.EVT_BUTTON, lambda evt, i=idx: self.on_add_tag(i, len(box['tags']), ""))
-            # tag_sizer.Add(add_btn, 0, wx.ALL, 2)
-            # box_sizer.Add(tag_sizer, 0, wx.EXPAND)
-            #
-            # self.heading_texts.append(heading)
-            # self.del_buttons.append(del_btn)
-            # self.tag_sizers.append(tag_sizer)
-            # self.combo_boxes.append(combo_list)
-            # self.rem_buttons.append(rem_btn_list)
-            # self.add_buttons.append(add_btn)
+                if panel.box is not None:
+                    print(f'TagPanel.set_ui: Panel {panel_index} has box {panel.box.coords} with id {hex(id(panel.box))}')
+
+            # print(f'TagPanel.set_ui: Panel {panel_index} has box {panel.box.coords} with id {hex(id(panel.box))}')
+        # while len(self.__box_panels) > 0:
+        #     panel: BoxTagPanelEdit = self.__box_panels[-1]
+        #     panel = self.__box_panels.pop()
+        #     panel.Destroy()
 
         self.vbox.Layout()
         self.Layout()
+
+        # Restore focus and cursor position
+        if focused_value is not None:
+            for panel in self.__box_panels:
+                for ctrl in panel.GetChildren():
+                    if isinstance(ctrl, wx.TextCtrl) and ctrl.GetValue() == focused_value:
+                        ctrl.SetFocus()
+                        if focused_pos is not None:
+                            ctrl.SetInsertionPoint(focused_pos)
+                        break
 
     def update_boxes(self, boxes: List[BoxData]) -> None:
         self.boxes = boxes

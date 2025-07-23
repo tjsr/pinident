@@ -4,6 +4,7 @@ import copy
 
 from boxdata import BoxData
 from events.BoxAddedEvent import BoxAddedEvent
+from events.BoxSelectedEvent import BoxSelectedEvent
 from events.BoxUpdatedEvent import BoxUpdatedEvent
 
 RotationAngle = int
@@ -101,14 +102,40 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         y_clamped: int = max(0, min(y, img_h - 1))
         return x_clamped, y_clamped
 
+
+    def point_in_box(self, point: wx.Point, box: BoxData) -> bool:
+        """Check if a wx.Point is inside the box (in bitmap coordinates)."""
+        x, y, w, h = box.coords
+        # Map image coordinates to bitmap coordinates
+        img_w, img_h = self.img_size
+        bx, by = self.bmp_size
+        if self.rotation_angle in (90, 270):
+            img_w, img_h = img_h, img_w
+            bx, by = by, bx
+        bmp_x1 = int(x / img_w * bx)
+        bmp_y1 = int(y / img_h * by)
+        bmp_x2 = int((x + w) / img_w * bx)
+        bmp_y2 = int((y + h) / img_h * by)
+        rect = wx.Rect(bmp_x1, bmp_y1, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
+        return rect.Contains(point)
+
     def on_left_down(self, event: wx.MouseEvent) -> None:
-        self.dragging = True
         mouse_pos: wx.Point = event.GetPosition()
         offset_x, offset_y = self.get_image_offset()
         img_x: int = mouse_pos.x - offset_x
         img_y: int = mouse_pos.y - offset_y
         img_x, img_y = self.clamp_to_image(img_x, img_y)
-        self.start_pos = wx.Point(img_x, img_y)
+        click_point = wx.Point(img_x, img_y)
+
+        # Check if click is inside any box
+        for box in self.__boxes:
+            if self.point_in_box(click_point, box):
+                select_event = BoxSelectedEvent(self, box)
+                wx.PostEvent(self, select_event)
+                return  # Do not start dragging
+
+        self.dragging = True
+        self.start_pos = click_point
 
     def on_left_up(self, event: wx.MouseEvent) -> None:
         if self.dragging:
@@ -154,6 +181,13 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             self.end_pos = wx.Point(img_x, img_y)
             self.Refresh()
 
+    def _is_box_selected(self, box: BoxData) -> bool:
+        """Check if the box is currently selected."""
+        for b in self.__boxes:
+            if b is box or b.coords == box.coords:
+                return True
+        return False
+
     def on_paint(self, event: wx.PaintEvent):
         dc = wx.BufferedPaintDC(self)
         dc.Clear()
@@ -167,6 +201,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 img_w, img_h = img_h, img_w
                 bx, by = by, bx
             for box in self.__boxes:
+                is_selected = self._is_box_selected(box)
                 coords = box.coords  # (x, y, w, h) in original image space
 
                 def rotate_point(x, y, w, h, angle, orig_w, orig_h):
@@ -190,12 +225,14 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 bmp_y2 = int((y + h) / img_h * by)
 
                 rect = wx.Rect(bmp_x1 + offset_x, bmp_y1 + offset_y, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
+                stroke_width = 3 if is_selected else 1
+
                 if box.source == 'user':
-                    dc.SetPen(wx.Pen(wx.RED, 2))
+                    dc.SetPen(wx.Pen(wx.RED, stroke_width))
                 elif box.source == 'automatic':
-                    dc.SetPen(wx.Pen(wx.BLUE, 2))
+                    dc.SetPen(wx.Pen(wx.BLUE, stroke_width))
                 else:
-                    dc.SetPen(wx.Pen(wx.YELLOW, 2))
+                    dc.SetPen(wx.Pen(wx.YELLOW, stroke_width))
                 dc.SetBrush(wx.TRANSPARENT_BRUSH)
                 dc.DrawRectangle(rect)
 
