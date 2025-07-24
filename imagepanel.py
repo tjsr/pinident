@@ -204,6 +204,12 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
 
         return False
 
+    @staticmethod
+    def get_box_label_text(box: BoxData) -> str:
+        """Return the label text for the box (to be implemented)."""
+        label = ', '.join(box.tags)
+        return label
+
     def on_paint(self, event: wx.PaintEvent):
         dc = wx.BufferedPaintDC(self)
         dc.Clear()
@@ -244,14 +250,41 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 rect = wx.Rect(bmp_x1 + offset_x, bmp_y1 + offset_y, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
                 stroke_width = 3 if is_selected else 1
 
+                # Draw label area at the bottom edge
+                label_text = self.get_box_label_text(box) or ""
+                label_rect_height = 18  # px, adjust as needed
+                label_rect = wx.Rect(
+                    bmp_x1 + offset_x,
+                    bmp_y2 + offset_y - label_rect_height,
+                    bmp_x2 - bmp_x1,
+                    label_rect_height
+                )
+
+                colour: wx.Colour
                 if box.source == 'user':
-                    dc.SetPen(wx.Pen(wx.RED, stroke_width))
+                    colour = wx.RED
                 elif box.source == 'automatic':
-                    dc.SetPen(wx.Pen(wx.BLUE, stroke_width))
+                    colour = wx.BLUE
                 else:
-                    dc.SetPen(wx.Pen(wx.YELLOW, stroke_width))
+                    colour = wx.YELLOW
+                dc.SetPen(wx.Pen(colour, stroke_width))
                 dc.SetBrush(wx.TRANSPARENT_BRUSH)
                 dc.DrawRectangle(rect)
+
+                # Truncate text to fit box width
+                dc.SetBrush(wx.Brush(colour))
+                font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+                dc.SetFont(font)
+                dc.SetTextForeground(wx.WHITE)
+                max_width = label_rect.GetWidth() - 4
+                truncated_text = label_text
+                while dc.GetTextExtent(truncated_text)[0] > max_width and len(truncated_text) > 0:
+                    truncated_text = truncated_text[:-1]
+                if truncated_text != label_text and len(truncated_text) > 3:
+                    truncated_text = truncated_text[:-3] + "..."
+
+                dc.DrawRectangle(label_rect)
+                dc.DrawText(truncated_text, label_rect.x + 2, label_rect.y + 2)
 
             # Draw current drag box
             if self.dragging and self.start_pos and self.end_pos:
