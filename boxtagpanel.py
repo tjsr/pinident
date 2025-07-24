@@ -102,9 +102,11 @@ class BoxTagPanelEdit(wx.Panel):
         self.__box_tags = []
         self.__sizer = wx.BoxSizer(wx.VERTICAL)
         self.__sizer.Add(self.__heading_text, 0, wx.EXPAND | wx.ALL, 5)
+
         self.__add_button = wx.Button(self, label="Add")
         self.__add_button.Bind(wx.EVT_BUTTON, self.__on_add_tag)
         self.__sizer.Add(self.__add_button, 0, wx.ALIGN_LEFT | wx.ALL, 5)
+
         self.SetSizer(self.__sizer)
         self.repaint_box()
 
@@ -150,7 +152,7 @@ class BoxTagPanelEdit(wx.Panel):
 
         new_label = BoxTagLabelRow(self, self.__box, index, self.__choices)
 
-        self.__sizer.Insert(index, new_label, 0, wx.EXPAND | wx.ALL, 2)
+        self.__sizer.Insert(index+1, new_label, 0, wx.EXPAND | wx.ALL, 2)
         return new_label
 
     def __on_label_edited(self, event: BoxLabelEditedEvent) -> None:
