@@ -96,6 +96,7 @@ class BoxTagPanelEdit(wx.Panel):
         box: BoxData
     ):
         super().__init__(parent)
+        self.__is_selected: bool = False
         self.__box = box
         self.__heading_text = wx.StaticText(self, label=f"Box: {box.coords}")
         self.__box_tags = []
@@ -169,3 +170,21 @@ class BoxTagPanelEdit(wx.Panel):
     @property
     def box(self) -> BoxData:
         return self.__box
+
+    @property
+    def selected(self) -> bool:
+        return self.__is_selected
+
+    @selected.setter
+    def selected(self, value: bool) -> None:
+        """Set the selection state of the box."""
+        self.__is_selected = value
+        heading_font: wx.Font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+        if value:
+            self.SetBackgroundColour(wx.Colour(200, 255, 200))  # Highlight color
+            heading_font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+        else:
+            self.SetBackgroundColour(wx.NullColour)  # Default color
+
+        self.__heading_text.SetFont(heading_font)
+        self.Refresh()  # Refresh to apply the new background color

@@ -5,6 +5,7 @@ from boxdata import BoxData
 from boxtagpanel import BoxTagPanelEdit
 from events.BoxEditedEvent import BoxEditedEvent
 from events.BoxRemovedEvent import BoxRemovedEvent
+from events.BoxSelectedEvent import BoxSelectedEvent
 from events.BoxUpdatedEvent import BoxUpdatedEvent
 from imagepanel import ImagePanel
 from events.BoxAddedEvent import BoxAddedEvent
@@ -170,3 +171,9 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         image_panel.Bind(EVT_BOX_ADDED, self.__on_box_added)
         image_panel.Bind(EVT_BOX_REMOVED, self.__on_box_removed)
         image_panel.Bind(EVT_BOX_UPDATED, self.__on_boxes_updated)
+
+    def on_box_selected(self, event: BoxSelectedEvent) -> None:
+        """Handle box selection event."""
+        print(f'TagPanel.on_box_selected: Box selected {event.box}')
+        for panel in self.__box_panels:
+            panel.selected = event.box is not None and panel.is_box(event.box)

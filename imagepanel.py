@@ -4,8 +4,9 @@ import copy
 
 from boxdata import BoxData
 from events.BoxAddedEvent import BoxAddedEvent
-from events.BoxSelectedEvent import BoxSelectedEvent
+from events.BoxSelectedEvent import BoxSelectedEvent, BoxDeselectedEvent
 from events.BoxUpdatedEvent import BoxUpdatedEvent
+from events.events import wxEVT_BOX_SELECTED, EVT_BOX_SELECTED
 
 RotationAngle = int
 ImageSize = tuple[int, int] # (width, height)
@@ -15,6 +16,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     image: np.ndarray | None
     bitmap: wx.Bitmap | None
     __boxes: list[BoxData]
+    _selected_box: BoxData | None = None
     dragging: bool
     start_pos: wx.Point | None
     end_pos: wx.Point | None
@@ -130,10 +132,21 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         # Check if click is inside any box
         for box in self.__boxes:
             if self.point_in_box(click_point, box):
+                print(f"ImagePanel.on_box_selected: Selected box {self._selected_box}")
+
                 select_event = BoxSelectedEvent(self, box)
                 wx.PostEvent(self, select_event)
+                self.Refresh()
+                self._selected_box = box
                 return  # Do not start dragging
 
+        if self._selected_box is not None:
+            # Deselect the current box if clicking outside
+            deselect_event = BoxDeselectedEvent(self)
+            wx.PostEvent(self, deselect_event)
+            self.Refresh()
+
+        self._selected_box = None
         self.dragging = True
         self.start_pos = click_point
 
@@ -182,10 +195,13 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             self.Refresh()
 
     def _is_box_selected(self, box: BoxData) -> bool:
+        if self._selected_box is None:
+            return False
         """Check if the box is currently selected."""
-        for b in self.__boxes:
-            if b is box or b.coords == box.coords:
-                return True
+
+        if self._selected_box == box or self._selected_box.coords == box.coords:
+            return True
+
         return False
 
     def on_paint(self, event: wx.PaintEvent):
@@ -201,7 +217,8 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 img_w, img_h = img_h, img_w
                 bx, by = by, bx
             for box in self.__boxes:
-                is_selected = self._is_box_selected(box)
+                # Check if the box is selected
+                is_selected = self._selected_box is not None and self._is_box_selected(box)
                 coords = box.coords  # (x, y, w, h) in original image space
 
                 def rotate_point(x, y, w, h, angle, orig_w, orig_h):

@@ -9,6 +9,8 @@ import wx
 
 from boxdata import BoxData, Coordinate
 from controlspanel import ControlsPanel
+from events.BoxSelectedEvent import BoxSelectedEvent
+from events.events import EVT_BOX_SELECTED
 from imagepanel import ImagePanel
 from markerpanel import MarkerPanel  # Adjust import as needed
 from tagpanel import TagPanel
@@ -107,6 +109,7 @@ class ScrubberFrame(wx.Frame):
         self.tag_panel = TagPanel(
             main_panel,
         )
+        self.__image_panel.Bind(EVT_BOX_SELECTED, self.tag_panel.on_box_selected)
         frame_boxes = self.__get_frame_boxes(self._current_index)
         self.tag_panel.update_boxes(frame_boxes)
         # print(f'ScrubberFrame.__init__: TagPanel referencing {hex(id(self.__boxes))}=>{self.__boxes}')
@@ -274,6 +277,10 @@ class ScrubberFrame(wx.Frame):
         save_boxes_to_file(self.__box_data_filename, self.__frame_boxes)
         print(f'{count} boxes saved to {self.__box_data_filename}')
         event.Skip()  # Continue closing
+
+    def on_box_selected(self, event: BoxSelectedEvent) -> None:
+        print(f'ScrubberFrame.on_box_selected: Selected box {selected_box.coords} with tags {selected_box.tags}')
+        self.tag_panel.set_selected(event.box)
 
     @staticmethod
     def find_object_in_next_frame(
