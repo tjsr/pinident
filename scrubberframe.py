@@ -34,7 +34,7 @@ def save_boxes_to_file(filename: str, frame_boxes: dict[int, list[BoxData]]) -> 
 def load_boxes_from_stream(stream) -> dict[int, list[BoxData]]:
     data = json.load(stream)
     return {
-        int(frame): [BoxData(tuple(box["coords"]), list(box["tags"])) for box in boxes]
+        int(frame): [BoxData(tuple(box["coords"]), list(box["tags"]), box.get("source", "automatic")) for box in boxes]
         for frame, boxes in data.items()
     }
 
