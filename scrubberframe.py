@@ -46,6 +46,10 @@ def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
             merged[key].tags.extend(box.tags)
             merged[key].tags = remove_empty(merged[key].tags)
 
+    # Remove duplicates in tags
+    for box in merged.values():
+        box.tags = list(set(box.tags))  # Remove duplicate tags
+
     return list(merged.values())
 
 def load_boxes_from_stream(stream) -> dict[int, list[BoxData]]:
