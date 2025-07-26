@@ -1,4 +1,5 @@
 import wx
+from wx.lib.scrolledpanel import ScrolledPanel
 from logutil import getLog
 
 from typing import List
@@ -13,7 +14,7 @@ from imagepanel import ImagePanel
 from events.BoxAddedEvent import BoxAddedEvent
 from events.events import EVT_BOX_UPDATED, EVT_BOX_ADDED, EVT_BOX_REMOVED, EVT_BOX_EDITED, wxEVT_BOX_ADDED
 
-class TagPanel(wx.Panel, wx.PyEventBinder):
+class TagPanel(ScrolledPanel, wx.PyEventBinder):
     boxes: List[BoxData] | None
     __box_panels: List[BoxTagPanelEdit] = []
 
@@ -38,14 +39,18 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         self.set_cb = wx.CheckBox(self, label="Contains set")
         self.card_cb = wx.CheckBox(self, label="With backing card")
         self.__box_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.SetMinSize(wx.Size(180, -1))
+        self.SetScrollRate(0, 20)
+        self.Bind(wx.EVT_SIZE, self.on_size)
 
         self.vbox.Add(self.pin_cb, 0, wx.ALL, 5)
         self.vbox.Add(self.set_cb, 0, wx.ALL, 5)
         self.vbox.Add(self.card_cb, 0, wx.ALL, 5)
-        self.vbox.Add(self.__box_sizer, 1, wx.EXPAND | wx.ALL, 5)
+        self.vbox.Add(self.__box_sizer, 1, wx.ALL, 5)
 
         self.set_ui()
-        self.SetSizerAndFit(self.vbox)
+        self.SetSizer(self.vbox)
+        self.SetupScrolling()
 
     def find_panel_for_box(self, box: BoxData) -> BoxTagPanelEdit:
         """Find the BoxTagPanelEdit for a given box."""
@@ -87,7 +92,7 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
                 self.__box_panels.append(box_tag_panel)
                 box_tag_panel.Bind(EVT_BOX_EDITED, self.__on_box_edited)
 
-            self.__box_sizer.Add(box_tag_panel, 0, wx.EXPAND | wx.ALL, 2)
+            self.__box_sizer.Add(box_tag_panel, 0, wx.ALIGN_LEFT | wx.ALL, 2)
 
         panel_index: int = 0
         for panel_index, panel in enumerate(self.__box_panels):
@@ -180,3 +185,8 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         getLog().debug(f'Box selected {event.box}')
         for panel in self.__box_panels:
             panel.selected = event.box is not None and panel.is_box(event.box)
+
+    def on_size(self, event):
+        self.FitInside()  # Ensures content fits inside the panel
+        self.SetScrollRate(0, 20)  # Re-apply scroll rate
+        event.Skip()
