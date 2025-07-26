@@ -1,4 +1,6 @@
 import wx
+from logutil import getLog
+
 from typing import List
 
 from boxdata import BoxData
@@ -11,13 +13,11 @@ from imagepanel import ImagePanel
 from events.BoxAddedEvent import BoxAddedEvent
 from events.events import EVT_BOX_UPDATED, EVT_BOX_ADDED, EVT_BOX_REMOVED, EVT_BOX_EDITED, wxEVT_BOX_ADDED
 
-
 class TagPanel(wx.Panel, wx.PyEventBinder):
     boxes: List[BoxData] | None
     __box_panels: List[BoxTagPanelEdit] = []
 
     vbox: wx.BoxSizer
-    # __box_sizers: List[wx.BoxSizer]
     __box_sizer: wx.BoxSizer
     pin_cb: wx.CheckBox
     set_cb: wx.CheckBox
@@ -55,6 +55,7 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         raise ValueError("No BoxTagPanelEdit found for the given box.")
 
     def set_ui(self) -> None:
+        log = getLog()
         # Save focus info before clearing panels
         focused: wx.Window | None = wx.Window.FindFocus()
         focused_value: str | None = None
@@ -71,20 +72,21 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         self.__box_panels.clear()
 
         if self.boxes is None:
-            print('TagPanel.set_ui: No boxes to display')
+            log.info('No boxes to display')
             return
 
         for idx, box in enumerate(self.boxes):
             try:
                 box_tag_panel = self.find_panel_for_box(box)
                 self.__box_sizer.Detach(box_tag_panel)
-                print(f'TagPanel.set_ui: Reusing panel for box {idx+1} with coords {box.coords}')
+                log.debug(f'Reusing panel for box {idx+1} with coords {box.coords} and labels {", ".join(box_tag_panel.box.tags)}')
             except ValueError:
-                print(f'TagPanel.set_ui: Creating new panel for box {idx+1} with coords {box.coords}')
+                log.debug(f'Creating new panel for box {idx+1} with coords {box.coords} and labels {", ".join(box.tags)}')
                 # If no existing panel found, create a new one
                 box_tag_panel = BoxTagPanelEdit(self, box)
                 self.__box_panels.append(box_tag_panel)
                 box_tag_panel.Bind(EVT_BOX_EDITED, self.__on_box_edited)
+
             self.__box_sizer.Add(box_tag_panel, 0, wx.EXPAND | wx.ALL, 2)
 
         panel_index: int = 0
@@ -97,13 +99,13 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
                         break
                 if not found:
                     panel_box = panel.box
-                    print(f'TagPanel.set_ui removed panel for box {panel_box}')
+                    log.info(f'Removed panel {panel_index} for box {panel_box}.')
                     self.__box_panels.remove(panel)
                     self.__box_sizer.Remove(panel_index)
                     panel.Destroy()
 
                 if panel.box is not None:
-                    print(f'TagPanel.set_ui: Panel {panel_index} has box {panel.box.coords} with id {hex(id(panel.box))}')
+                    log.debug(f'TagPanel.set_ui: Panel {panel_index} has box {panel.box}.')
 
             # print(f'TagPanel.set_ui: Panel {panel_index} has box {panel.box.coords} with id {hex(id(panel.box))}')
         # while len(self.__box_panels) > 0:
@@ -129,7 +131,7 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         self.set_ui()
 
     def update_box(self, box: BoxData) -> None:
-        print(f'TagPanel.update_box: Updating box {box.coords} in TagPanel with {len(self.boxes)} boxes')
+        getLog().info(f'Updating box {box.coords} in TagPanel with {len(self.boxes)} boxes')
         """Update a specific box."""
         try:
             box_panel = self.find_panel_for_box(box)
@@ -139,7 +141,7 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
 
     def __on_box_edited(self, event: BoxEditedEvent) -> None:
         """Handle box edited event."""
-        print('TagPanel.__on_box_edited', f'Box {event.box} edited in {event.GetEventObject()}')
+        getLog().info(f'Box {event.box} edited in {event.GetEventObject()}')
         self.update_box(event.box)
 
     def __on_boxes_updated(self, event: BoxUpdatedEvent) -> None:
@@ -147,13 +149,14 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
         self.update_boxes(event.boxes)
 
     def __on_box_added(self, event: BoxAddedEvent) -> None:
+        log = getLog()
         """Handle box updated event."""
-        print(f'TagPanel.__on_box_added has self.__boxes {hex(id(self.boxes))} and event {type(event)} {event.GetEventType()} {wxEVT_BOX_ADDED}')
+        log.debug(f'Added self.__boxes {self.boxes} and event {type(event)} {event.GetEventType()} {wxEVT_BOX_ADDED}')
         if isinstance(event, BoxAddedEvent):
-            print(f'TagPanel.__on_box_added: Adding box {event.box.coords} to panel')
+            log.debug(f'Adding box {event.box.coords} to panel')
             self.boxes.append(event.box)
         else:
-            print(f'TagPanel.__on_box_added: event parameter is not a BoxAddedEvent, skipping')
+            log.warning(f'TagPanel.__on_box_added: event parameter is not a BoxAddedEvent, skipping')
         self.set_ui()
 
     def __on_box_removed(self, event: BoxRemovedEvent) -> None:
@@ -174,6 +177,6 @@ class TagPanel(wx.Panel, wx.PyEventBinder):
 
     def on_box_selected(self, event: BoxSelectedEvent) -> None:
         """Handle box selection event."""
-        print(f'TagPanel.on_box_selected: Box selected {event.box}')
+        getLog().debug(f'Box selected {event.box}')
         for panel in self.__box_panels:
             panel.selected = event.box is not None and panel.is_box(event.box)

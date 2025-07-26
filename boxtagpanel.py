@@ -1,11 +1,13 @@
 from typing import List
 
 import wx
+from wx import EVT_BUTTON
 
 from boxdata import BoxData
 from events.BoxEditedEvent import BoxEditedEvent
 from events.BoxLabelEditEvent import BoxLabelEditedEvent
 from events.events import EVT_BOX_LABEL_EDITED
+from logutil import getLog
 
 
 class BoxTagLabelRow(wx.Panel):
@@ -30,6 +32,7 @@ class BoxTagLabelRow(wx.Panel):
         self.__text_entry = wx.TextCtrl(self, value=label, style=wx.TE_PROCESS_ENTER)
         self.__rem_button = wx.BitmapButton(self, bitmap=wx.ArtProvider.GetBitmap(wx.ART_MINUS, wx.ART_BUTTON))
 
+        self.timer = wx.Timer(self)
         sizer = wx.BoxSizer(wx.HORIZONTAL)
         # sizer.Add(self.__combo_box, 1, wx.EXPAND | wx.ALL, 5)
         sizer.Add(self.__text_entry, 1, wx.EXPAND | wx.ALL, 5)
@@ -37,6 +40,8 @@ class BoxTagLabelRow(wx.Panel):
 
         # self.__combo_box.Bind(wx.EVT_TEXT, self.label_updated)
         self.__text_entry.Bind(wx.EVT_TEXT, self.label_edited)
+        self.Bind(wx.EVT_TIMER, self.on_label_edited_timer, self.timer)
+        self.__rem_button.Bind(EVT_BUTTON, self.on_remove_button_clicked)
 
         self.SetSizer(sizer)
 
@@ -66,15 +71,27 @@ class BoxTagLabelRow(wx.Panel):
             self.set_only_row(is_only_row)
 
     def label_edited(self, event: wx.Event) -> None:
-        """Handle label updates."""
-        # This method can be overridden to handle label changes
-        # For example, you might want to notify the parent panel
-        # that the label has changed.
+        """Handle label edits."""
+        # Start the timer to delay the event handling
+        self.timer.Start(500, oneShot=True)
+
+    def on_label_edited_timer(self, event: wx.TimerEvent) -> None:
+        self.fire_edited_event()
+        event.Skip()
+
+    def fire_edited_event(self):
         value = self.__text_entry.GetLineText(0)
         if not value:
             value = ""
         updateEvent = BoxLabelEditedEvent(self, self.__tag_index, value)
         wx.PostEvent(self, updateEvent)
+
+    def on_text_blur(self, event):
+        self.timer.Stop()
+        self.fire_edited_event()
+        event.Skip()
+
+    def on_remove_button_clicked(self, event: wx.BoxLabelRemovedEvent):
 
 
 class BoxTagPanelEdit(wx.Panel):
@@ -99,6 +116,7 @@ class BoxTagPanelEdit(wx.Panel):
         self.__is_selected: bool = False
         self.__box = box
         self.__heading_text = wx.StaticText(self, label=f"Box: {box.coords}")
+        self.__heading_text.SetMinSize(wx.Size(240, -1))
         self.__box_tags = []
         self.__sizer = wx.BoxSizer(wx.VERTICAL)
         self.__sizer.Add(self.__heading_text, 0, wx.EXPAND | wx.ALL, 5)
@@ -111,13 +129,14 @@ class BoxTagPanelEdit(wx.Panel):
         self.repaint_box()
 
     def repaint_box(self) -> None:
+        log = getLog()
         tag_index: int = 0
         tag_count: int = len(self.__box.tags)
 
         self.__heading_text.SetLabelText(f"Box: {self.__box.coords}")
 
         while tag_index < tag_count:
-            print(f'BoxTagPanelEdit.repaint_box: Repainting tag {tag_index}/{tag_count} on {self}')
+            log.debug(f'Repainting tag {tag_index}/{tag_count} on {self}')
             self.repaint_tag(tag_index)
             tag_index += 1
 
@@ -144,6 +163,7 @@ class BoxTagPanelEdit(wx.Panel):
 
         current_label_row.Bind(EVT_BOX_LABEL_EDITED, self.__on_label_edited)
         current_label_row.set_tag(tag, is_only_row)
+        self.__sizer.Layout()
 
     def get_or_create_label(self, index: int) -> BoxTagLabelRow:
         """Get or create a BoxTagLabelRow for the given index."""
@@ -152,12 +172,17 @@ class BoxTagPanelEdit(wx.Panel):
 
         new_label = BoxTagLabelRow(self, self.__box, index, self.__choices)
 
-        self.__sizer.Insert(index+1, new_label, 0, wx.EXPAND | wx.ALL, 2)
+        # Always insert before the Add button (which is the last item)
+        sizer_children = self.__sizer.GetChildren()
+        if len(sizer_children) == 0:
+            self.__sizer.Add(new_label, 0, wx.EXPAND | wx.ALL, 2)
+        else:
+            self.__sizer.Insert(self.__sizer.GetItemCount() - 1, new_label, 0, wx.EXPAND | wx.ALL, 2)
         return new_label
 
     def __on_label_edited(self, event: BoxLabelEditedEvent) -> None:
         """Handle label updates."""
-        print(f'BoxTagPanelEdit.__on_label_edited: {event.label_index}={event.new_label}')
+        getLog().debug(f'{event.label_index}={event.new_label}')
         self.__box.set_tag(event.label_index, event.new_label)
         boxUpdateEvent = BoxEditedEvent(self, self.__box)
         wx.PostEvent(self, boxUpdateEvent)

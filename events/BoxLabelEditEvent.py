@@ -26,3 +26,13 @@ class BoxLabelEditedEvent(wx.CommandEvent):
 	def Clone(self) -> "BoxLabelEditedEvent":
 		# wxPython uses this to copy events internally
 		return BoxLabelEditedEvent(self.GetEventObject(), self.label_index, self.new_label) # type: ignore[arg-type]
+
+class BoxLabelRemovedEvent(BoxLabelEditedEvent):
+	__new_label: TagLabel | None
+
+	"""Custom event for box label removal."""
+	def __init__(self, source: wx.Panel, label_index: int):
+		super().__init__(source, label_index)
+		self.SetEventType(wxEVT_BOX_LABEL_EDITED)  # Use the same event type for removal
+		self._label_index = label_index
+		self.__new_label = None  # Empty label to indicate removal

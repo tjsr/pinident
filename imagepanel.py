@@ -7,6 +7,7 @@ from events.BoxAddedEvent import BoxAddedEvent
 from events.BoxSelectedEvent import BoxSelectedEvent, BoxDeselectedEvent
 from events.BoxUpdatedEvent import BoxUpdatedEvent
 from events.events import wxEVT_BOX_SELECTED, EVT_BOX_SELECTED
+from logutil import getLog
 
 RotationAngle = int
 ImageSize = tuple[int, int] # (width, height)
@@ -132,7 +133,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         # Check if click is inside any box
         for box in self.__boxes:
             if self.point_in_box(click_point, box):
-                print(f"ImagePanel.on_box_selected: Selected box {self._selected_box}")
+                getLog().debug(f"Selected box {self._selected_box}")
 
                 select_event = BoxSelectedEvent(self, box)
                 wx.PostEvent(self, select_event)
@@ -260,6 +261,9 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                     label_rect_height
                 )
 
+                if label_text.startswith("unknown-"):
+                    getLog().debug(f'{box} with unknown label.')
+
                 colour: wx.Colour
                 if box.source == 'user':
                     colour = wx.RED
@@ -340,7 +344,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         new_box = BoxData(coords, [new_box_label], 'user')
         self.__boxes.append(new_box)
         box_added_event = BoxAddedEvent(self, new_box)
-        print("ImagePanel.add_new_box: New box added:", new_box, box_added_event)
+        getLog().info(f'New box added: {new_box}, {box_added_event}')
         wx.PostEvent(self, box_added_event)
         self.Refresh()
 

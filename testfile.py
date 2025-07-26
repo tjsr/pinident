@@ -1,7 +1,12 @@
+import cv2
+
+from logutil import getLog
+
 file_name: str = "e:\\pindev\\PXL_20250715_015847092.mp4"
 out_dir: str = "e:\\pindev\\output"
-import cv2
 import os
+
+log = getLog()
 
 try:
 	# creating a folder named data
@@ -10,7 +15,7 @@ try:
 
 # if not created then raise error
 except OSError as e:
-	print('Error: Creating directory of data')
+	log.error('Error: Creating directory of data')
 	raise e
 
 existing_files = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
@@ -20,10 +25,10 @@ total_frames: int = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))  # Get total nu
 fps: float = video_cap.get(cv2.CAP_PROP_FPS)  # Get the frames per second of the video
 resolution: tuple = (int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 if not video_cap.isOpened():
-	print("Error: Could not open video.")
+	log.error("Error: Could not open video.")
 	raise Exception("Could not open video file.")
 
-print(f'Video is at {resolution[0]}x{resolution[1]} @ {fps}fps with {total_frames} frames.')
+log.info(f'Video is at {resolution[0]}x{resolution[1]} @ {fps}fps with {total_frames} frames.')
 
 success, image = video_cap.read()
 display_image = None

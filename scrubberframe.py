@@ -12,15 +12,19 @@ from controlspanel import ControlsPanel
 from events.BoxSelectedEvent import BoxSelectedEvent
 from events.events import EVT_BOX_SELECTED
 from imagepanel import ImagePanel
+from logutil import getLog
 from markerpanel import MarkerPanel  # Adjust import as needed
 from tagpanel import TagPanel
 
+def remove_empty(tags: List[str]) -> List[str]:
+    """Remove empty tags from the list."""
+    return [tag for tag in tags if tag.strip()]
 
 def save_boxes_to_stream(stream, frame_boxes: dict[int, list[BoxData]]) -> None:
     # frame_boxes: {frame_number: [BoxData, ...]}
     serializable = {
         frame: [
-            {"coords": box.coords, "tags": box.tags}
+            {"coords": box.coords, "tags": remove_empty(box.tags), "source": box.source}
             for box in boxes
         ]
         for frame, boxes in frame_boxes.items()
@@ -31,10 +35,23 @@ def save_boxes_to_file(filename: str, frame_boxes: dict[int, list[BoxData]]) -> 
     with open(filename, "w", encoding="utf-8") as f:
         save_boxes_to_stream(f, frame_boxes)
 
+def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
+    """Merge boxes with the same coordinates and tags."""
+    merged: Dict[Coordinate, BoxData] = {}
+    for box in boxes:
+        key = (box.coords, tuple(sorted(box.tags)))
+        if key not in merged:
+            merged[key] = BoxData(coords=box.coords, tags=copy(box.tags), source=box.source)
+        else:
+            merged[key].tags.extend(box.tags)
+            merged[key].tags = remove_empty(merged[key].tags)
+
+    return list(merged.values())
+
 def load_boxes_from_stream(stream) -> dict[int, list[BoxData]]:
     data = json.load(stream)
     return {
-        int(frame): [BoxData(tuple(box["coords"]), list(box["tags"]), box.get("source", "automatic")) for box in boxes]
+        int(frame): merge_duplicate_boxes([BoxData(tuple(box["coords"]), list(box["tags"]), box.get("source", "automatic")) for box in boxes])
         for frame, boxes in data.items()
     }
 
@@ -76,12 +93,12 @@ class ScrubberFrame(wx.Frame):
             try:
                 self.__frame_boxes = load_boxes_from_file(self.box_data_filename)
                 count = self.count_boxes()
-                print(f"Loaded {count} boxes in data from {self.box_data_filename}")
+                getLog().info(f"Loaded {count} boxes in data from {self.box_data_filename}")
                 return self.__frame_boxes
             except Exception as e:
-                print(f"Error loading box data: {e}")
+                getLog().error(f"Error loading box data: {e}")
         else:
-            print("No box data file specified or file does not exist.")
+            getLog().warning("No box data file specified or file does not exist.")
         return {}
 
     @property
@@ -202,7 +219,7 @@ class ScrubberFrame(wx.Frame):
                 for box in frame_boxes:
                     new_bbox = self.find_object_in_next_frame(current_frame, next_frame, box)
                     if new_bbox is not None:
-                        print('ScrubberFrame.on_next: Found new coordinates for box:', box, '->', new_bbox)
+                        getLog().debug('Found new coordinates for box:', box, '->', new_bbox)
                         found_boxes.append(new_bbox)
 
                 if next_index not in self.__frame_boxes:
@@ -275,12 +292,13 @@ class ScrubberFrame(wx.Frame):
         # Save boxes before exiting
         count = self.count_boxes()
         save_boxes_to_file(self.__box_data_filename, self.__frame_boxes)
-        print(f'{count} boxes saved to {self.__box_data_filename}')
+        getLog().info(f'{count} boxes saved to {self.__box_data_filename}')
         event.Skip()  # Continue closing
 
     def on_box_selected(self, event: BoxSelectedEvent) -> None:
-        print(f'ScrubberFrame.on_box_selected: Selected box {selected_box.coords} with tags {selected_box.tags}')
-        self.tag_panel.set_selected(event.box)
+        selected_box = event.box
+        getLog().debug(f'Selected box {selected_box.coords} with tags {selected_box.tags}')
+        # self.tag_panel.set_selected(event.box)
 
     @staticmethod
     def find_object_in_next_frame(

@@ -58,3 +58,6 @@ class BoxData:
         if value is not None and not isinstance(value, str):
             raise ValueError("Source must be a string or None")
         self._source = value
+
+    def __str__(self) -> str:
+        return f'BoxData({self.source})<{hex(id(self))}>@{self.coords}={self.tags}'
