@@ -1,0 +1,13 @@
+version: 1
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: method
+    stream: ext://sys.stdout
+
+loggers:
+  root:
+    level: DEBUG
+    handlers:
+    - console
