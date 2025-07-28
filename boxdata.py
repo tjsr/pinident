@@ -5,6 +5,8 @@ class BoxData:
     _tags: list[TagLabel]
     _coords: Coordinate
     _source: str | None = None
+    __is_set: bool = False
+    __has_backing_card: bool = False
 
     def __init__(self, coords: Coordinate, tags: list[TagLabel], source: str):
         if source not in ['user', 'automatic']:
@@ -61,3 +63,27 @@ class BoxData:
 
     def __str__(self) -> str:
         return f'BoxData({self.source})<{hex(id(self))}>@{self.coords}={self.tags}'
+
+    @property
+    def is_set(self) -> bool:
+        """Check if the box data is set."""
+        return self.__is_set
+
+    @is_set.setter
+    def is_set(self, value: bool) -> None:
+        """Set the is_set flag."""
+        if not isinstance(value, bool):
+            raise ValueError("is_set must be a boolean value")
+        self.__is_set = value
+
+    @property
+    def has_backing_card(self) -> bool:
+        """Check if the box has a backing card."""
+        return self.__has_backing_card
+
+    @has_backing_card.setter
+    def has_backing_card(self, value: bool) -> None:
+        """Set the has_backing_card flag."""
+        if not isinstance(value, bool):
+            raise ValueError("has_backing_card must be a boolean value")
+        self.__has_backing_card = value
