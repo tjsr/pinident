@@ -91,8 +91,24 @@ class BoxTagLabelRow(wx.Panel):
         self.fire_edited_event()
         event.Skip()
 
-    def on_remove_button_clicked(self, event: wx.BoxLabelRemovedEvent):
+    def on_remove_button_clicked(self, event: wx.CommandEvent):
+        """Handle the remove button click."""
+        if self.__is_only_row:
+            return
 
+        # # Remove the label of the current index from the box's tag list.
+        # self.__box.remove_tag(self.__tag_index)
+        #
+        #
+        # # Get the label text of the tag at the current index
+        # label_text = self.__text_entry.GetValue()
+        # if not label_text:
+        #     return
+        # # Remove any  tag matching that label text.
+        #
+        # # Remove this label row from the parent panel
+        # parent_panel: BoxTagPanelEdit = self.GetParent()
+        # parent_panel.__box.tags.pop(self.__tag_index)
 
 class BoxTagPanelEdit(wx.Panel):
     __box: BoxData
