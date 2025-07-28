@@ -2,6 +2,7 @@ import numpy as np
 import wx
 import copy
 
+from FrameData import FrameData
 from boxdata import BoxData
 from events.BoxAddedEvent import BoxAddedEvent
 from events.BoxSelectedEvent import BoxSelectedEvent, BoxDeselectedEvent
@@ -17,6 +18,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     image: np.ndarray | None
     bitmap: wx.Bitmap | None
     __boxes: list[BoxData]
+    __frame_data: FrameData
     _selected_box: BoxData | None = None
     dragging: bool
     start_pos: wx.Point | None
