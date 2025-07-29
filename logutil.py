@@ -22,10 +22,26 @@ def load_config() -> None:
     logging.config.dictConfig(config)
 
 
+def get_file_name(file_path: str) -> str | None:
+    """Extract the file name from a file path."""
+    if not file_path:
+        return None
+    return file_path.split('/')[-1].split('\\')[-1]  # Handle both Unix and Windows paths
+
 def getLog() -> logging.Logger:
     # Get the caller's frame (1 level up)
     frame = inspect.currentframe().f_back
-    method_name = frame.f_code.co_name
+    ct = frame.f_code
+    parts = ct.co_qualname.split('.')
+    method_name = parts[0]
+    if len(parts) == 1:
+        # If no module or class name, use the function name directly
+        method_name = get_file_name(ct.co_filename)
+    # if len(parts) > 1:
+    #     method_name = '.'.join(parts[-2:])
+    # else:
+    #     # Remove redundant prefix if present (e.g., "func:func")
+    #     method_name = ct.co_qualname.split(':')[-1]
     logger = logging.getLogger(method_name)
     logger.setLevel(DEFAULT_LOG_LEVEL)
     return logger
