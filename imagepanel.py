@@ -21,6 +21,8 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     __boxes: list[BoxData]
     __frame_data: FrameData
     _selected_box: BoxData | None = None
+    __dragging_box: BoxData | None = None
+    __drag_offset: tuple[int, int] | None
     dragging: bool
     start_pos: wx.Point | None
     end_pos: wx.Point | None
@@ -48,6 +50,9 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self.Bind(wx.EVT_LEFT_UP, self.on_left_up)
         self.Bind(wx.EVT_MOTION, self.on_motion)
         self.Bind(EVT_BOX_EDITED, self.__on_box_edited)
+        self.Bind(wx.EVT_LEFT_DOWN, self.on_mouse_down)
+        self.Bind(wx.EVT_MOTION, self.on_mouse_move)
+        self.Bind(wx.EVT_LEFT_UP, self.on_mouse_up)
         self.undo_stack = []
         self.redo_stack = []
 
@@ -155,6 +160,48 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self.dragging = True
         self.start_pos = click_point
 
+    def on_mouse_down(self, event: wx.MouseEvent) -> None:
+        pos: wx.Point = event.GetPosition()
+        self.__dragging_box: BoxData | None = self.get_box_at_position(pos)
+        if self.__dragging_box is not None:
+            self.__drag_offset: tuple[int, int] = (pos.x - self.__dragging_box.coords[0],
+                                                 pos.y - self.__dragging_box.coords[1])
+        event.Skip()
+
+    def get_box_at_position(self, pos: wx.Point) -> BoxData | None:
+        """Get the box at the given position."""
+        for box in self.__boxes:
+            if self.point_in_box(pos, box):
+                return box
+        return None
+
+    def on_mouse_move(self, event: wx.MouseEvent) -> None:
+        if event.Dragging() and event.LeftIsDown() and self.__dragging_box is not None:
+            pos: wx.Point = event.GetPosition()
+            x_offset, y_offset = self.__drag_offset
+            w, h = self.__dragging_box.coords[2], self.__dragging_box.coords[3]
+            new_coords: tuple[int, int, int, int] = (pos.x - x_offset, pos.y - y_offset, w, h)
+            self.__dragging_box.coords = new_coords
+            self.Refresh()  # Redraw panel
+        event.Skip()
+
+    def on_mouse_up(self, event: wx.MouseEvent) -> None:
+        if self.__dragging_box is not None:
+            # Fire a custom event to notify that the box was edited
+            evt: BoxEditedEvent = BoxEditedEvent(source=self, box=self.__dragging_box)
+            wx.PostEvent(self, evt)
+            self.__dragging_box = None
+        event.Skip()
+
+    def to_img_coords(self, x: int, y: int) -> tuple[int, int]:
+        bx: int = self.bmp_size[0]
+        by: int = self.bmp_size[1]
+        iw: int = self.img_size[0]
+        ih: int = self.img_size[1]
+        img_x: int = int(x / bx * iw)
+        img_y: int = int(y / by * ih)
+        return img_x, img_y
+
     def on_left_up(self, event: wx.MouseEvent) -> None:
         if self.dragging:
             mouse_pos: wx.Point = event.GetPosition()
@@ -169,17 +216,8 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             x2: int = self.end_pos.x
             y2: int = self.end_pos.y
 
-            def to_img_coords(x: int, y: int) -> tuple[int, int]:
-                bx: int = self.bmp_size[0]
-                by: int = self.bmp_size[1]
-                iw: int = self.img_size[0]
-                ih: int = self.img_size[1]
-                img_x: int = int(x / bx * iw)
-                img_y: int = int(y / by * ih)
-                return img_x, img_y
-
-            img_start: tuple[int, int] = to_img_coords(x1, y1)
-            img_end: tuple[int, int] = to_img_coords(x2, y2)
+            img_start: tuple[int, int] = self.to_img_coords(x1, y1)
+            img_end: tuple[int, int] = self.to_img_coords(x2, y2)
             coords: tuple[int, int, int, int] = (
                 img_start[0], img_start[1],
                 img_end[0] - img_start[0], img_end[1] - img_start[1]
@@ -215,7 +253,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         label = ', '.join(box.tags)
         return label
 
-    def on_paint(self, event: wx.PaintEvent):
+    def on_paint(self, _event: wx.PaintEvent):
         dc = wx.BufferedPaintDC(self)
         dc.Clear()
         if self.bitmap:
