@@ -89,6 +89,7 @@ class ScrubberFrame(wx.Frame):
     __frame_boxes: Dict[int, List[BoxData]] = {}  # Map of frame index to BoxData
     # __boxes: List[BoxData] = []  # Or load from your data source
     __image_panel: ImagePanel
+    __tag_panel: TagPanel
     __button_panel: ControlsPanel
     __box_data_filename: str | None = None
 
@@ -150,24 +151,24 @@ class ScrubberFrame(wx.Frame):
 
         image_and_tag_sizer.Add(self.__image_panel, 1, wx.EXPAND | wx.ALL, 10)
 
-        self.tag_panel = TagPanel(
+        self.__tag_panel = TagPanel(
             main_panel,
         )
-        self.__image_panel.Bind(EVT_BOX_SELECTED, self.tag_panel.on_box_selected)
+        self.__image_panel.Bind(EVT_BOX_SELECTED, self.__tag_panel.on_box_selected)
         frame_boxes = self.__get_frame_boxes(self._current_index)
-        self.tag_panel.update_boxes(frame_boxes)
+        self.__tag_panel.boxes = frame_boxes
         # print(f'ScrubberFrame.__init__: TagPanel referencing {hex(id(self.__boxes))}=>{self.__boxes}')
-        self.tag_panel.bind_box_events(self.__image_panel)
+        self.__tag_panel.bind_box_events(self.__image_panel)
         # self.image_panel.Bind(EVT_BOX_ADDED, self.tag_panel.Refresh)
 
-        image_and_tag_sizer.Add(self.tag_panel, 0, wx.EXPAND | wx.ALL, 10)
+        image_and_tag_sizer.Add(self.__tag_panel, 0, wx.EXPAND | wx.ALL, 10)
 
         vbox.Add(image_and_tag_sizer, 1, wx.EXPAND | wx.ALL, 5)
 
         # Add ControlsPanel below image_panel
         self.__button_panel = ControlsPanel(main_panel)
         vbox.Add(self.__button_panel, 0, wx.CENTER, 0)
-        self.__button_panel.bind_buttons(self.on_prev, self.on_next, self.on_rotate_ccw, self.on_rotate_cw)
+        self.__button_panel.bind_buttons(self.on_prev, self.on_next, self.on_next_empty, self.on_rotate_ccw, self.on_rotate_cw, self.__on_remove_selected)
 
         # Add MarkerPanel below image_panel
         self.marker_panel = MarkerPanel(main_panel, num_frames)
@@ -206,7 +207,7 @@ class ScrubberFrame(wx.Frame):
         self.__image_panel.boxes = self.__current_boxes
 
         frame_boxes = self.__get_frame_boxes(self._current_index)
-        self.tag_panel.update_boxes(frame_boxes)
+        self.__tag_panel.boxes = frame_boxes
 
         self.__button_panel.set_prev_enabled(self._current_index > 0)
         self.__button_panel.set_next_enabled(self._current_index < self.num_frames)
@@ -214,11 +215,11 @@ class ScrubberFrame(wx.Frame):
         self.slider.SetValue(self._current_index)
         self.Refresh()
 
-    def on_resize(self, event):
+    def on_resize(self, event: wx.CommandEvent):
         self.display_image()
         event.Skip()
 
-    def on_prev(self, event):
+    def on_prev(self, _event: wx.CommandEvent):
         if self._current_index > 0:
             self._current_index -= 1
             self.display_image()
@@ -227,7 +228,7 @@ class ScrubberFrame(wx.Frame):
         """Check if the current frame has boxes."""
         return index in self.__frame_boxes and len(self.__frame_boxes[index]) > 0
 
-    def on_next(self, event):
+    def on_next(self, _event: wx.CommandEvent):
         if self._current_index < self.num_frames - 1:
             next_index = self._current_index + 1
 
@@ -255,27 +256,51 @@ class ScrubberFrame(wx.Frame):
 
             self.display_image()
 
-    def on_slider(self, event):
-        self._current_index = self.slider.GetValue()
-        self.display_image()
+    def goto_frame(self, index: int, set_slider: bool = True) -> bool:
+        """Go to a specific frame index."""
+        if 0 <= index < self.num_frames:
+            self._current_index = index
+            if set_slider and self.slider is not None:
+                self.slider.SetValue(index)
+            self.display_image()
+            return True
+        else:
+            getLog().warning(f"Index {index} out of bounds for {self.num_frames} frames.")
 
-    def on_rotate_cw(self, event: wx.CommandEvent) -> None:
+        return False
+
+    def on_slider(self, _event: wx.CommandEvent) -> bool:
+        return self.goto_frame(self.slider.GetValue(), set_slider=False)
+
+    def on_next_empty(self, _event: wx.CommandEvent) -> bool:
+        current_index = self._current_index
+        total_frames = self.num_frames
+
+        for idx in range(current_index + 1, total_frames):
+            if not self.frame_has_boxes(idx):  # implement has_boxes(idx) to check for boxes
+                self.goto_frame(idx)  # implement goto_frame(idx) to show the frame
+                return True
+
+        wx.MessageBox("No more empty frames found.", "Info", wx.OK | wx.ICON_INFORMATION)
+        return False
+
+    def on_rotate_cw(self, _event: wx.CommandEvent) -> None:
         self._rotation_angle = (self._rotation_angle + 90) % 360
         self.__image_panel.rotate_boxes(self._rotation_angle)
         self.display_image()
 
-    def on_rotate_ccw(self, event: wx.CommandEvent) -> None:
+    def on_rotate_ccw(self, _event: wx.CommandEvent) -> None:
         self._rotation_angle = (self._rotation_angle - 90) % 360
         self.__image_panel.rotate_boxes(self._rotation_angle)
         self.display_image()
 
-    def on_show(self, event):
+    def on_show(self, event: wx.ShowEvent):
         if event.IsShown():
             self.GetChildren()[0].Layout()  # main_panel.Layout()
             self.display_image()
         event.Skip()
 
-    def on_key_down(self, event):
+    def on_key_down(self, event: wx.KeyEvent):
         keycode = event.GetKeyCode()
         control_down = event.ControlDown()
         shift_down = event.ShiftDown()
@@ -295,11 +320,11 @@ class ScrubberFrame(wx.Frame):
 
     def on_box_update(self) -> None:
         """Called when a box is updated, e.g., after adding or removing a tag."""
-        self.tag_panel.update_boxes(self.__current_boxes)
+        self.__tag_panel.boxes = self.__current_boxes
         self.Refresh()
 
     @current_index.setter
-    def current_index(self, index):
+    def current_index(self, index: int):
         if 0 <= index < self.num_frames:
             self._current_index = index
             if self.slider is not None:
@@ -315,7 +340,7 @@ class ScrubberFrame(wx.Frame):
         """Count the number of boxes in the current frame."""
         return count
 
-    def on_close(self, event):
+    def on_close(self, event: wx.CloseEvent) -> None:
         # Save boxes before exiting
         count = self.count_boxes()
         save_boxes_to_file(self.__box_data_filename, self.__frame_boxes)
@@ -324,8 +349,9 @@ class ScrubberFrame(wx.Frame):
 
     def on_box_selected(self, event: BoxSelectedEvent) -> None:
         selected_box = event.box
+        self.__tag_panel.selected_box = selected_box
         getLog().debug(f'Selected box {selected_box.coords} with tags {selected_box.tags}')
-        # self.tag_panel.set_selected(event.box)
+        # self.__tag_panel.set_selected(event.box)
 
     @staticmethod
     def find_object_in_next_frame(
@@ -381,3 +407,18 @@ class ScrubberFrame(wx.Frame):
                 )
                 return new_data
         return None
+
+    def get_selected_box(self) -> BoxData | None:
+        """Get the currently selected box from the tag panel."""
+        return self.__image_panel.selected_box if self.__image_panel else None
+
+    def __on_remove_selected(self, event: wx.CommandEvent) -> None:
+        selected_box: BoxData | None = self.get_selected_box()  # Implement this method as needed
+        if selected_box is not None:
+            frame_index: int = self.current_index
+            boxes: list[BoxData] = self.__get_frame_boxes(frame_index)
+            if selected_box in boxes:
+                boxes.remove(selected_box)
+                # self.tag_panel.update_boxes(boxes)
+                self.__tag_panel.boxes = boxes
+                self.__image_panel.boxes = boxes

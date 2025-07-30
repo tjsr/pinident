@@ -157,11 +157,7 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
     def boxes(self, boxes: List[BoxData]) -> None:
         """Set the boxes and update the UI."""
         self.__boxes = boxes
-        self.set_ui()
-
-    def update_boxes(self, boxes: List[BoxData]) -> None:
-        self.__boxes = boxes
-        self.set_ui()
+        self.Refresh()
 
     def update_box(self, box: BoxData) -> None:
         getLog().info(f'Updating box {box.coords} in TagPanel with {len(self.__boxes)} boxes')

@@ -424,3 +424,8 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
 
         dc.DrawRectangle(label_rect)
         dc.DrawText(truncated_text, label_rect.x + 2, label_rect.y + 2)
+
+    @property
+    def selected_box(self) -> BoxData | None:
+        """Get the currently selected box."""
+        return self._selected_box
