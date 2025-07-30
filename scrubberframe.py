@@ -39,7 +39,7 @@ def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
     """Merge boxes with the same coordinates and tags."""
     merged: Dict[Coordinate, BoxData] = {}
     for box in boxes:
-        key = (box.coords, tuple(sorted(box.tags)))
+        key = box.coords # , tuple(sorted(box.tags)))
         if key not in merged:
             merged[key] = BoxData(coords=box.coords, tags=copy(box.tags), source=box.source)
         else:
@@ -62,6 +62,27 @@ def load_boxes_from_stream(stream) -> dict[int, list[BoxData]]:
 def load_boxes_from_file(filename: str) -> dict[int, list[BoxData]]:
     with open(filename, "r", encoding="utf-8") as f:
         return load_boxes_from_stream(f)
+
+def filter_zero_sized_boxes(boxes: dict[int, list[BoxData]]) -> dict[int, list[BoxData]]:
+    """Filter out boxes with zero width or height."""
+    filtered_boxes: Dict[int, List[BoxData]] = {}
+    for frame_index, box_list in boxes.items():
+        for box in box_list:
+            if not isinstance(box, BoxData):
+                getLog().warning(f"Skipping non-BoxData object: {box}")
+                continue
+            if not isinstance(box.coords, tuple) or len(box.coords) != 4:
+                getLog().warning(f"Skipping box with invalid coords: {box.coords}")
+                continue
+            if not box.is_non_zero_sized():
+                getLog().debug(f"Skipping zero-sized box: {box.coords}")
+                continue
+
+            if frame_index not in filtered_boxes:
+                filtered_boxes[frame_index] = []
+            filtered_boxes[frame_index].append(box)
+
+    return filtered_boxes
 
 
 class ScrubberFrame(wx.Frame):
@@ -95,7 +116,9 @@ class ScrubberFrame(wx.Frame):
         """Load box data from the specified file."""
         if self.box_data_filename and os.path.exists(self.box_data_filename):
             try:
-                self.__frame_boxes = load_boxes_from_file(self.box_data_filename)
+                boxes = load_boxes_from_file(self.box_data_filename)
+                self.__frame_boxes = filter_zero_sized_boxes(boxes)
+                # self.__frame_boxes = merge_duplicate_boxes(boxes)
                 count = self.count_boxes()
                 getLog().info(f"Loaded {count} boxes in data from {self.box_data_filename}")
                 return self.__frame_boxes
@@ -223,7 +246,7 @@ class ScrubberFrame(wx.Frame):
                 for box in frame_boxes:
                     new_bbox = self.find_object_in_next_frame(current_frame, next_frame, box)
                     if new_bbox is not None:
-                        getLog().debug('Found new coordinates for box:', box, '->', new_bbox)
+                        getLog().debug(f'Found new coordinates for box: {box}->{new_bbox}')
                         found_boxes.append(new_bbox)
 
                 if next_index not in self.__frame_boxes:

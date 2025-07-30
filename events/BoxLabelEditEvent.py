@@ -9,7 +9,7 @@ class BoxLabelEditedEvent(wx.CommandEvent):
 	__label_index: int
 
 	"""Custom event for box label updates."""
-	def __init__(self, source: wx.Panel, label_index: int, new_label: TagLabel):
+	def __init__(self, source: wx.Panel, label_index: int, new_label: TagLabel | None = None):
 		super().__init__(wxEVT_BOX_LABEL_EDITED, source.GetId())
 		self.SetEventObject(source)
 		self.__new_label = new_label
@@ -28,6 +28,16 @@ class BoxLabelEditedEvent(wx.CommandEvent):
 		return BoxLabelEditedEvent(self.GetEventObject(), self.label_index, self.new_label) # type: ignore[arg-type]
 
 class BoxLabelRemovedEvent(BoxLabelEditedEvent):
+	__new_label: TagLabel | None
+
+	"""Custom event for box label removal."""
+	def __init__(self, source: wx.Panel, label_index: int):
+		super().__init__(source, label_index)
+		self.SetEventType(wxEVT_BOX_LABEL_EDITED)  # Use the same event type for removal
+		self._label_index = label_index
+		self.__new_label = None  # Empty label to indicate removal
+
+class BoxLabelRemoveEvent(BoxLabelEditedEvent):
 	__new_label: TagLabel | None
 
 	"""Custom event for box label removal."""

@@ -1,5 +1,8 @@
 import wx
 
+from events.BoxEditedEvent import BoxEditedEvent
+from events.events import EVT_BOX_EDITED
+
 
 class MarkerPanel(wx.Panel):
     def __init__(self, parent, num_images, interval=5):
@@ -8,7 +11,7 @@ class MarkerPanel(wx.Panel):
         self.interval = interval
         self.Bind(wx.EVT_PAINT, self.on_paint)
 
-    def on_paint(self, event):
+    def on_paint(self, event: wx.PaintEvent):
         dc = wx.PaintDC(self)
         width = self.GetSize().GetWidth()
         last_x = -32  # Start so first marker is always drawn

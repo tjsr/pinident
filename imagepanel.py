@@ -5,9 +5,10 @@ import copy
 from FrameData import FrameData
 from boxdata import BoxData
 from events.BoxAddedEvent import BoxAddedEvent
+from events.BoxEditedEvent import BoxEditedEvent
 from events.BoxSelectedEvent import BoxSelectedEvent, BoxDeselectedEvent
 from events.BoxUpdatedEvent import BoxUpdatedEvent
-from events.events import wxEVT_BOX_SELECTED, EVT_BOX_SELECTED
+from events.events import wxEVT_BOX_SELECTED, EVT_BOX_SELECTED, EVT_BOX_EDITED
 from logutil import getLog
 
 RotationAngle = int
@@ -46,6 +47,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self.Bind(wx.EVT_LEFT_DOWN, self.on_left_down)
         self.Bind(wx.EVT_LEFT_UP, self.on_left_up)
         self.Bind(wx.EVT_MOTION, self.on_motion)
+        self.Bind(EVT_BOX_EDITED, self.__on_box_edited)
         self.undo_stack = []
         self.redo_stack = []
 
@@ -226,71 +228,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 img_w, img_h = img_h, img_w
                 bx, by = by, bx
             for box in self.__boxes:
-                # Check if the box is selected
-                is_selected = self._selected_box is not None and self._is_box_selected(box)
-                coords = box.coords  # (x, y, w, h) in original image space
-
-                def rotate_point(x, y, w, h, angle, orig_w, orig_h):
-                    if angle == 90:
-                        return orig_h - y - h, x, h, w
-                    elif angle == 180:
-                        return orig_w - x - w, orig_h - y - h, w, h
-                    elif angle == 270:
-                        return y, orig_w - x - w, h, w
-                    else:
-                        return x, y, w, h
-
-                # Use original image size for rotation
-                x, y, w, h = rotate_point(coords[0], coords[1], coords[2], coords[3], self.rotation_angle,
-                                          self.img_size[0], self.img_size[1])
-
-                # Map image coordinates to bitmap coordinates using swapped dimensions
-                bmp_x1 = int(x / img_w * bx)
-                bmp_y1 = int(y / img_h * by)
-                bmp_x2 = int((x + w) / img_w * bx)
-                bmp_y2 = int((y + h) / img_h * by)
-
-                rect = wx.Rect(bmp_x1 + offset_x, bmp_y1 + offset_y, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
-                stroke_width = 3 if is_selected else 1
-
-                # Draw label area at the bottom edge
-                label_text = self.get_box_label_text(box) or ""
-                label_rect_height = 18  # px, adjust as needed
-                label_rect = wx.Rect(
-                    bmp_x1 + offset_x,
-                    bmp_y2 + offset_y - label_rect_height,
-                    bmp_x2 - bmp_x1,
-                    label_rect_height
-                )
-
-                if label_text.startswith("unknown-"):
-                    getLog().debug(f'{box} with unknown label.')
-
-                colour: wx.Colour
-                if box.source == 'user':
-                    colour = wx.RED
-                elif box.source == 'automatic':
-                    colour = wx.BLUE
-                else:
-                    colour = wx.YELLOW
-                dc.SetPen(wx.Pen(colour, stroke_width))
-                dc.SetBrush(wx.TRANSPARENT_BRUSH)
-                dc.DrawRectangle(rect)
-
-                # Truncate text to fit box width
-                dc.SetBrush(wx.Brush(colour))
-                font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
-                dc.SetFont(font)
-                dc.SetTextForeground(wx.WHITE)
-                max_width = label_rect.GetWidth() - 4
-                truncated_text = label_text
-                while dc.GetTextExtent(truncated_text)[0] > max_width and len(truncated_text) > 0:
-                    truncated_text = truncated_text[:-1]
-                if truncated_text != label_text and len(truncated_text) > 3:
-                    truncated_text = truncated_text[:-3] + "..."
-
-                dc.DrawRectangle(label_rect)
-                dc.DrawText(truncated_text, label_rect.x + 2, label_rect.y + 2)
+                self.paint_box(dc, box, offset_x, offset_y, img_w, img_h, bx, by)
 
             # Draw current drag box
             if self.dragging and self.start_pos and self.end_pos:
@@ -326,6 +264,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         if not self.undo_stack:
             return
         action = self.undo_stack.pop()
+        getLog().debug(f'Actioned undo for {action[0]}')
         if action[0] == 'draw_box':
             self.redo_stack.append(('draw_box', copy.deepcopy(self.__boxes)))
             self.__boxes = copy.deepcopy(action[1])
@@ -339,11 +278,11 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         wx.PostEvent(self, update_event)
         self.Refresh()
 
-    def add_new_box(self, coords: tuple[int, int, int, int], source: str) -> None:
+    def add_new_box(self, coords: tuple[int, int, int, int], source: str = 'user') -> None:
         """Add a new box with the given coordinates."""
         box_number = len(self.__boxes) + 1
         new_box_label = f"unknown-{box_number}"
-        new_box = BoxData(coords, [new_box_label], 'user')
+        new_box = BoxData(coords, [new_box_label], source)
         self.__boxes.append(new_box)
         box_added_event = BoxAddedEvent(self, new_box)
         getLog().info(f'New box added: {new_box}, {box_added_event}')
@@ -354,6 +293,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         if not self.redo_stack:
             return
         action = self.redo_stack.pop()
+        getLog().debug(f'Actioned redo for {action[0]}')
         if action[0] == 'draw_box':
             self.undo_stack.append(('draw_box', copy.deepcopy(self.__boxes)))
             self.__boxes = copy.deepcopy(action[1])
@@ -381,6 +321,11 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             box.tags.remove(tag)
             self.Refresh()
 
+    def __on_box_edited(self, event: BoxEditedEvent) -> None:
+        """Handle box edited event."""
+        getLog().info(f'Box {event.box} edited in {event.GetEventObject()}')
+        self.Refresh()
+
     @property
     def boxes(self) -> list[BoxData]:
         """Get the list of boxes."""
@@ -389,5 +334,93 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     @boxes.setter
     def boxes(self, new_boxes: list[BoxData]) -> None:
         """Set the list of boxes and clear undo/redo stacks."""
-        self.__boxes = new_boxes
+        if new_boxes is None:
+            new_boxes = []
+        else:
+            self.__boxes = new_boxes
+        getLog().debug(f'Setting {len(new_boxes)} boxes in ImagePanel mutator')
+
         self.Refresh()  # Redraw the image panel
+
+    @staticmethod
+    def rotate_point(x: int, y: int, w: int, h: int, angle, orig_w, orig_h):
+        if angle == 90:
+            return orig_h - y - h, x, h, w
+        elif angle == 180:
+            return orig_w - x - w, orig_h - y - h, w, h
+        elif angle == 270:
+            return y, orig_w - x - w, h, w
+        else:
+            return x, y, w, h
+
+    def paint_box(
+        self,
+        dc: wx.DC,
+        box: BoxData,
+        offset_x: int,
+        offset_y: int,
+        img_w: int,
+        img_h: int,
+        bx: int,
+        by: int
+    ) -> None:
+        # Check if the box is selected
+        is_selected = self._selected_box is not None and self._is_box_selected(box)
+        coords = box.coords  # (x, y, w, h) in original image space
+
+        # Use original image size for rotation
+        x, y, w, h = ImagePanel.rotate_point(
+                         coords[0], coords[1], coords[2], coords[3],
+                         self.rotation_angle,
+                         self.img_size[0], self.img_size[1]
+                    )
+
+        # Map image coordinates to bitmap coordinates using swapped dimensions
+        bmp_x1 = int(x / img_w * bx)
+        bmp_y1 = int(y / img_h * by)
+        bmp_x2 = int((x + w) / img_w * bx)
+        bmp_y2 = int((y + h) / img_h * by)
+
+        rect = wx.Rect(bmp_x1 + offset_x, bmp_y1 + offset_y, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
+        stroke_width = 3 if is_selected else 1
+
+        # Draw label area at the bottom edge
+        label_text = self.get_box_label_text(box) or ""
+        label_rect_height = 18  # px, adjust as needed
+        label_rect = wx.Rect(
+            bmp_x1 + offset_x,
+            bmp_y2 + offset_y - label_rect_height,
+            bmp_x2 - bmp_x1,
+            label_rect_height
+        )
+
+        if label_text.startswith("unknown-"):
+            getLog().debug(f'Painting {box} with unknown label.')
+        else:
+            getLog().debug(f'Painting box {box}')
+
+        colour: wx.Colour
+        if box.source == 'user':
+            colour = wx.RED
+        elif box.source == 'automatic':
+            colour = wx.BLUE
+        else:
+            colour = wx.YELLOW
+        dc.SetPen(wx.Pen(colour, stroke_width))
+        dc.SetBrush(wx.TRANSPARENT_BRUSH)
+        dc.DrawRectangle(rect)
+
+        # Truncate text to fit box width
+        dc.SetBrush(wx.Brush(colour))
+        font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+        dc.SetFont(font)
+        dc.SetTextForeground(wx.WHITE)
+        max_width = label_rect.GetWidth() - 4
+        truncated_text = label_text
+        while dc.GetTextExtent(truncated_text)[0] > max_width and len(truncated_text) > 0:
+            truncated_text = truncated_text[:-1]
+        if truncated_text != label_text and len(truncated_text) > 3:
+            truncated_text = truncated_text[:-3] + "..."
+
+        dc.DrawRectangle(label_rect)
+        dc.DrawText(truncated_text, label_rect.x + 2, label_rect.y + 2)

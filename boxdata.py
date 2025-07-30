@@ -49,6 +49,13 @@ class BoxData:
         self._tags.append(tag)
         return len(self._tags)
 
+    def remove_tag(self, index: int) -> None:
+        """Remove the tag at the specified index."""
+        if 0 <= index < len(self._tags):
+            del self._tags[index]
+        else:
+            raise IndexError("Tag index out of range")
+
     @property
     def source(self) -> str | None:
         """Get the source of the box data."""
@@ -87,3 +94,6 @@ class BoxData:
         if not isinstance(value, bool):
             raise ValueError("has_backing_card must be a boolean value")
         self.__has_backing_card = value
+
+    def is_non_zero_sized(self) -> bool:
+        return self.coords[2] > 0 and self.coords[3] > 0  # Check width and height

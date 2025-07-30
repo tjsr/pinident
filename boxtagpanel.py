@@ -5,8 +5,8 @@ from wx import EVT_BUTTON
 
 from boxdata import BoxData
 from events.BoxEditedEvent import BoxEditedEvent
-from events.BoxLabelEditEvent import BoxLabelEditedEvent
-from events.events import EVT_BOX_LABEL_EDITED
+from events.BoxLabelEditEvent import BoxLabelEditedEvent, BoxLabelRemoveEvent
+from events.events import EVT_BOX_LABEL_EDITED, EVT_BOX_EDITED, EVT_BOX_LABEL_REMOVE
 from logutil import getLog
 
 
@@ -96,6 +96,9 @@ class BoxTagLabelRow(wx.Panel):
         if self.__is_only_row:
             return
 
+        remove_event = BoxLabelRemoveEvent(self, self.__tag_index)
+        wx.PostEvent(self, remove_event)
+
         # # Remove the label of the current index from the box's tag list.
         # self.__box.remove_tag(self.__tag_index)
         #
@@ -130,21 +133,22 @@ class BoxTagPanelEdit(wx.Panel):
     ):
         super().__init__(parent)
         self.__is_selected: bool = False
-        self.__box = box
         self.__heading_text = wx.StaticText(self, label=f"Box: {box.coords}")
         self.__heading_text.SetMinSize(wx.Size(240, -1))
-        self.__box_tags = []
         self.__sizer = wx.BoxSizer(wx.VERTICAL)
         self.__sizer.Add(self.__heading_text, 0, wx.EXPAND | wx.ALL, 5)
 
         self.__add_button = wx.Button(self, label="Add")
         self.__add_button.Bind(wx.EVT_BUTTON, self.__on_add_tag)
         self.__sizer.Add(self.__add_button, 0, wx.ALIGN_LEFT | wx.ALL, 5)
+        self.Bind(EVT_BOX_EDITED, self.update_after_edited)
 
         self.SetSizer(self.__sizer)
-        self.repaint_box()
 
-    def repaint_box(self) -> None:
+        self.box = box
+
+
+    def Refresh(self) -> None:
         log = getLog()
         tag_index: int = 0
         tag_count: int = len(self.__box.tags)
@@ -152,7 +156,7 @@ class BoxTagPanelEdit(wx.Panel):
         self.__heading_text.SetLabelText(f"Box: {self.__box.coords}")
 
         while tag_index < tag_count:
-            log.debug(f'Repainting tag {tag_index}/{tag_count} on {self}')
+            log.debug(f'Repainting tag {tag_index+1}/{tag_count} on {self}')
             self.repaint_tag(tag_index)
             tag_index += 1
 
@@ -161,7 +165,11 @@ class BoxTagPanelEdit(wx.Panel):
             removed_tag = self.__box_tags.pop()
             removed_tag.Destroy()
 
+        ab = self.__add_button
+        # self.__sizer.Layout()
         self.Layout()
+        super().Refresh()
+
 
     def repaint_tag(self, tag_index: int) -> None:
         tag = self.__box.tags[tag_index]
@@ -177,9 +185,9 @@ class BoxTagPanelEdit(wx.Panel):
 
         is_only_row = len(self.__box_tags) == 1 and tag_index == 0
 
-        current_label_row.Bind(EVT_BOX_LABEL_EDITED, self.__on_label_edited)
         current_label_row.set_tag(tag, is_only_row)
-        self.__sizer.Layout()
+        # self.Bind(EVT_BOX_LABEL_EDITED, self.__on_label_edited, current_label_row)
+        current_label_row.Refresh()
 
     def get_or_create_label(self, index: int) -> BoxTagLabelRow:
         """Get or create a BoxTagLabelRow for the given index."""
@@ -187,6 +195,9 @@ class BoxTagPanelEdit(wx.Panel):
             return self.__box_tags[index]
 
         new_label = BoxTagLabelRow(self, self.__box, index, self.__choices)
+        new_label.Bind(EVT_BOX_LABEL_REMOVE, self.__on_tag_remove)
+        new_label.Bind(EVT_BOX_LABEL_EDITED, self.__on_label_edited)
+        new_label.Bind(wx.EVT_PAINT, self.__on_label_repainted)
 
         # Always insert before the Add button (which is the last item)
         sizer_children = self.__sizer.GetChildren()
@@ -206,13 +217,38 @@ class BoxTagPanelEdit(wx.Panel):
     def __on_add_tag(self, event: wx.CommandEvent) -> None:
         # Add a new empty tag
         self.__box.tags.append("")
-        self.repaint_box()
         boxEditEvent = BoxEditedEvent(self, self.__box)
         wx.PostEvent(self, boxEditEvent)
+
+    def __on_label_repainted(self, event: wx.PaintEvent) -> None:
+        pass
+        # self.Refresh()
+
+    def __on_tag_remove(self, event: BoxLabelRemoveEvent) -> None:
+        """Handle tag removal."""
+        if event.label_index < 0 or event.label_index >= len(self.__box.tags):
+            return
+
+        self.__box.remove_tag(event.label_index)
+        boxEditEvent = BoxEditedEvent(self, self.__box)
+        wx.PostEvent(self, boxEditEvent)
+
+    def update_after_edited(self, event: BoxLabelEditedEvent):
+        pass
+        # self.Refresh()
 
     @property
     def box(self) -> BoxData:
         return self.__box
+
+    @box.setter
+    def box(self, value: BoxData) -> None:
+        """Set the box data and update the UI."""
+        if not isinstance(value, BoxData):
+            raise ValueError("Expected a BoxData instance.")
+        self.__box = value
+        self.__box_tags = []
+        self.Refresh()  # Refresh to apply the new box data
 
     @property
     def selected(self) -> bool:
@@ -231,3 +267,7 @@ class BoxTagPanelEdit(wx.Panel):
 
         self.__heading_text.SetFont(heading_font)
         self.Refresh()  # Refresh to apply the new background color
+
+    def __str__(self) -> str:
+        """Return a string representation of the box."""
+        return f"BoxTagPanelEdit(box={self.__box})"
