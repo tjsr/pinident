@@ -11,6 +11,8 @@ class ControlsPanel(wx.Panel):
         self.rotate_ccw_btn = wx.Button(self, label='Rotate CCW')
         self.rotate_cw_btn = wx.Button(self, label='Rotate CW')
         self.remove_selected_btn = wx.Button(self, label='Remove Selected')
+        self.process_btn = wx.Button(self, label='Process')
+
 
         sizer.Add(self.prev_btn, 0, wx.ALL, 5)
         sizer.Add(self.next_btn, 0, wx.ALL, 5)
@@ -18,15 +20,17 @@ class ControlsPanel(wx.Panel):
         sizer.Add(self.rotate_ccw_btn, 0, wx.ALL, 5)
         sizer.Add(self.rotate_cw_btn, 0, wx.ALL, 5)
         sizer.Add(self.remove_selected_btn, 0, wx.ALL, 5)
+        sizer.Add(self.process_btn, 0, wx.ALL, 5)
         self.SetSizer(sizer)
 
-    def bind_buttons(self, prev_handler, next_handler, on_next_empty, rotate_ccw_handler, rotate_cw_handler, on_remove_selected):
+    def bind_buttons(self, prev_handler, next_handler, on_next_empty, rotate_ccw_handler, rotate_cw_handler, on_remove_selected, on_process):
         self.prev_btn.Bind(wx.EVT_BUTTON, prev_handler)
         self.next_btn.Bind(wx.EVT_BUTTON, next_handler)
         self.next_empty_button.Bind(wx.EVT_BUTTON, on_next_empty)
         self.rotate_ccw_btn.Bind(wx.EVT_BUTTON, rotate_ccw_handler)
         self.rotate_cw_btn.Bind(wx.EVT_BUTTON, rotate_cw_handler)
         self.remove_selected_btn.Bind(wx.EVT_BUTTON, on_remove_selected)
+        self.process_btn.Bind(wx.EVT_BUTTON, on_process)
 
     def set_prev_enabled(self, enabled: bool):
         self.prev_btn.Enable(enabled)

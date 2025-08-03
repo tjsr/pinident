@@ -1,3 +1,5 @@
+from typing import Optional, Tuple
+
 import numpy as np
 import wx
 import copy
@@ -8,7 +10,7 @@ from events.BoxAddedEvent import BoxAddedEvent
 from events.BoxEditedEvent import BoxEditedEvent
 from events.BoxSelectedEvent import BoxSelectedEvent, BoxDeselectedEvent
 from events.BoxUpdatedEvent import BoxUpdatedEvent
-from events.events import wxEVT_BOX_SELECTED, EVT_BOX_SELECTED, EVT_BOX_EDITED
+from events.events import EVT_BOX_EDITED
 from logutil import getLog
 
 RotationAngle = int
@@ -30,8 +32,12 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     img_size: ImageSize
     bmp_size: ImageSize
     rotation_angle: RotationAngle
+    resizing_box: Optional[BoxData] = None
+    resize_edge: Optional[str] = None  # e.g., 'left', 'right', 'top', 'bottom', 'topleft', etc.
     undo_stack: list[tuple[UserAction, RotationAngle, list[BoxData]] | tuple[UserAction, list[BoxData]]]
     redo_stack: list[tuple[UserAction, RotationAngle, list[BoxData]] | tuple[UserAction, list[BoxData]]]
+
+    _RESIZE_MARGIN: int = 6
 
     def __init__(self, parent: wx.Window):
         super().__init__(parent)
@@ -45,6 +51,8 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self.img_size = (0, 0)
         self.bmp_size = (0, 0)
         self.rotation_angle = 0
+        self.resizing_box: Optional[BoxData] = None
+        self.resize_edge: Optional[str] = None  # e.g., 'left', 'right', 'top', 'bottom', 'topleft', etc.
         self.Bind(wx.EVT_PAINT, self.on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self.on_left_down)
         self.Bind(wx.EVT_LEFT_UP, self.on_left_up)
@@ -57,6 +65,21 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self.redo_stack = []
 
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+
+    def hit_test_resize(self, pos: wx.Point) -> Tuple[Optional[BoxData], Optional[str]]:
+        for box in self.boxes:  # type: ignore
+            x, y, w, h = box.coords
+            # Check each edge/corner
+            if abs(pos.x - x) <= self._RESIZE_MARGIN and y <= pos.y <= y + h:
+                return box, 'left'
+            if abs(pos.x - (x + w)) <= self._RESIZE_MARGIN and y <= pos.y <= y + h:
+                return box, 'right'
+            if abs(pos.y - y) <= self._RESIZE_MARGIN and x <= pos.x <= x + w:
+                return box, 'top'
+            if abs(pos.y - (y + h)) <= self._RESIZE_MARGIN and x <= pos.x <= x + w:
+                return box, 'bottom'
+            # Optionally, check corners for diagonal resize
+        return None, None
 
     def set_image(self, img: np.ndarray, rotation_angle: int = 0) -> None:
         self.image = img
@@ -162,10 +185,28 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
 
     def on_mouse_down(self, event: wx.MouseEvent) -> None:
         pos: wx.Point = event.GetPosition()
-        self.__dragging_box: BoxData | None = self.get_box_at_position(pos)
-        if self.__dragging_box is not None:
-            self.__drag_offset: tuple[int, int] = (pos.x - self.__dragging_box.coords[0],
-                                                 pos.y - self.__dragging_box.coords[1])
+        box, edge = self.hit_test_resize(pos)
+        if box and edge:
+            self.resizing_box = box
+            self.resize_edge = edge
+        else:
+            box_at_pos: BoxData | None = self.get_box_at_position(pos)
+            if box_at_pos is not None:
+                # Select the box and fire event
+                self._selected_box = box_at_pos
+                select_event = BoxSelectedEvent(self, box_at_pos)
+                wx.PostEvent(self, select_event)
+                self.Refresh()
+                # Prepare for dragging
+                self.__dragging_box = box_at_pos
+                self.__drag_offset = (pos.x - box_at_pos.coords[0], pos.y - box_at_pos.coords[1])
+            else:
+                # Deselect if clicking empty area
+                if self._selected_box is not None:
+                    deselect_event = BoxDeselectedEvent(self)
+                    wx.PostEvent(self, deselect_event)
+                    self._selected_box = None
+                    self.Refresh()
         event.Skip()
 
     def get_box_at_position(self, pos: wx.Point) -> BoxData | None:
@@ -176,16 +217,50 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         return None
 
     def on_mouse_move(self, event: wx.MouseEvent) -> None:
-        if event.Dragging() and event.LeftIsDown() and self.__dragging_box is not None:
-            pos: wx.Point = event.GetPosition()
-            x_offset, y_offset = self.__drag_offset
-            w, h = self.__dragging_box.coords[2], self.__dragging_box.coords[3]
-            new_coords: tuple[int, int, int, int] = (pos.x - x_offset, pos.y - y_offset, w, h)
-            self.__dragging_box.coords = new_coords
-            self.Refresh()  # Redraw panel
+        pos: wx.Point = event.GetPosition()
+        if self.resizing_box and self.resize_edge and event.LeftIsDown():
+            x, y, w, h = self.resizing_box.coords
+            if self.resize_edge == 'left':
+                new_x = min(pos.x, x + w - 1)
+                self.resizing_box.coords = (new_x, y, x + w - new_x, h)
+            elif self.resize_edge == 'right':
+                new_w = max(1, pos.x - x)
+                self.resizing_box.coords = (x, y, new_w, h)
+            elif self.resize_edge == 'top':
+                new_y = min(pos.y, y + h - 1)
+                self.resizing_box.coords = (x, new_y, w, y + h - new_y)
+            elif self.resize_edge == 'bottom':
+                new_h = max(1, pos.y - y)
+                self.resizing_box.coords = (x, y, w, new_h)
+            self.Refresh()
+            event.Skip()
+            return
+        elif event.Dragging() and event.LeftIsDown() and self.__dragging_box is not None:
+                pos: wx.Point = event.GetPosition()
+                x_offset, y_offset = self.__drag_offset
+                w, h = self.__dragging_box.coords[2], self.__dragging_box.coords[3]
+                new_coords: tuple[int, int, int, int] = (pos.x - x_offset, pos.y - y_offset, w, h)
+                self.__dragging_box.coords = new_coords
+                self.Refresh()  # Redraw panel
+        else:
+            box, edge = self.hit_test_resize(pos)
+            if edge:
+                if edge in ('left', 'right'):
+                    self.SetCursor(wx.Cursor(wx.CURSOR_SIZEWE))
+                elif edge in ('top', 'bottom'):
+                    self.SetCursor(wx.Cursor(wx.CURSOR_SIZENS))
+                # Add diagonal cursors for corners if needed
+            else:
+                self.SetCursor(wx.NullCursor)
+
         event.Skip()
 
     def on_mouse_up(self, event: wx.MouseEvent) -> None:
+        if self.resizing_box:
+            evt: BoxEditedEvent = BoxEditedEvent(source=self, box=self.resizing_box)
+            wx.PostEvent(self, evt)
+            self.resizing_box = None
+            self.resize_edge = None
         if self.__dragging_box is not None:
             # Fire a custom event to notify that the box was edited
             evt: BoxEditedEvent = BoxEditedEvent(source=self, box=self.__dragging_box)

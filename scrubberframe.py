@@ -168,7 +168,7 @@ class ScrubberFrame(wx.Frame):
         # Add ControlsPanel below image_panel
         self.__button_panel = ControlsPanel(main_panel)
         vbox.Add(self.__button_panel, 0, wx.CENTER, 0)
-        self.__button_panel.bind_buttons(self.on_prev, self.on_next, self.on_next_empty, self.on_rotate_ccw, self.on_rotate_cw, self.__on_remove_selected)
+        self.__button_panel.bind_buttons(self.on_prev, self.on_next, self.on_next_empty, self.on_rotate_ccw, self.on_rotate_cw, self.__on_remove_selected, self.__on_process)
 
         # Add MarkerPanel below image_panel
         self.marker_panel = MarkerPanel(main_panel, num_frames)
@@ -422,3 +422,60 @@ class ScrubberFrame(wx.Frame):
                 # self.tag_panel.update_boxes(boxes)
                 self.__tag_panel.boxes = boxes
                 self.__image_panel.boxes = boxes
+
+    @staticmethod
+    def detect_object_in_region(region: np.ndarray, box: BoxData) -> BoxData | None:
+        """
+        Given an image region, create a binary mask and return a new BoxData
+        for the largest detected object, or None if nothing found.
+        """
+        # Convert to grayscale if needed
+        if len(region.shape) == 3 and region.shape[2] == 3:
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = region
+
+        # Apply Otsu's thresholding to create a mask
+        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Find contours in the mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        # Find the largest contour
+        largest = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest)
+
+        # Offset by the original box's top-left corner
+        abs_x = box.coords[0] + x
+        abs_y = box.coords[1] + y
+
+        # Return a new BoxData with the new coordinates
+        return BoxData(coords=(abs_x, abs_y, w, h), tags=box.tags.copy(), source="processed")
+
+
+    def __on_process(self, event: wx.CommandEvent) -> None:
+        """Process the current frame's boxes using image data under each box."""
+        frame_img = self.get_frame(self._current_index, self._rotation_angle)
+        if frame_img is None:
+            getLog().warning("No image data for current frame.")
+            return
+
+        improved_boxes = []
+        for box in self.__current_boxes:
+            x, y, w, h = box.coords
+            # Ensure coordinates are within image bounds
+            x, y = max(0, x), max(0, y)
+            w, h = max(1, w), max(1, h)
+            region = frame_img[y:y + h, x:x + w]
+            # Call your object detection function here
+            new_box = self.detect_object_in_region(region, box)
+            if new_box:
+                improved_boxes.append(new_box)
+            else:
+                improved_boxes.append(box)  # fallback to original
+
+        self.__frame_boxes[self._current_index] = improved_boxes
+        self.display_image()
+        getLog().info(f"Processed {len(improved_boxes)} boxes in frame {self._current_index}")
