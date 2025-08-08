@@ -11,10 +11,10 @@ from boxdata import BoxData, Coordinate
 from controlspanel import ControlsPanel
 from events.BoxSelectedEvent import BoxSelectedEvent
 from events.events import EVT_BOX_SELECTED
-from imagepanel import ImagePanel
+from controls.imagepanel import ImagePanel
 from logutil import getLog
-from markerpanel import MarkerPanel  # Adjust import as needed
-from tagpanel import TagPanel
+from controls.markerpanel import MarkerPanel  # Adjust import as needed
+from controls.tagpanel import TagPanel
 
 def remove_empty(tags: List[str]) -> List[str]:
     """Remove empty tags from the list."""
@@ -87,7 +87,6 @@ def filter_zero_sized_boxes(boxes: dict[int, list[BoxData]]) -> dict[int, list[B
 
 class ScrubberFrame(wx.Frame):
     __frame_boxes: Dict[int, List[BoxData]] = {}  # Map of frame index to BoxData
-    # __boxes: List[BoxData] = []  # Or load from your data source
     __image_panel: ImagePanel
     __tag_panel: TagPanel
     __button_panel: ControlsPanel
@@ -476,6 +475,19 @@ class ScrubberFrame(wx.Frame):
             else:
                 improved_boxes.append(box)  # fallback to original
 
+        improved_boxes = merge_duplicate_boxes(improved_boxes)
+        self.__add_to_model(improved_boxes)
+
+        # self.boxes = improved_boxes
         self.__frame_boxes[self._current_index] = improved_boxes
         self.display_image()
         getLog().info(f"Processed {len(improved_boxes)} boxes in frame {self._current_index}")
+
+    def __add_to_model(self, boxes: List[BoxData]) -> None:
+        """Add processed boxes to the current frame's box model."""
+        if self._current_index not in self.__frame_boxes:
+            self.__frame_boxes[self._current_index] = []
+        self.__frame_boxes[self._current_index].extend(boxes)
+
+
+

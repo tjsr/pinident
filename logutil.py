@@ -3,18 +3,36 @@ import inspect
 import logging.config
 
 import yaml
+import os
 
 DEFAULT_LOG_LEVEL = logging.DEBUG if __debug__ else logging.INFO
 
+def open_config_file(filename: str, start_dir: str = None):
+    if start_dir is None:
+        start_dir = os.getcwd()
+
+    file_path = os.path.join(start_dir, filename)
+
+    if os.path.exists(file_path):
+        return open(file_path, 'r')
+
+    parent_dir = os.path.dirname(start_dir)
+    if parent_dir == start_dir:
+        # Reached the root directory
+        raise FileNotFoundError(f"Config file not found: {filename} in any parent directory")
+
+    return open_config_file(filename, parent_dir)
+
 def load_config() -> None:
     logConfigPath = 'logging.yml'
-    with open(logConfigPath, 'r') as logConfig:
+
+    with open_config_file(logConfigPath) as logConfig:
         config = yaml.safe_load(logConfig.read())
         logConfig.close()
 
     debugConfigPath = 'logging.debug.yml'
     if debugConfigPath is not None:
-        with open(debugConfigPath, 'r') as debugLogConfig:
+        with open_config_file(debugConfigPath) as debugLogConfig:
             debugConfig = yaml.safe_load(debugLogConfig.read())
             config = {**config, **debugConfig}
             debugLogConfig.close()
@@ -25,6 +43,7 @@ def load_config() -> None:
 def get_file_name(file_path: str) -> str | None:
     """Extract the file name from a file path."""
     if not file_path:
+
         return None
     return file_path.split('/')[-1].split('\\')[-1]  # Handle both Unix and Windows paths
 

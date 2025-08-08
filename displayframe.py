@@ -2,7 +2,7 @@ import wx
 import cv2
 import os
 
-from markerpanel import MarkerPanel
+from controls.markerpanel import MarkerPanel
 
 DEFAULT_IMAGE_HEIGHT:int = 600
 DEFAULT_IMAGE_WIDTH:int = 800

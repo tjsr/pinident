@@ -2,6 +2,9 @@ Coordinate = tuple[int, int, int, int]
 TagLabel = str
 
 class BoxData:
+    VALID_SOURCE_TYPES = ['user', 'automatic', 'processed']
+
+    __id: str
     _tags: list[TagLabel]
     _coords: Coordinate
     _source: str | None = None
@@ -9,11 +12,12 @@ class BoxData:
     __has_backing_card: bool = False
 
     def __init__(self, coords: Coordinate, tags: list[TagLabel], source: str):
-        if source not in ['user', 'automatic']:
-            raise ValueError("Source must be 'user' or 'automatic'")
+        if source not in BoxData.VALID_SOURCE_TYPES:
+            raise ValueError(f'Source must be "user" or "automatic" but was "{source}"')
         self._coords = coords
         self._tags = tags
         self._source = source
+        self.__id = hex(id(self))
 
     @property
     def coords(self) -> Coordinate:
@@ -97,3 +101,26 @@ class BoxData:
 
     def is_non_zero_sized(self) -> bool:
         return self.coords[2] > 0 and self.coords[3] > 0  # Check width and height
+
+    @property
+    def id(self):
+        return self.__id
+
+    def __eq__(self, other):
+        """Check equality based on id, coords, tags, and source."""
+        if not isinstance(other, BoxData):
+            return False
+        return (self.__id == other.id and
+                self.coords == other.coords and
+                self.tags == other.tags and
+                self.source == other.source)
+
+    def matches(self, other: 'BoxData') -> bool:
+        """Check if this box matches another box based on coordinates and tags."""
+        if not isinstance(other, BoxData):
+            return False
+        if self.__id == other.id:
+            return True
+        return (self.coords == other.coords and
+                self.tags == other.tags and
+                self.source == other.source)
