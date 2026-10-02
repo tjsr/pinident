@@ -10,8 +10,9 @@ class BoxData:
     _source: str | None = None
     __is_set: bool = False
     __has_backing_card: bool = False
+    prev_box_id: str | None = None
 
-    def __init__(self, coords: Coordinate, tags: list[TagLabel], source: str):
+    def __init__(self, coords: Coordinate, tags: list[TagLabel] | None, source: str):
         if source not in BoxData.VALID_SOURCE_TYPES:
             raise ValueError(f'Source must be "user" or "automatic" but was "{source}"')
         self._coords = coords
@@ -28,14 +29,17 @@ class BoxData:
         self._coords = value
 
     @property
-    def tags(self) -> list[TagLabel]:
+    def tags(self) -> list[TagLabel] | None:
         return self._tags
 
     @tags.setter
-    def tags(self, value: list[TagLabel]) -> None:
+    def tags(self, value: list[TagLabel] | None) -> None:
         self._tags = value
 
-    def get_tag(self, index: int) -> TagLabel:
+    def get_tag(self, index: int) -> TagLabel | None:
+        if self._tags is None:
+            return None
+
         """Get the tag at the specified index."""
         if 0 <= index < len(self._tags):
             return self._tags[index]
@@ -49,13 +53,16 @@ class BoxData:
             raise IndexError("Tag index out of range")
 
     def add_tag(self, tag: TagLabel) -> int:
+        if self._tags is None:
+            self._tags = []
+
         """Add a new tag to the box."""
         self._tags.append(tag)
         return len(self._tags)
 
     def remove_tag(self, index: int) -> None:
         """Remove the tag at the specified index."""
-        if 0 <= index < len(self._tags):
+        if self._tags is not None and 0 <= index < len(self._tags):
             del self._tags[index]
         else:
             raise IndexError("Tag index out of range")

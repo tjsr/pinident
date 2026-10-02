@@ -159,12 +159,13 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         for panel in panels:
             idx = self.__get_existing_box_index(panel.box)
             if idx > 0:
-                getLog().debug(f'Removing panel {panel} from box sizer at index {idx}.')
+                # getLog().debug(f'Removing panel {panel} from box sizer at index {idx}.')
                 self.__box_sizer.Remove(idx)
                 panel.Destroy()
                 self.__box_panels.remove(panel)
             else:
-                getLog().warning(f'Panel {panel} not found in box panels, cannot remove.')
+                # getLog().warning(f'Panel {panel} not found in box panels, cannot remove.')
+                pass
 
     def __get_existing_boxes(self, boxes: List[BoxData]) -> List[BoxData]:
         """Get the existing boxes."""

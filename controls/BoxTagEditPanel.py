@@ -61,9 +61,9 @@ class BoxTagPanelEdit(wx.Panel):
             # child.Destroy()
 
         while tag_index < tag_count:
-            log.debug(f'Repainting tag {tag_index+1}/{tag_count} on {self}')
+            # log.debug(f'Repainting tag {tag_index+1}/{tag_count} on {self}')
             tag = self.repaint_tag(tag_index)
-            log.debug(f'Repainted tag {tag_index+1}/{tag_count} on {self} with label: {tag.tag}')
+            # log.debug(f'Repainted tag {tag_index+1}/{tag_count} on {self} with label: {tag.tag}')
             tag_index += 1
             self.__sizer.Insert(self.__sizer.GetItemCount() - 1, tag, 0, wx.EXPAND | wx.ALL, 2)
 
@@ -121,7 +121,8 @@ class BoxTagPanelEdit(wx.Panel):
         wx.PostEvent(self, boxEditEvent)
 
     def __on_label_repainted(self, event: wx.PaintEvent) -> None:
-        getLog().debug(f'Repainting label row: {self}->{event.GetEventObject()}')
+        # getLog().debug(f'Repainting label row: {self}->{event.GetEventObject()}')
+        pass
 
     def __on_tag_remove(self, event: BoxLabelRemoveEvent) -> None:
         """Handle tag removal."""

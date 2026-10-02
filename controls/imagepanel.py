@@ -513,12 +513,14 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             getLog().debug(f'Painting box {box}')
 
         colour: wx.Colour
+        text_colour = wx.WHITE
         if box.source == 'user':
             colour = wx.RED
         elif box.source == 'automatic':
             colour = wx.BLUE
         else:
             colour = wx.YELLOW
+            text_colour = wx.BLACK
         dc.SetPen(wx.Pen(colour, stroke_width))
         dc.SetBrush(wx.TRANSPARENT_BRUSH)
         dc.DrawRectangle(rect)
@@ -527,7 +529,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         dc.SetBrush(wx.Brush(colour))
         font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
         dc.SetFont(font)
-        dc.SetTextForeground(wx.WHITE)
+        dc.SetTextForeground(text_colour)
         max_width = label_rect.GetWidth() - 4
         truncated_text = label_text
         while dc.GetTextExtent(truncated_text)[0] > max_width and len(truncated_text) > 0:

@@ -4,11 +4,11 @@ import os
 from scrubberframe import ScrubberFrame
 
 class ImageScrubber(ScrubberFrame):
-    def __init__(self, parent, title, image_dir):
+    def __init__(self, parent, title: str, image_dir: str, opencv_exe_path: str):
         self.image_files = [f for f in os.listdir(image_dir) if f.lower().endswith('.jpg')]
         self.image_files.sort()
         self.image_dir = image_dir
-        super().__init__(parent, title, len(self.image_files))
+        super().__init__(parent, title, opencv_exe_path, len(self.image_files))
 
     def get_frame(self, index: int, rotation_angle: int = 0):
         if not self.image_files:

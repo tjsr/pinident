@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import wx
 
+from OpenCVBoxTrainer import OpenCVBoxTrainer
 from boxdata import BoxData, Coordinate
 from controlspanel import ControlsPanel
 from events.BoxSelectedEvent import BoxSelectedEvent
@@ -24,7 +25,7 @@ def save_boxes_to_stream(stream, frame_boxes: dict[int, list[BoxData]]) -> None:
     # frame_boxes: {frame_number: [BoxData, ...]}
     serializable = {
         frame: [
-            {"coords": box.coords, "tags": remove_empty(box.tags), "source": box.source}
+            {"coords": box.coords, "tags": remove_empty(box.tags), "source": box.source, "prev_box_id": box.prev_box_id}
             for box in boxes
         ]
         for frame, boxes in frame_boxes.items()
@@ -34,6 +35,7 @@ def save_boxes_to_stream(stream, frame_boxes: dict[int, list[BoxData]]) -> None:
 def save_boxes_to_file(filename: str, frame_boxes: dict[int, list[BoxData]]) -> None:
     with open(filename, "w", encoding="utf-8") as f:
         save_boxes_to_stream(f, frame_boxes)
+        f.close()
 
 def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
     """Merge boxes with the same coordinates and tags."""
@@ -46,6 +48,8 @@ def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
             merged[key].tags.extend(box.tags)
             merged[key].tags = remove_empty(merged[key].tags)
 
+        merged[key].prev_box_id = box.prev_box_id
+
     # Remove duplicates in tags
     for box in merged.values():
         box.tags = list(set(box.tags))  # Remove duplicate tags
@@ -54,10 +58,20 @@ def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
 
 def load_boxes_from_stream(stream) -> dict[int, list[BoxData]]:
     data = json.load(stream)
-    return {
-        int(frame): merge_duplicate_boxes([BoxData(tuple(box["coords"]), list(box["tags"]), box.get("source", "automatic")) for box in boxes])
-        for frame, boxes in data.items()
-    }
+    result = dict[int, list[BoxData]]()
+    for frame, boxes in data.items():
+        f: int = int(frame)
+        result[f] = []
+        for jsonbox in boxes:
+            box = BoxData(
+                    coords=tuple(jsonbox["coords"]),
+                    tags=remove_empty(jsonbox["tags"]),
+                    source=jsonbox.get("source", "automatic")
+                )
+            box.prev_box_id = jsonbox.get("prev_box_id", None)
+            result[f].append(box)
+
+    return result
 
 def load_boxes_from_file(filename: str) -> dict[int, list[BoxData]]:
     with open(filename, "r", encoding="utf-8") as f:
@@ -91,6 +105,8 @@ class ScrubberFrame(wx.Frame):
     __tag_panel: TagPanel
     __button_panel: ControlsPanel
     __box_data_filename: str | None = None
+    __opencv_exe_path: str
+    __num_frames: int
 
     @staticmethod
     def create_box_data_name_from_filename(file_name: str) -> str:
@@ -108,9 +124,22 @@ class ScrubberFrame(wx.Frame):
     def box_data_filename(self, filename: str | None) -> None:
         """Set the filename for saving/loading box data."""
         if filename is not None and not filename.endswith('.json'):
-            raise ValueError("Box data filename must end with .json")
+            raise ValueError(f'Box data filename {filename} must end with .json')
         self.__box_data_filename = filename
         self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def close_video_file(self) -> None:
+        # Check if the video file is open and close it
+        # if hasattr(self, "video_capture") and self.video_capture is not None:
+        #     if self.video_capture.isOpened():
+        #         self.video_capture.release()
+        #         getLog().info("Video file closed.")
+        #     self.video_capture = None
+
+        # Write the JSON metadata file to disk
+        if self.box_data_filename and self.__frame_boxes:
+            save_boxes_to_file(self.box_data_filename, self.__frame_boxes)
+            getLog().info(f"Metadata saved to {self.box_data_filename}")
 
     def load_box_data(self) -> Dict[int, List[BoxData]]:
         """Load box data from the specified file."""
@@ -132,12 +161,14 @@ class ScrubberFrame(wx.Frame):
     def current_index(self) -> int:
         return self._current_index
 
-    def __init__(self, parent: wx.Panel, title: str, num_frames: int):
-        super().__init__(parent, title=title, size=wx.Size(800, 600))
+    def __init__(self, parent: wx.Panel | None, title: str, opencv_exe_path: str, num_frames: int):
+        super().__init__(parent=parent, title=title, size=wx.Size(800, 600))
+
+        self.__opencv_trainer: OpenCVBoxTrainer = OpenCVBoxTrainer(opencv_exe_path)
 
         self._current_index = 0
         self._rotation_angle = 0
-        self.num_frames = num_frames
+        self.__num_frames = num_frames
         self.Bind(wx.EVT_SIZE, self.on_resize)
 
         main_panel = wx.Panel(self)
@@ -167,7 +198,17 @@ class ScrubberFrame(wx.Frame):
         # Add ControlsPanel below image_panel
         self.__button_panel = ControlsPanel(main_panel)
         vbox.Add(self.__button_panel, 0, wx.CENTER, 0)
-        self.__button_panel.bind_buttons(self.on_prev, self.on_next, self.on_next_empty, self.on_rotate_ccw, self.on_rotate_cw, self.__on_remove_selected, self.__on_process)
+        self.__button_panel.bind_buttons(self.on_prev, self.on_next, self.on_next_empty, self.on_rotate_ccw, self.on_rotate_cw, self.__on_remove_selected, self.__on_process, self.file_select)
+
+        def on_key_down(event):
+            if event.GetKeyCode() == ord('F'):
+                self.on_next(event)
+            elif event.GetKeyCode() == ord('D'):
+                self.on_prev(event)
+            else:
+                event.Skip()
+
+        self.Bind(wx.EVT_CHAR_HOOK, on_key_down)
 
         # Add MarkerPanel below image_panel
         self.marker_panel = MarkerPanel(main_panel, num_frames)
@@ -209,7 +250,7 @@ class ScrubberFrame(wx.Frame):
         self.__tag_panel.boxes = frame_boxes
 
         self.__button_panel.set_prev_enabled(self._current_index > 0)
-        self.__button_panel.set_next_enabled(self._current_index < self.num_frames)
+        self.__button_panel.set_next_enabled(self._current_index < self.__num_frames)
 
         self.slider.SetValue(self._current_index)
         self.Refresh()
@@ -228,7 +269,7 @@ class ScrubberFrame(wx.Frame):
         return index in self.__frame_boxes and len(self.__frame_boxes[index]) > 0
 
     def on_next(self, _event: wx.CommandEvent):
-        if self._current_index < self.num_frames - 1:
+        if self._current_index < self.__num_frames - 1:
             next_index = self._current_index + 1
 
             current_frame: np.ndarray | None = None
@@ -257,14 +298,14 @@ class ScrubberFrame(wx.Frame):
 
     def goto_frame(self, index: int, set_slider: bool = True) -> bool:
         """Go to a specific frame index."""
-        if 0 <= index < self.num_frames:
+        if 0 <= index < self.__num_frames:
             self._current_index = index
             if set_slider and self.slider is not None:
                 self.slider.SetValue(index)
             self.display_image()
             return True
         else:
-            getLog().warning(f"Index {index} out of bounds for {self.num_frames} frames.")
+            getLog().warning(f"Index {index} out of bounds for {self.__num_frames} frames.")
 
         return False
 
@@ -273,7 +314,7 @@ class ScrubberFrame(wx.Frame):
 
     def on_next_empty(self, _event: wx.CommandEvent) -> bool:
         current_index = self._current_index
-        total_frames = self.num_frames
+        total_frames = self.__num_frames
 
         for idx in range(current_index + 1, total_frames):
             if not self.frame_has_boxes(idx):  # implement has_boxes(idx) to check for boxes
@@ -322,9 +363,22 @@ class ScrubberFrame(wx.Frame):
         self.__tag_panel.boxes = self.__current_boxes
         self.Refresh()
 
+    def file_select(self, evt: wx.CommandEvent) -> None:
+        """Open a file dialog to select a box data file."""
+        with wx.FileDialog(self, "Select box data file", wildcard="JPEG or MPEG files|*.jpg;*.mp4;*.avi",
+                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as fileDialog:
+            if fileDialog.ShowModal() == wx.ID_OK:
+                path = fileDialog.GetPath()
+                if os.path.exists(path):
+                    self.box_data_filename = path + '.json'
+                    self.__frame_boxes = self.load_box_data()
+                    self.display_image()
+                else:
+                    wx.MessageBox("File does not exist.", "Error", wx.OK | wx.ICON_ERROR)
+
     @current_index.setter
     def current_index(self, index: int):
-        if 0 <= index < self.num_frames:
+        if 0 <= index < self.__num_frames:
             self._current_index = index
             if self.slider is not None:
                 self.slider.SetValue(index)
@@ -404,6 +458,7 @@ class ScrubberFrame(wx.Frame):
                     tags=copy(bbox.tags),
                     source='automatic'
                 )
+                new_data.prev_box_id = bbox.id
                 return new_data
         return None
 
@@ -489,5 +544,6 @@ class ScrubberFrame(wx.Frame):
             self.__frame_boxes[self._current_index] = []
         self.__frame_boxes[self._current_index].extend(boxes)
 
-
+        opencv_exe_path: str = "opencv_train_object"  # Path to your OpenCV executable
+        self.train_boxes_with_opencv(self.__opencv_exe_path)
 

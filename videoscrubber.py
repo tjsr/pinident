@@ -4,27 +4,27 @@ import wx
 from scrubberframe import ScrubberFrame
 
 class VideoScrubber(ScrubberFrame):
+    __cap: cv2.VideoCapture | None
+
     @property
     def current_index(self):
         return self._current_index
 
-    def __init__(self, parent, title, video_path=None, image_array=None, box_data: str | None = None):
-        self.cap = None
-        self.num_frames = 0
+    def __init__(self, parent: wx.Panel | None, title: str, opencv_exe_path: str, video_path=None, image_array=None, box_data: str | None = None):
+        self.__cap = None
         self.image_array = image_array
         if video_path:
-            self.cap = cv2.VideoCapture(video_path)
-            self.num_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.__cap = cv2.VideoCapture(video_path)
+            num_frames = int(self.__cap.get(cv2.CAP_PROP_FRAME_COUNT))
         elif image_array:
-            self.num_frames = len(image_array)
+            num_frames = len(image_array)
         else:
             raise ValueError("Either video_path or image_array must be provided.")
-        super().__init__(parent, title, self.num_frames)
+        super().__init__(parent, title, opencv_exe_path, num_frames)
         self.get_frame(0)
 
         if video_path is not None:
             self.box_data_filename = self.create_box_data_name_from_filename(video_path)
-
 
     # @ScrubberFrame.current_index.setter
     # def current_index(self, index):
@@ -33,9 +33,9 @@ class VideoScrubber(ScrubberFrame):
     #     self.display_image()
 
     def get_frame(self, index, rotation_angle: int = 0):
-        if self.cap:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ret, frame = self.cap.read()
+        if self.__cap:
+            self.__cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ret, frame = self.__cap.read()
             if not ret:
                 return None
             img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -57,6 +57,5 @@ class VideoScrubber(ScrubberFrame):
         return img
 
     def __del__(self):
-        if self.cap:
-            self.cap.release()
-
+        if self.__cap:
+            self.__cap.release()

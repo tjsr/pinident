@@ -128,4 +128,5 @@ class BoxTagLabelRow(wx.Panel):
         # parent_panel.__box.tags.pop(self.__tag_index)
 
     def __on_text_destroy(self, event: wx.WindowDestroyEvent) -> None:
-        getLog().debug("Destroying text entry in BoxTagLabelRow")
+        # getLog().debug("Destroying text entry in BoxTagLabelRow")
+        pass
