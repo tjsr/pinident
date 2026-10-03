@@ -1,4 +1,12 @@
 images/*
 **/__pycache__/*
+.pytest_cache/
+.venv/
 labels
 names.txt
+known_pins.sqlite3*
+detection_feedback.sqlite3*
+mobile_web/node_modules/
+mobile_web/dist/
+mobile_web/.npm-cache/
+mobile_web/.wrangler/

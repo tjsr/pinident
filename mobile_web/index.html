@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#15243b">
+  <meta name="description" content="Scan and organise Pinny Arcade pins">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <title>Pinident Mobile</title>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">P</span><div><strong>Pinident</strong><small>Mobile pin scanner</small></div></div>
+    <span id="connectionStatus" class="connection">Loading catalog…</span>
+  </header>
+
+  <main>
+    <nav class="tabs" aria-label="Main sections">
+      <button id="scanTab" class="tab active" type="button" aria-current="page">Scan</button>
+      <button id="libraryTab" class="tab" type="button">My library <span id="libraryCount">0</span></button>
+    </nav>
+
+    <section id="scanView" class="view">
+      <div class="section-heading"><div><p class="eyebrow">Capture</p><h1>Find your pins</h1></div><p>Scan a board with your camera or review a recorded video. Detection runs on your phone.</p></div>
+
+      <div class="source-actions">
+        <button id="cameraButton" class="primary" type="button">Use live camera</button>
+        <label class="button" for="photoInput">Take or choose photo</label>
+        <label class="button" for="videoInput">Open recorded video</label>
+        <button id="stopButton" class="quiet" type="button" hidden>Stop scanning</button>
+        <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
+        <input id="videoInput" type="file" accept="video/*" hidden>
+      </div>
+
+      <div id="stage" class="stage" aria-label="Camera or video preview">
+        <div id="stageEmpty" class="stage-empty"><span class="stage-icon">◈</span><strong>Ready to scan</strong><span>Choose a source above. Photos also work when live camera access is unavailable.</span></div>
+        <video id="videoPreview" autoplay muted playsinline controls hidden></video>
+        <img id="photoPreview" alt="Selected pin photo" hidden>
+        <canvas id="boxOverlay" aria-hidden="true"></canvas>
+      </div>
+      <p id="scanStatus" class="status" role="status">Scanning starts when you choose a source.</p>
+
+      <div class="results-heading"><div><p class="eyebrow">Review</p><h2>Detected areas</h2></div><button id="manualSearchButton" class="text-button" type="button">Browse known pins</button></div>
+      <div id="results" class="results"><p class="empty-message">Detected pins will appear here. You can also browse the catalog.</p></div>
+    </section>
+
+    <section id="libraryView" class="view" hidden>
+      <div class="section-heading"><div><p class="eyebrow">Collections</p><h1>My library</h1></div><p>Your saved pins stay on this device until you export or connect a collection service.</p></div>
+      <div class="collection-controls">
+        <label for="collectionSelect">Collection</label>
+        <select id="collectionSelect"></select>
+        <button id="newCollectionButton" class="button" type="button">New collection</button>
+        <button id="addCatalogPinButton" class="button" type="button">Add from catalog</button>
+      </div>
+      <div id="libraryItems" class="library-items"></div>
+      <div class="library-actions"><button id="exportButton" class="button" type="button">Export library JSON</button><a href="https://pinpanion.com/" target="_blank" rel="noopener noreferrer">Open Pinpanion ↗</a></div>
+      <p class="sync-note">Pinpanion collection sync needs its authenticated collection API. Export keeps a portable copy of your work in the meantime.</p>
+    </section>
+  </main>
+
+  <dialog id="tagDialog" class="tag-dialog">
+    <form method="dialog" class="dialog-heading"><div><p class="eyebrow">Pinpanion catalog</p><h2>Select a known pin</h2></div><button class="icon-button" aria-label="Close" value="cancel">×</button></form>
+    <div class="catalog-load"><p id="catalogStatus" class="catalog-status" role="status">Loading known pins…</p><button id="retryCatalogButton" class="text-button" type="button">Refresh list</button></div>
+    <label for="catalogQuery">Search by name or ID</label>
+    <input id="catalogQuery" type="search" placeholder="Optional name or ID" autocomplete="off">
+    <div class="catalog-filters" aria-label="Narrow the pin list">
+      <div><label for="filterYear">Year</label><select id="filterYear"><option value="">All years</option></select></div>
+      <div><label for="filterCategory">Category</label><select id="filterCategory"><option value="">All categories</option></select></div>
+      <div><label for="filterSet">Set</label><select id="filterSet"><option value="">All sets</option></select></div>
+      <div><label for="filterEvent">Event</label><select id="filterEvent"><option value="">All events</option></select></div>
+      <div><label for="filterGroup">Group</label><select id="filterGroup"><option value="">All groups</option></select></div>
+    </div>
+    <div class="catalog-toolbar"><span id="catalogCount">Choose filters to narrow the list.</span><button id="clearCatalogFilters" class="text-button" type="button">Clear filters</button></div>
+    <div id="catalogResults" class="catalog-results"></div>
+    <button id="showMorePins" class="button catalog-more" type="button" hidden>Show more pins</button>
+    <div class="custom-pin"><details><summary>Pin not in the catalog?</summary><label for="customPinName">Temporary local name</label><input id="customPinName" type="text" maxlength="100" placeholder="Describe the unknown pin"><button id="saveCustomButton" class="button" type="button">Record an unknown pin</button></details></div>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pinident-mobile",
+  "compatibility_date": "2026-10-02",
+  "main": "./worker.ts",
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "id.pinpanion.com", "custom_domain": true }
+  ],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/catalog.json"]
+  },
+  "env": {
+    "dev": {
+      "workers_dev": true,
+      "routes": [
+        { "pattern": "id.dev.pinpanion.com", "custom_domain": true }
+      ]
+    }
+  }
+}

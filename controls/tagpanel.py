@@ -1,8 +1,9 @@
 import wx
 from wx.lib.scrolledpanel import ScrolledPanel
 from logutil import getLog
+from time import perf_counter
 
-from typing import List
+from typing import Callable, List
 
 from boxdata import BoxData
 from controls import BoxTagPanelEdit, ImagePanel
@@ -24,26 +25,60 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
 
     def __init__(
         self,
-        parent: wx.Window
+        parent: wx.Window,
+        on_confirm: Callable[[BoxData], None] | None = None,
+        on_remove: Callable[[BoxData], None] | None = None,
+        on_interact: Callable[[], None] | None = None,
+        on_change_begin: Callable[[], None] | None = None,
+        on_change_end: Callable[[], None] | None = None,
+        on_presence_change: Callable[[str, bool], None] | None = None,
+        on_feedback_info: Callable[[], None] | None = None,
+        catalog_options: list[tuple[str, str]] | None = None,
+        on_add_training_data: Callable[[], None] | None = None,
+        on_confirm_identity: Callable[[BoxData], None] | None = None,
     ) -> None:
         super().__init__(parent)
         # self.__boxes = None
 
         self.vbox = wx.BoxSizer(wx.VERTICAL)
         self.__box_panels = []
+        self._on_confirm = on_confirm
+        self._on_confirm_identity = on_confirm_identity
+        self._on_remove = on_remove
+        self._on_interact = on_interact
+        self._on_change_begin = on_change_begin
+        self._on_change_end = on_change_end
+        self._on_presence_change = on_presence_change
+        self._on_feedback_info = on_feedback_info
+        self._catalog_options = catalog_options or []
+        self._on_add_training_data = on_add_training_data
 
         self.pin_cb = wx.CheckBox(self, label="Contains pin")
         self.set_cb = wx.CheckBox(self, label="Contains set")
         self.card_cb = wx.CheckBox(self, label="With backing card")
+        self.feedback_info_btn = wx.Button(self, label="Feedback model...")
+        self.training_btn = wx.Button(self, label="Add to training data")
+        self.training_gauge = wx.Gauge(self, range=100)
+        self.training_status = wx.StaticText(self, label="Training idle")
+        self.training_btn.Bind(wx.EVT_BUTTON, lambda _event: self._on_add_training_data()
+                               if self._on_add_training_data else None)
+        if on_feedback_info:
+            self.feedback_info_btn.Bind(wx.EVT_BUTTON, lambda _event: on_feedback_info())
+        self.pin_cb.Bind(wx.EVT_CHECKBOX, self._on_pin_checked)
+        self.set_cb.Bind(wx.EVT_CHECKBOX, self._on_set_checked)
         self.__box_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.SetMinSize(wx.Size(180, -1))
+        self.SetMinSize(wx.Size(410, -1))
         self.SetScrollRate(0, 20)
         self.Bind(wx.EVT_SIZE, self.on_size)
 
         self.vbox.Add(self.pin_cb, 0, wx.ALL, 5)
         self.vbox.Add(self.set_cb, 0, wx.ALL, 5)
         self.vbox.Add(self.card_cb, 0, wx.ALL, 5)
-        self.vbox.Add(self.__box_sizer, 1, wx.ALL, 5)
+        self.vbox.Add(self.feedback_info_btn, 0, wx.ALL, 5)
+        self.vbox.Add(self.training_btn, 0, wx.ALL, 5)
+        self.vbox.Add(self.training_gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+        self.vbox.Add(self.training_status, 0, wx.ALL, 5)
+        self.vbox.Add(self.__box_sizer, 1, wx.EXPAND | wx.ALL, 5)
 
         self.Bind(EVT_BOX_EDITED, self.__on_box_edited)
 
@@ -63,7 +98,7 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         getLog().error(error_message)
         raise ValueError(error_message)
 
-    def resize_box_panels(self, min_width: int = 180) -> None:
+    def resize_box_panels(self, min_width: int = 380) -> None:
         for idx, panel in enumerate(self.__box_panels):
             # Adjust the minimum size of each panel
             panel.SetMinSize(wx.Size(min_width, -1))
@@ -73,68 +108,43 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         self.FitInside()
 
     def __create_panel_for_box(self, box: BoxData) -> BoxTagPanelEdit:
-        box_tag_panel = BoxTagPanelEdit(self, box)
+        box_tag_panel = BoxTagPanelEdit(self, box, self._on_confirm, self._on_remove,
+                                       self._on_interact, self._on_change_begin,
+                                       self._on_change_end, self._catalog_options,
+                                       self._on_confirm_identity)
         box_tag_panel.Bind(EVT_BOX_EDITED, self.__on_box_edited)
         box_tag_panel.Bind(wx.EVT_PAINT, self.__on_tag_panel_painted)
         box_tag_panel.Bind(wx.EVT_LEFT_DOWN, self.__on_box_clicked)
         return box_tag_panel
 
-    def Refresh(self, eraseBackground=True, rect=None) -> bool:
-        log = getLog()
-        # Save focus info before clearing panels
-        focused: wx.Window | None = wx.Window.FindFocus()
-        focused_value: str | None = None
-        focused_pos: int | None = None
-        if isinstance(focused, wx.TextCtrl):
-            focused_value = focused.GetValue()
-            focused_pos = focused.GetInsertionPoint()
-
-        # self.__box_sizer.Clear(True)
-        # self.__box_panels.clear()
-
-        for idx, panel in enumerate(self.__box_panels):
-            try:
-                self.__box_sizer.Detach(panel)
-                log.debug(f'Reusing panel for box[{idx+1}]={panel.box})')
-            except ValueError:
-                log.debug(f'Creating new panel for box[{idx+1}]={panel.box}')
-                # # If no existing panel found, create a new one
-                # self.__box_panels.append(panel)
-
-            self.__box_sizer.Add(panel, 0, wx.ALIGN_LEFT | wx.ALL, 2)
-
-        # for panel_index, panel in enumerate(self.__box_panels):
-        #     box_index = self.__get_existing_box_index(panel.box)
-        #     if box_index < 0:
-        #         log.warning(f'Box {panel.box} not found in current boxes, removing panel {panel_index}.')
-        #         # If the box is not found in the current boxes, remove the panel
-        #         self.__box_panels.remove(panel)
-        #         self.__box_sizer.Remove(panel_index)
-        #         panel.Destroy()
-        #         continue
-
-            # if panel.box is not None:
-            #     log.debug(f'Panel {panel_index} has box {panel.box}.')
-
-        self.__box_sizer.Layout()
-        self.Layout()
-        super().Refresh(eraseBackground, rect)
-
-        # Restore focus and cursor position
-        if focused_value is not None:
+    def set_catalog_options(self, options: list[tuple[str, str]]) -> None:
+        started = perf_counter()
+        self._catalog_options = options
+        froze = bool(self.__box_panels) and not self.IsFrozen()
+        if froze:
+            self.Freeze()
+        try:
             for panel in self.__box_panels:
-                for ctrl in panel.GetChildren():
-                    if isinstance(ctrl, wx.TextCtrl) and ctrl.GetValue() == focused_value:
-                        ctrl.SetFocus()
-                        if focused_pos is not None:
-                            ctrl.SetInsertionPoint(focused_pos)
-                        break
+                panel.set_catalog_options(options)
+            if self.__box_panels:
+                self.Layout()
+        finally:
+            if froze:
+                self.Thaw()
+        getLog().info('catalog choices=%d rows=%d refresh=%.1fms',
+                      len(options), len(self.__box_panels),
+                      (perf_counter()-started)*1000)
 
-        return True
+    def set_training_progress(self, percent: int, status: str, running: bool) -> None:
+        self.training_gauge.SetValue(max(0, min(100, percent)))
+        self.training_status.SetLabel(status)
+        self.training_btn.Enable(not running)
+
+    def Refresh(self, eraseBackground=True, rect=None) -> bool:
+        return super().Refresh(eraseBackground, rect)
 
     def __on_tag_panel_painted(self, event: wx.PaintEvent) -> None:
-        self.__box_sizer.Layout()
-        self.vbox.Layout()
+        event.Skip()
 
     @property
     def boxes(self) -> List[BoxData]:
@@ -158,7 +168,7 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         """Remove panels from the box sizer."""
         for panel in panels:
             idx = self.__get_existing_box_index(panel.box)
-            if idx > 0:
+            if idx >= 0:
                 # getLog().debug(f'Removing panel {panel} from box sizer at index {idx}.')
                 self.__box_sizer.Remove(idx)
                 panel.Destroy()
@@ -171,13 +181,9 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         """Get the existing boxes."""
         if self.boxes is None:
             return []
-
-        filtered_boxes = [
-            panel.box for panel in self.__box_panels
-            if any(panel.is_box(box) for box in boxes)
-        ]
-
-        return filtered_boxes
+        # A panel may be reused for a visually identical box on the next frame.
+        # Update it with that frame's box object, not the previous frame's one.
+        return [box for box in boxes if self.__get_existing_box_index(box) >= 0]
 
     def __get_new_boxes(self, boxes: List[BoxData]) -> List[BoxData]:
         """Get the new boxes that are not already in the box panels."""
@@ -191,42 +197,27 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
 
         return new_boxes
 
-    def __update_panels(self, boxes: List[BoxData]) -> None:
+    def __update_panels(self, boxes: List[BoxData]) -> int:
+        changed = 0
         for box in boxes:
             index = self.__get_existing_box_index(box)
             if index >= 0:
-                getLog().debug(f'Box {box.coords} already exists at index {index}, reusing panel.')
                 panel = self.__box_panels[index]
+                changed += panel.needs_refresh(box)
                 panel.box = box
-            else:
-                getLog().debug(f'No existing panel to update {box}.')
-
-
-        """Update the panels with the given boxes."""
-        if boxes is None or len(boxes) == 0:
-            getLog().debug('No boxes provided to update panels.')
-            return
-
-        getLog().info(f'Updating panels with {len(boxes)} boxes.')
-
-        self.Refresh()
+        return changed
 
     def __add_panel_for_box(self, box: BoxData) -> BoxTagPanelEdit:
         new_panel = self.__create_panel_for_box(box)
+        new_panel.SetMinSize(wx.Size(380, -1))
         self.__box_panels.append(new_panel)
-        # insert_index = len(self.__box_sizer.GetChildren()) - 1  # Insert before the last item (the add button)
-        getLog().debug(f'Inserting new panel for box {box}.')
-        # self.__box_sizer.Insert(insert_index, new_panel, 0, wx.ALIGN_LEFT | wx.ALL, 2)
-        self.__box_sizer.Add(new_panel, 0, wx.ALIGN_LEFT | wx.ALL, 2)
+        self.__box_sizer.Add(new_panel, 0, wx.EXPAND | wx.ALL, 2)
         return new_panel
 
     def __add_panels_for_boxes(self, boxes: List[BoxData]) -> None:
         """Create panels for the given boxes."""
         if boxes is None or len(boxes) == 0:
-            getLog().debug('No boxes provided to create panels.')
             return
-
-        getLog().info(f'Creating panels for {len(boxes)} boxes.')
 
         for box in boxes:
             if not isinstance(box, BoxData):
@@ -237,16 +228,54 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
 
     @boxes.setter
     def boxes(self, boxes: List[BoxData]) -> None:
+        started = perf_counter()
+        boxes = [box for box in boxes if box.review_state != 'rejected']
         removed = self.get_removed_boxes(boxes)
-        self.__remove_panels(removed)
-
         existing = self.__get_existing_boxes(boxes)
-        self.__update_panels(existing)
-
         new_boxes = self.__get_new_boxes(boxes)
-        self.__add_panels_for_boxes(new_boxes)
+        diff_ready = perf_counter()
+        structural_change = bool(removed or new_boxes)
+        froze = structural_change and not self.IsFrozen()
+        if froze:
+            self.Freeze()
+        try:
+            self.__remove_panels(removed)
+            updated = self.__update_panels(existing)
+            updated_ready = perf_counter()
+            self.__add_panels_for_boxes(new_boxes)
+            added_ready = perf_counter()
+            if structural_change:
+                self.Layout()
+                self.FitInside()
+        finally:
+            if froze:
+                self.Thaw()
+        if structural_change or updated:
+            self.Refresh()
+        finished = perf_counter()
+        if structural_change or updated or finished - started > 0.05:
+            getLog().info(
+                'tag panels visible=%d reused=%d updated=%d added=%d removed=%d '
+                'catalog=%d diff=%.1fms update=%.1fms create=%.1fms '
+                'layout=%.1fms total=%.1fms',
+                len(boxes), len(existing), updated, len(new_boxes), len(removed),
+                len(self._catalog_options), (diff_ready-started)*1000,
+                (updated_ready-diff_ready)*1000, (added_ready-updated_ready)*1000,
+                (finished-added_ready)*1000, (finished-started)*1000)
 
-        self.Refresh()
+    def set_presence(self, contains_pin: bool, contains_set: bool) -> None:
+        self.pin_cb.SetValue(contains_pin)
+        self.set_cb.SetValue(contains_set)
+
+    def _on_pin_checked(self, event: wx.CommandEvent) -> None:
+        if self._on_presence_change:
+            self._on_presence_change('pin', self.pin_cb.GetValue())
+        event.Skip()
+
+    def _on_set_checked(self, event: wx.CommandEvent) -> None:
+        if self._on_presence_change:
+            self._on_presence_change('set', self.set_cb.GetValue())
+        event.Skip()
 
     def __get_existing_box_index(self, box: BoxData) -> int:
         """Get the index of an existing box in the list."""
@@ -276,6 +305,8 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
 
     def __on_box_clicked(self, event: wx.MouseEvent) -> None:
         """Handle box click event."""
+        if self._on_interact:
+            self._on_interact()
         log = getLog()
 
         panel = event.GetEventObject()
@@ -291,15 +322,11 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         self.boxes = event.boxes
 
     def __on_box_added(self, event: BoxAddedEvent) -> None:
-        log = getLog()
-        """Handle box updated event."""
-        log.debug(f'Added {self.__box_panels} and event {type(event)} {event.GetEventType()} {wxEVT_BOX_ADDED}')
         if isinstance(event, BoxAddedEvent):
-            log.debug(f'Adding box {event.box.coords} to panel')
-            self.__add_panel_for_box(event.box)
+            if self.__get_existing_box_index(event.box) < 0:
+                self.boxes = [*self.boxes, event.box]
         else:
-            log.warning(f'TagPanel.__on_box_added: event parameter is not a BoxAddedEvent, skipping')
-        self.Refresh()
+            getLog().warning('TagPanel received an invalid box-added event')
 
     def __remove_box_panel(self, box: BoxData) -> None:
         filtered_panels = [
@@ -312,8 +339,7 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
     def __on_box_removed(self, event: BoxRemovedEvent) -> None:
         """Handle box removed event."""
         try:
-            self.__remove_box_panel(event.box)
-            self.Refresh()
+            self.boxes = [box for box in self.boxes if not box.matches(event.box)]
         except ValueError as e:
             getLog().error(f'Error removing box {event.box}: {e}')
 
@@ -331,6 +357,4 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
             panel.selected = event.box is not None and panel.is_box(event.box)
 
     def on_size(self, event):
-        self.resize_box_panels()
-        self.SetScrollRate(0, 20)  # Re-apply scroll rate
         event.Skip()

@@ -1,0 +1,18 @@
+{
+  "name": "pinident-mobile",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node --experimental-strip-types build.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.sw.json && tsc -p tsconfig.build.json && tsc --noEmit --strict --skipLibCheck --target ES2022 --module ESNext --moduleResolution Bundler --lib ES2022,WebWorker worker.ts",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --experimental-strip-types --test library.test.ts scanner.test.ts catalog.test.ts worker.test.ts",
+    "dev": "npm run build && wrangler dev",
+    "deploy:dev": "npm run build && wrangler deploy --env dev",
+    "deploy:prod": "npm run build && wrangler deploy --env="
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.147.0"
+  }
+}

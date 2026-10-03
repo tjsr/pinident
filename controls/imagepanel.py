@@ -1,21 +1,19 @@
-from typing import Optional, Tuple
+from typing import Callable, Optional
 
 import numpy as np
 import wx
-import copy
 
 from FrameData import FrameData
-from boxdata import BoxData
+from boxdata import BoxData, has_specific_identity
+from controls.boxgeometry import hit_test_rect, resize_rect, rotate_rect, unrotate_rect
 from events.BoxAddedEvent import BoxAddedEvent
 from events.BoxEditedEvent import BoxEditedEvent
-from events.BoxSelectedEvent import BoxSelectedEvent, BoxDeselectedEvent
-from events.BoxUpdatedEvent import BoxUpdatedEvent
-from events.events import EVT_BOX_EDITED
+from events.BoxSelectedEvent import BoxSelectedEvent
 from logutil import getLog
+from pin_catalog import PinMatch
 
 RotationAngle = int
 ImageSize = tuple[int, int] # (width, height)
-UserAction = str  # 'draw_box', 'rotate', etc.
 
 class ImagePanel(wx.Panel, wx.PyEventBinder):
     image: np.ndarray | None
@@ -24,7 +22,6 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     __frame_data: FrameData
     _selected_box: BoxData | None = None
     __dragging_box: BoxData | None = None
-    __drag_offset: tuple[int, int] | None
     dragging: bool
     start_pos: wx.Point | None
     end_pos: wx.Point | None
@@ -34,10 +31,14 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     rotation_angle: RotationAngle
     resizing_box: Optional[BoxData] = None
     resize_edge: Optional[str] = None  # e.g., 'left', 'right', 'top', 'bottom', 'topleft', etc.
-    undo_stack: list[tuple[UserAction, RotationAngle, list[BoxData]] | tuple[UserAction, list[BoxData]]]
-    redo_stack: list[tuple[UserAction, RotationAngle, list[BoxData]] | tuple[UserAction, list[BoxData]]]
 
     _RESIZE_MARGIN: int = 6
+    _CURSORS = {
+        'left': wx.CURSOR_SIZEWE, 'right': wx.CURSOR_SIZEWE,
+        'top': wx.CURSOR_SIZENS, 'bottom': wx.CURSOR_SIZENS,
+        'topleft': wx.CURSOR_SIZENWSE, 'bottomright': wx.CURSOR_SIZENWSE,
+        'topright': wx.CURSOR_SIZENESW, 'bottomleft': wx.CURSOR_SIZENESW,
+    }
 
     def __init__(self, parent: wx.Window):
         super().__init__(parent)
@@ -53,35 +54,52 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self.rotation_angle = 0
         self.resizing_box: Optional[BoxData] = None
         self.resize_edge: Optional[str] = None  # e.g., 'left', 'right', 'top', 'bottom', 'topleft', etc.
+        self._gesture_rect: tuple[int, int, int, int] | None = None
+        self._gesture_anchor: tuple[int, int] | None = None
+        self._selected_boxes: list[BoxData] = []
+        self._box_tooltip_text: str | None = None
+        self.on_confirm_box: Callable[[BoxData], None] | None = None
+        self.on_confirm_boxes: Callable[[list[BoxData]], None] | None = None
+        self.on_confirm_identity: Callable[[BoxData], None] | None = None
+        self.on_wrong_identity: Callable[[BoxData], None] | None = None
+        self.on_rank_replacements: Callable[[BoxData, int], list[PinMatch]] | None = None
+        self.on_replace_pin: Callable[[BoxData, PinMatch], None] | None = None
+        self.on_reject_replacements: Callable[[BoxData, list[PinMatch]], bool] | None = None
+        self._context_menu_active = False
+        self._replacement_popup_request: tuple[BoxData, wx.Point] | None = None
+        self._context_menu_position = wx.Point(0, 0)
+        self.on_box_added: Callable[[BoxData], None] | None = None
+        self.on_remove_box: Callable[[BoxData], None] | None = None
+        self.on_remove_boxes: Callable[[list[BoxData]], None] | None = None
+        self.on_not_pin: Callable[[BoxData], None] | None = None
+        self.on_not_pin_boxes: Callable[[list[BoxData]], None] | None = None
+        self.on_interact: Callable[[], None] | None = None
+        self.on_change_begin: Callable[[], None] | None = None
+        self.on_change_end: Callable[[], None] | None = None
+        self.on_undo: Callable[[], None] | None = None
+        self.on_redo: Callable[[], None] | None = None
         self.Bind(wx.EVT_PAINT, self.on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self.on_left_down)
+        self.Bind(wx.EVT_RIGHT_DOWN, self.on_right_down)
+        self.Bind(wx.EVT_RIGHT_UP, self.on_right_up)
         self.Bind(wx.EVT_LEFT_UP, self.on_left_up)
         self.Bind(wx.EVT_MOTION, self.on_motion)
-        self.Bind(EVT_BOX_EDITED, self.__on_box_edited)
-        self.Bind(wx.EVT_LEFT_DOWN, self.on_mouse_down)
-        self.Bind(wx.EVT_MOTION, self.on_mouse_move)
-        self.Bind(wx.EVT_LEFT_UP, self.on_mouse_up)
-        self.undo_stack = []
-        self.redo_stack = []
+        self.Bind(wx.EVT_LEAVE_WINDOW, self._on_mouse_leave)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self._on_capture_lost)
 
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
 
-    def hit_test_resize(self, pos: wx.Point) -> Tuple[Optional[BoxData], Optional[str]]:
-        for box in self.boxes:  # type: ignore
-            x, y, w, h = box.coords
-            # Check each edge/corner
-            if abs(pos.x - x) <= self._RESIZE_MARGIN and y <= pos.y <= y + h:
-                return box, 'left'
-            if abs(pos.x - (x + w)) <= self._RESIZE_MARGIN and y <= pos.y <= y + h:
-                return box, 'right'
-            if abs(pos.y - y) <= self._RESIZE_MARGIN and x <= pos.x <= x + w:
-                return box, 'top'
-            if abs(pos.y - (y + h)) <= self._RESIZE_MARGIN and x <= pos.x <= x + w:
-                return box, 'bottom'
-            # Optionally, check corners for diagonal resize
+    def hit_test_resize(self, pos: wx.Point) -> tuple[BoxData | None, str | None]:
+        for box in reversed(self.__boxes):
+            if box.review_state == 'rejected':
+                continue
+            edge = hit_test_rect(self._box_panel_rect(box), (pos.x, pos.y), self._RESIZE_MARGIN)
+            if edge:
+                return box, edge
         return None, None
 
     def set_image(self, img: np.ndarray, rotation_angle: int = 0) -> None:
+        self._clear_box_tooltip()
         self.image = img
         self.rotation_angle = rotation_angle
         h, w = img.shape[:2]
@@ -106,227 +124,419 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self.Refresh()
 
     def rotate_boxes(self, new_angle: int) -> None:
-        # Store undo state
-        self.undo_stack.append(('rotate', self.rotation_angle, copy.deepcopy(self.__boxes)))
-        self.redo_stack.clear()
-
-        # Only update the rotation angle
         self.rotation_angle = new_angle
-
-        # Trigger box update event and refresh
-        update_event = BoxUpdatedEvent(self, self.__boxes)
-        wx.PostEvent(self, update_event)
         self.Refresh()
 
     def get_image_offset(self) -> tuple[int, int]:
-        """Return the (x, y) offset of the image inside the panel, accounting for rotation."""
-        panel_w: int = self.GetSize().GetWidth()
-        panel_h: int = self.GetSize().GetHeight()
+        """Return the displayed bitmap's offset inside the panel."""
+        panel_w, panel_h = self.GetSize().GetWidth(), self.GetSize().GetHeight()
         bmp_w, bmp_h = self.bmp_size
-        if self.rotation_angle in (90, 270):
-            bmp_w, bmp_h = bmp_h, bmp_w
-        offset_x: int = (panel_w - bmp_w) // 2
-        offset_y: int = (panel_h - bmp_h) // 2
-        return offset_x, offset_y
+        return (panel_w - bmp_w) // 2, (panel_h - bmp_h) // 2
 
-    def clamp_to_image(self, x: int, y: int) -> tuple[int, int]:
-        """Clamp coordinates to the image area."""
-        img_w: int = self.bmp_size[0]
-        img_h: int = self.bmp_size[1]
-        x_clamped: int = max(0, min(x, img_w - 1))
-        y_clamped: int = max(0, min(y, img_h - 1))
-        return x_clamped, y_clamped
+    def _source_size(self) -> tuple[int, int]:
+        return (self.img_size[1], self.img_size[0]) if self.rotation_angle % 180 else self.img_size
 
+    def _box_panel_rect(self, box: BoxData) -> tuple[int, int, int, int]:
+        x, y, w, h = rotate_rect(box.coords, self._source_size(), self.rotation_angle)
+        display_w, display_h = self.img_size
+        bitmap_w, bitmap_h = self.bmp_size
+        offset_x, offset_y = self.get_image_offset()
+        left = offset_x + round(x * bitmap_w / display_w)
+        top = offset_y + round(y * bitmap_h / display_h)
+        right = offset_x + round((x + w) * bitmap_w / display_w)
+        bottom = offset_y + round((y + h) * bitmap_h / display_h)
+        return left, top, right - left, bottom - top
+
+    def _panel_to_display(self, pos: wx.Point) -> tuple[int, int]:
+        offset_x, offset_y = self.get_image_offset()
+        bitmap_w, bitmap_h = self.bmp_size
+        display_w, display_h = self.img_size
+        return (max(0, min(display_w, round((pos.x - offset_x) * display_w / bitmap_w))),
+                max(0, min(display_h, round((pos.y - offset_y) * display_h / bitmap_h))))
+
+    def _point_on_image(self, pos: wx.Point) -> bool:
+        offset_x, offset_y = self.get_image_offset()
+        return (offset_x <= pos.x <= offset_x + self.bmp_size[0] and
+                offset_y <= pos.y <= offset_y + self.bmp_size[1])
 
     def point_in_box(self, point: wx.Point, box: BoxData) -> bool:
-        """Check if a wx.Point is inside the box (in bitmap coordinates)."""
-        x, y, w, h = box.coords
-        # Map image coordinates to bitmap coordinates
-        img_w, img_h = self.img_size
-        bx, by = self.bmp_size
-        if self.rotation_angle in (90, 270):
-            img_w, img_h = img_h, img_w
-            bx, by = by, bx
-        bmp_x1 = int(x / img_w * bx)
-        bmp_y1 = int(y / img_h * by)
-        bmp_x2 = int((x + w) / img_w * bx)
-        bmp_y2 = int((y + h) / img_h * by)
-        rect = wx.Rect(bmp_x1, bmp_y1, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
-        return rect.Contains(point)
+        x, y, w, h = self._box_panel_rect(box)
+        return wx.Rect(x, y, w, h).Contains(point)
+
+    def _set_selection(self, boxes: list[BoxData]) -> None:
+        unique: list[BoxData] = []
+        visible_ids = {id(box) for box in self.__boxes if box.review_state != 'rejected'}
+        seen: set[int] = set()
+        for box in boxes:
+            identity = id(box)
+            if identity in visible_ids and identity not in seen:
+                unique.append(box)
+                seen.add(identity)
+        if len(unique) == len(self._selected_boxes) and all(
+                old is new for old, new in zip(self._selected_boxes, unique)):
+            return
+        self._selected_boxes = unique
+        self._selected_box = unique[-1] if unique else None
+        wx.PostEvent(self, BoxSelectedEvent(self, self._selected_box))
+        self.Refresh()
+
+    def _boxes_overlapping_panel_rect(self, rect: wx.Rect) -> list[BoxData]:
+        overlapping: list[BoxData] = []
+        for box in self.__boxes:
+            if box.review_state == 'rejected':
+                continue
+            x, y, width, height = self._box_panel_rect(box)
+            if width <= 0 or height <= 0:
+                continue
+            covered_width = max(0, min(x + width, rect.x + rect.width) - max(x, rect.x))
+            covered_height = max(0, min(y + height, rect.y + rect.height) - max(y, rect.y))
+            if 2 * covered_width * covered_height > width * height:
+                overlapping.append(box)
+        return overlapping
 
     def on_left_down(self, event: wx.MouseEvent) -> None:
-        mouse_pos: wx.Point = event.GetPosition()
-        offset_x, offset_y = self.get_image_offset()
-        img_x: int = mouse_pos.x - offset_x
-        img_y: int = mouse_pos.y - offset_y
-        img_x, img_y = self.clamp_to_image(img_x, img_y)
-        click_point = wx.Point(img_x, img_y)
-
-        # Check if click is inside any box
-        for box in self.__boxes:
-            if self.point_in_box(click_point, box):
-                getLog().debug(f"Selected box {self._selected_box}")
-
-                select_event = BoxSelectedEvent(self, box)
-                wx.PostEvent(self, select_event)
-                self.Refresh()
-                self._selected_box = box
-                return  # Do not start dragging
-
-        if self._selected_box is not None:
-            # Deselect the current box if clicking outside
-            deselect_event = BoxDeselectedEvent(self)
-            wx.PostEvent(self, deselect_event)
-            self.Refresh()
-
-        self._selected_box = None
-        self.dragging = True
-        self.start_pos = click_point
-
-    def on_mouse_down(self, event: wx.MouseEvent) -> None:
-        pos: wx.Point = event.GetPosition()
-        box, edge = self.hit_test_resize(pos)
-        if box and edge:
-            self.resizing_box = box
-            self.resize_edge = edge
-        else:
-            box_at_pos: BoxData | None = self.get_box_at_position(pos)
-            if box_at_pos is not None:
-                # Select the box and fire event
-                self._selected_box = box_at_pos
-                select_event = BoxSelectedEvent(self, box_at_pos)
-                wx.PostEvent(self, select_event)
-                self.Refresh()
-                # Prepare for dragging
-                self.__dragging_box = box_at_pos
-                self.__drag_offset = (pos.x - box_at_pos.coords[0], pos.y - box_at_pos.coords[1])
+        self._clear_box_tooltip()
+        if self.on_interact:
+            self.on_interact()
+        if self.image is None:
+            return
+        self.SetFocus()
+        pos = event.GetPosition()
+        box, handle = self.hit_test_resize(pos)
+        if box is None:
+            box = self.get_box_at_position(pos)
+        if getattr(event, 'ControlDown', lambda: False)():
+            if box is not None:
+                selected = [item for item in self._selected_boxes if item is not box]
+                if len(selected) == len(self._selected_boxes):
+                    selected.append(box)
+                self._set_selection(selected)
+            return
+        if box is not None:
+            if self.on_change_begin:
+                self.on_change_begin()
+            self._set_selection([box])
+            self._gesture_rect = rotate_rect(box.coords, self._source_size(), self.rotation_angle)
+            self._gesture_anchor = self._panel_to_display(pos)
+            if handle:
+                self.resizing_box, self.resize_edge = box, handle
             else:
-                # Deselect if clicking empty area
-                if self._selected_box is not None:
-                    deselect_event = BoxDeselectedEvent(self)
-                    wx.PostEvent(self, deselect_event)
-                    self._selected_box = None
-                    self.Refresh()
+                self.__dragging_box = box
+            if not self.HasCapture():
+                self.CaptureMouse()
+            self.Refresh()
+            return
+
+        self._set_selection([])
+        if self._point_on_image(pos):
+            self.dragging = True
+            self.start_pos = pos
+            self.end_pos = pos
+            if not self.HasCapture():
+                self.CaptureMouse()
+        self.Refresh()
+
+    def on_right_down(self, event: wx.MouseEvent) -> None:
+        self._clear_box_tooltip()
+        if self.on_interact:
+            self.on_interact()
+        self.SetFocus()
         event.Skip()
+
+    def on_right_up(self, event: wx.MouseEvent) -> None:
+        if self.on_interact:
+            self.on_interact()
+        if self.image is None:
+            return
+        pos = event.GetPosition()
+        box, _ = self.hit_test_resize(pos)
+        box = box or self.get_box_at_position(pos)
+        if box is not None and all(selected is not box for selected in self._selected_boxes):
+            self._set_selection([box])
+        if not self._selected_boxes:
+            return
+        menu = (self.make_selection_context_menu(list(self._selected_boxes))
+                if len(self._selected_boxes) > 1 else
+                self.make_box_context_menu(self._selected_boxes[0]))
+        self._popup_review_menu(menu, pos)
+
+    def _popup_review_menu(self, menu: wx.Menu, pos: wx.Point,
+                           position_menu: bool = False) -> None:
+        self._context_menu_active = True
+        self._context_menu_position = pos
+        try:
+            if position_menu:
+                self.PopupMenu(menu, pos)
+            else:
+                self.PopupMenu(menu)
+        finally:
+            self._context_menu_active = False
+            menu.Destroy()
+        request = self._replacement_popup_request
+        self._replacement_popup_request = None
+        if request is not None:
+            wx.CallAfter(self._show_replacement_choices, *request)
+
+    def _show_replacement_choices(self, box: BoxData, pos: wx.Point) -> None:
+        if (box.review_state == 'rejected' or
+                all(existing is not box for existing in self.__boxes)):
+            return
+        menu = self._make_replacement_menu(box)
+        if menu is None:
+            menu = wx.Menu()
+            empty = menu.Append(wx.ID_ANY, 'No more catalog matches')
+            empty.Enable(False)
+        self._popup_review_menu(menu, pos, position_menu=True)
+
+    def make_selection_context_menu(self, boxes: list[BoxData]) -> wx.Menu:
+        """Apply one owner transaction to the selected visible boxes."""
+        menu = wx.Menu()
+        confirm = menu.Append(wx.ID_ANY, 'Confirm selected as pins')
+        not_pin = menu.Append(wx.ID_ANY, '&Not a pin (automatic only)')
+        remove = menu.Append(wx.ID_ANY, 'Remove selected areas\tDel')
+        menu.Enable(confirm.GetId(), any(box.review_state != 'confirmed' for box in boxes))
+        menu.Enable(not_pin.GetId(), any(box.source == 'automatic' for box in boxes))
+        menu.Bind(wx.EVT_MENU,
+                  lambda _evt: self.on_confirm_boxes(list(boxes)) if self.on_confirm_boxes else None,
+                  id=confirm.GetId())
+        menu.Bind(wx.EVT_MENU,
+                  lambda _evt: self.on_not_pin_boxes(list(boxes)) if self.on_not_pin_boxes else None,
+                  id=not_pin.GetId())
+        menu.Bind(wx.EVT_MENU,
+                  lambda _evt: self.on_remove_boxes(list(boxes)) if self.on_remove_boxes else None,
+                  id=remove.GetId())
+        return menu
+
+    def make_box_context_menu(self, box: BoxData) -> wx.Menu:
+        """Build actions bound to the same frame owner as the label buttons."""
+        menu = wx.Menu()
+        confirm = menu.Append(wx.ID_ANY, 'Confirm is a pin')
+        confirm_identity = menu.Append(wx.ID_ANY, 'Confirm pin identity')
+        wrong_identity = (menu.Append(wx.ID_ANY, 'Not this pin (&X)')
+                          if has_specific_identity(box) else None)
+        replacement_menu = self._make_replacement_menu(box)
+        if replacement_menu is not None:
+            menu.AppendSubMenu(replacement_menu, 'Replace with pin')
+        remove = menu.Append(wx.ID_ANY, 'Remove area\tDel')
+        not_pin = (menu.Append(wx.ID_ANY, '&Not a pin')
+                   if box.source == 'automatic' else None)
+        menu.Enable(confirm.GetId(), box.review_state != 'confirmed')
+        menu.Enable(confirm_identity.GetId(),
+                    has_specific_identity(box) and not (
+                        box.review_state == 'confirmed' and box.identity_confirmed))
+        menu.Bind(wx.EVT_MENU, lambda _evt: self.on_confirm_box(box) if self.on_confirm_box else None,
+                  id=confirm.GetId())
+        menu.Bind(wx.EVT_MENU,
+                  lambda _evt: self.on_confirm_identity(box) if self.on_confirm_identity else None,
+                  id=confirm_identity.GetId())
+        if wrong_identity is not None:
+            menu.Bind(wx.EVT_MENU,
+                      lambda _evt: self.on_wrong_identity(box) if self.on_wrong_identity else None,
+                      id=wrong_identity.GetId())
+        menu.Bind(wx.EVT_MENU, lambda _evt: self.on_remove_box(box) if self.on_remove_box else None,
+                  id=remove.GetId())
+        if not_pin is not None:
+            menu.Bind(wx.EVT_MENU, lambda _evt: self.on_not_pin(box) if self.on_not_pin else None,
+                      id=not_pin.GetId())
+        return menu
+
+    def _make_replacement_menu(self, box: BoxData) -> wx.Menu | None:
+        if self.on_rank_replacements is None:
+            return None
+        choices = self.on_rank_replacements(box, 20)
+        if not choices:
+            return None
+        menu = wx.Menu()
+        names = [match.name for match in choices]
+        for match in choices:
+            name = match.name.replace('&', '&&').replace('\t', ' ').replace('\n', ' ')
+            if names.count(match.name) > 1:
+                name += f" ({match.pin_id.replace('&', '&&')})"
+            score = f'{match.confidence:.0%} ' if match.confidence is not None else ''
+            item = menu.Append(wx.ID_ANY, score + name)
+            menu.Bind(wx.EVT_MENU,
+                      lambda _event, chosen=match: self.on_replace_pin(box, chosen)
+                      if self.on_replace_pin else None,
+                      id=item.GetId())
+        menu.AppendSeparator()
+        none = menu.Append(wx.ID_ANY, 'none of these')
+        menu.Bind(wx.EVT_MENU,
+                  lambda _event: self._reject_replacement_page(box, choices),
+                  id=none.GetId())
+        return menu
+
+    def _reject_replacement_page(self, box: BoxData, choices: list[PinMatch]) -> None:
+        if (self.on_reject_replacements is not None and
+                self.on_reject_replacements(box, choices) and
+                self._context_menu_active):
+            self._replacement_popup_request = (box, self._context_menu_position)
 
     def get_box_at_position(self, pos: wx.Point) -> BoxData | None:
         """Get the box at the given position."""
-        for box in self.__boxes:
+        for box in reversed(self.__boxes):
+            if box.review_state == 'rejected':
+                continue
             if self.point_in_box(pos, box):
                 return box
         return None
 
-    def on_mouse_move(self, event: wx.MouseEvent) -> None:
-        pos: wx.Point = event.GetPosition()
-        if self.resizing_box and self.resize_edge and event.LeftIsDown():
-            x, y, w, h = self.resizing_box.coords
-            if self.resize_edge == 'left':
-                new_x = min(pos.x, x + w - 1)
-                self.resizing_box.coords = (new_x, y, x + w - new_x, h)
-            elif self.resize_edge == 'right':
-                new_w = max(1, pos.x - x)
-                self.resizing_box.coords = (x, y, new_w, h)
-            elif self.resize_edge == 'top':
-                new_y = min(pos.y, y + h - 1)
-                self.resizing_box.coords = (x, new_y, w, y + h - new_y)
-            elif self.resize_edge == 'bottom':
-                new_h = max(1, pos.y - y)
-                self.resizing_box.coords = (x, y, w, new_h)
-            self.Refresh()
-            event.Skip()
-            return
-        elif event.Dragging() and event.LeftIsDown() and self.__dragging_box is not None:
-                pos: wx.Point = event.GetPosition()
-                x_offset, y_offset = self.__drag_offset
-                w, h = self.__dragging_box.coords[2], self.__dragging_box.coords[3]
-                new_coords: tuple[int, int, int, int] = (pos.x - x_offset, pos.y - y_offset, w, h)
-                self.__dragging_box.coords = new_coords
-                self.Refresh()  # Redraw panel
-        else:
-            box, edge = self.hit_test_resize(pos)
-            if edge:
-                if edge in ('left', 'right'):
-                    self.SetCursor(wx.Cursor(wx.CURSOR_SIZEWE))
-                elif edge in ('top', 'bottom'):
-                    self.SetCursor(wx.Cursor(wx.CURSOR_SIZENS))
-                # Add diagonal cursors for corners if needed
-            else:
-                self.SetCursor(wx.NullCursor)
-
-        event.Skip()
-
-    def on_mouse_up(self, event: wx.MouseEvent) -> None:
-        if self.resizing_box:
-            evt: BoxEditedEvent = BoxEditedEvent(source=self, box=self.resizing_box)
-            wx.PostEvent(self, evt)
+    def on_left_up(self, event: wx.MouseEvent) -> None:
+        changed_gesture = self.resizing_box is not None or self.__dragging_box is not None
+        if self.resizing_box is not None or self.__dragging_box is not None:
+            self._update_active_box(event.GetPosition())
             self.resizing_box = None
             self.resize_edge = None
-        if self.__dragging_box is not None:
-            # Fire a custom event to notify that the box was edited
-            evt: BoxEditedEvent = BoxEditedEvent(source=self, box=self.__dragging_box)
-            wx.PostEvent(self, evt)
             self.__dragging_box = None
+            self._gesture_rect = None
+            self._gesture_anchor = None
+        elif self.dragging and self.start_pos is not None:
+            released = event.GetPosition()
+            offset_x, offset_y = self.get_image_offset()
+            end_panel = wx.Point(
+                max(offset_x, min(released.x, offset_x + self.bmp_size[0])),
+                max(offset_y, min(released.y, offset_y + self.bmp_size[1])))
+            start_x, start_y = self._panel_to_display(self.start_pos)
+            end_x, end_y = self._panel_to_display(end_panel)
+            left, top = min(start_x, end_x), min(start_y, end_y)
+            width, height = abs(end_x - start_x), abs(end_y - start_y)
+            if width > 0 and height > 0:
+                panel_left = min(self.start_pos.x, end_panel.x)
+                panel_top = min(self.start_pos.y, end_panel.y)
+                selection_rect = wx.Rect(panel_left, panel_top,
+                                         abs(end_panel.x - self.start_pos.x),
+                                         abs(end_panel.y - self.start_pos.y))
+                overlapping = self._boxes_overlapping_panel_rect(selection_rect)
+                if overlapping:
+                    self._set_selection(overlapping)
+                else:
+                    if self.on_change_begin:
+                        self.on_change_begin()
+                    coords = unrotate_rect((left, top, width, height),
+                                           self._source_size(), self.rotation_angle)
+                    self.add_new_box(coords, 'user')
+                    changed_gesture = True
+            self.dragging = False
+            self.start_pos = None
+            self.end_pos = None
+        if self.HasCapture():
+            self.ReleaseMouse()
+        if changed_gesture and self.on_change_end:
+            self.on_change_end()
+        self._set_resize_cursor(event.GetPosition())
+        self.Refresh()
         event.Skip()
 
-    def to_img_coords(self, x: int, y: int) -> tuple[int, int]:
-        bx: int = self.bmp_size[0]
-        by: int = self.bmp_size[1]
-        iw: int = self.img_size[0]
-        ih: int = self.img_size[1]
-        img_x: int = int(x / bx * iw)
-        img_y: int = int(y / by * ih)
-        return img_x, img_y
-
-    def on_left_up(self, event: wx.MouseEvent) -> None:
-        if self.dragging:
-            mouse_pos: wx.Point = event.GetPosition()
-            offset_x, offset_y = self.get_image_offset()
-            img_x: int = mouse_pos.x - offset_x
-            img_y: int = mouse_pos.y - offset_y
-            img_x, img_y = self.clamp_to_image(img_x, img_y)
-            self.end_pos = wx.Point(img_x, img_y)
-
-            x1: int = self.start_pos.x
-            y1: int = self.start_pos.y
-            x2: int = self.end_pos.x
-            y2: int = self.end_pos.y
-
-            img_start: tuple[int, int] = self.to_img_coords(x1, y1)
-            img_end: tuple[int, int] = self.to_img_coords(x2, y2)
-            coords: tuple[int, int, int, int] = (
-                img_start[0], img_start[1],
-                img_end[0] - img_start[0], img_end[1] - img_start[1]
-            )
-            self.undo_stack.append(('draw_box', copy.deepcopy(self.__boxes)))
-            self.redo_stack.clear()
-            self.add_new_box(coords, 'user')
-            self.dragging = False
-
     def on_motion(self, event: wx.MouseEvent):
-        if self.dragging and event.Dragging() and event.LeftIsDown():
-            mouse_pos: wx.Point = event.GetPosition()
+        pos = event.GetPosition()
+        if event.LeftIsDown() and (self.resizing_box is not None or self.__dragging_box is not None):
+            self._clear_box_tooltip()
+            self._update_active_box(pos)
+        elif event.LeftIsDown() and self.dragging:
+            self._clear_box_tooltip()
             offset_x, offset_y = self.get_image_offset()
-            img_x: int = mouse_pos.x - offset_x
-            img_y: int = mouse_pos.y - offset_y
-            img_x, img_y = self.clamp_to_image(img_x, img_y)
-            self.end_pos = wx.Point(img_x, img_y)
+            self.end_pos = wx.Point(
+                max(offset_x, min(pos.x, offset_x + self.bmp_size[0])),
+                max(offset_y, min(pos.y, offset_y + self.bmp_size[1])),
+            )
+            self.Refresh()
+        else:
+            self._set_resize_cursor(pos)
+            self._update_box_tooltip(pos)
+        event.Skip()
+
+    def _update_box_tooltip(self, pos: wx.Point) -> None:
+        box = self.get_box_at_position(pos) if self.image is not None else None
+        label = self.get_box_label_text(box) if box is not None else None
+        if label == self._box_tooltip_text:
+            return
+        self._clear_box_tooltip()
+        if label:
+            tip = wx.ToolTip(label)
+            tip.SetMaxWidth(480)
+            self.SetToolTip(tip)
+            self._box_tooltip_text = label
+
+    def _clear_box_tooltip(self) -> None:
+        if self._box_tooltip_text is not None:
+            self.UnsetToolTip()
+            self._box_tooltip_text = None
+
+    def _on_mouse_leave(self, event: wx.MouseEvent) -> None:
+        self._clear_box_tooltip()
+        event.Skip()
+
+    def _update_active_box(self, pos: wx.Point) -> None:
+        if self._gesture_rect is None or self._gesture_anchor is None:
+            return
+        point = self._panel_to_display(pos)
+        if self.resizing_box is not None and self.resize_edge is not None:
+            box = self.resizing_box
+            shown = resize_rect(self._gesture_rect, self.resize_edge, point, self.img_size)
+        elif self.__dragging_box is not None:
+            box = self.__dragging_box
+            x, y, w, h = self._gesture_rect
+            dx = point[0] - self._gesture_anchor[0]
+            dy = point[1] - self._gesture_anchor[1]
+            shown = (max(0, min(x + dx, self.img_size[0] - w)),
+                     max(0, min(y + dy, self.img_size[1] - h)), w, h)
+        else:
+            return
+        updated = unrotate_rect(shown, self._source_size(), self.rotation_angle)
+        if updated != box.coords:
+            box.coords = updated
+            wx.PostEvent(self, BoxEditedEvent(source=self, box=box))
             self.Refresh()
 
+    def _set_resize_cursor(self, pos: wx.Point) -> None:
+        if self.image is None:
+            return
+        _, handle = self.hit_test_resize(pos)
+        self.SetCursor(wx.Cursor(self._CURSORS[handle]) if handle else wx.NullCursor)
+
+    def _on_capture_lost(self, event: wx.MouseCaptureLostEvent) -> None:
+        had_gesture = self.resizing_box is not None or self.__dragging_box is not None or self.dragging
+        self.resizing_box = None
+        self.resize_edge = None
+        self.__dragging_box = None
+        self._gesture_rect = None
+        self._gesture_anchor = None
+        self.dragging = False
+        self.start_pos = None
+        self.end_pos = None
+        self.SetCursor(wx.NullCursor)
+        if had_gesture and self.on_change_end:
+            self.on_change_end()
+        self.Refresh()
+        event.Skip()
+
     def _is_box_selected(self, box: BoxData) -> bool:
-        if self._selected_box is None:
-            return False
-        """Check if the box is currently selected."""
-
-        if self._selected_box == box or self._selected_box.coords == box.coords:
-            return True
-
-        return False
+        return any(selected is box for selected in self._selected_boxes)
 
     @staticmethod
     def get_box_label_text(box: BoxData) -> str:
-        """Return the label text for the box (to be implemented)."""
-        label = ', '.join(box.tags)
-        return label
+        """Show unlabelled automatic detections as review candidates."""
+        name = ', '.join(box.tags or []) or box.pin_id
+        if name:
+            if not has_specific_identity(box):
+                return 'Pin (unidentified)' if box.review_state != 'unconfirmed' else 'Candidate'
+            if (not box.identity_confirmed and box.pin_id and
+                    box.match_confidence is not None):
+                return f'{box.match_confidence:.0%} {name}' + (
+                    '?' if box.review_state != 'unconfirmed' else '')
+            if box.review_state != 'unconfirmed' and not box.identity_confirmed:
+                return f'{name}?'
+            return name
+        return 'Pin (unidentified)' if box.review_state != 'unconfirmed' else 'Candidate'
+
+    @staticmethod
+    def get_box_colour(box: BoxData) -> wx.Colour:
+        if box.review_state == 'confirmed':
+            return wx.Colour(0, 160, 60)
+        if box.review_state == 'inherited':
+            return wx.Colour(230, 140, 0)
+        if has_specific_identity(box):
+            return wx.RED
+        return wx.BLUE
 
     def on_paint(self, _event: wx.PaintEvent):
         dc = wx.BufferedPaintDC(self)
@@ -334,24 +544,14 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         if self.bitmap:
             offset_x, offset_y = self.get_image_offset()
             dc.DrawBitmap(self.bitmap, offset_x, offset_y)
-            # Swap image and bitmap dimensions for 90/270 degree rotations
-            img_w, img_h = self.img_size
-            bx, by = self.bmp_size
-            if self.rotation_angle in (90, 270):
-                img_w, img_h = img_h, img_w
-                bx, by = by, bx
             for box in self.__boxes:
-                self.paint_box(dc, box, offset_x, offset_y, img_w, img_h, bx, by)
+                if box.review_state != 'rejected':
+                    self.paint_box(dc, box)
 
-            # Draw current drag box
             if self.dragging and self.start_pos and self.end_pos:
-                offset_x, offset_y = self.get_image_offset()
-                rect = wx.Rect(
-                    self.start_pos[0] + offset_x,
-                    self.start_pos[1] + offset_y,
-                    self.end_pos[0] - self.start_pos[0],
-                    self.end_pos[1] - self.start_pos[1]
-                )
+                left, top = min(self.start_pos.x, self.end_pos.x), min(self.start_pos.y, self.end_pos.y)
+                rect = wx.Rect(left, top, abs(self.end_pos.x - self.start_pos.x),
+                               abs(self.end_pos.y - self.start_pos.y))
                 dc.SetPen(wx.Pen(wx.BLUE, 2, wx.PENSTYLE_DOT))
                 dc.SetBrush(wx.TRANSPARENT_BRUSH)
                 dc.DrawRectangle(rect)
@@ -374,70 +574,64 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     #         return img_x, img_y
 
     def undo(self):
-        if not self.undo_stack:
-            return
-        action = self.undo_stack.pop()
-        getLog().debug(f'Actioned undo for {action[0]}')
-        if action[0] == 'draw_box':
-            self.redo_stack.append(('draw_box', copy.deepcopy(self.__boxes)))
-            self.__boxes = copy.deepcopy(action[1])
-            # box_removed_event = BoxRemovedEvent(self, box)
-            # wx.PostEvent(self, box_removed_event)
-        elif action[0] == 'rotate':
-            self.redo_stack.append(('rotate', self.rotation_angle, copy.deepcopy(self.__boxes)))
-            self.rotation_angle = action[1]
-            self.__boxes = copy.deepcopy(action[2])
-        update_event = BoxUpdatedEvent(self, self.__boxes)
-        wx.PostEvent(self, update_event)
-        self.Refresh()
+        if self.on_undo:
+            self.on_undo()
 
     def add_new_box(self, coords: tuple[int, int, int, int], source: str = 'user') -> None:
         """Add a new box with the given coordinates."""
-        box_number = len(self.__boxes) + 1
-        new_box_label = f"unknown-{box_number}"
-        new_box = BoxData(coords, [new_box_label], source)
+        if self.on_change_begin:
+            self.on_change_begin()
+        new_box = BoxData(coords, [''], source,
+                          review_state='confirmed' if source == 'user' else 'unconfirmed')
         self.__boxes.append(new_box)
+        if self.on_box_added:
+            self.on_box_added(new_box)
         box_added_event = BoxAddedEvent(self, new_box)
         getLog().info(f'New box added: {new_box}, {box_added_event}')
         wx.PostEvent(self, box_added_event)
+        if self.on_change_end:
+            self.on_change_end()
         self.Refresh()
 
     def redo(self):
-        if not self.redo_stack:
-            return
-        action = self.redo_stack.pop()
-        getLog().debug(f'Actioned redo for {action[0]}')
-        if action[0] == 'draw_box':
-            self.undo_stack.append(('draw_box', copy.deepcopy(self.__boxes)))
-            self.__boxes = copy.deepcopy(action[1])
-        elif action[0] == 'rotate':
-            self.undo_stack.append(('rotate', self.rotation_angle, copy.deepcopy(self.__boxes)))
-            self.rotation_angle = action[1]
-            self.__boxes = copy.deepcopy(action[2])
-        self.Refresh()
+        if self.on_redo:
+            self.on_redo()
 
     def on_delete_box(self, box: BoxData) -> None:
+        if self.on_remove_box:
+            self.on_remove_box(box)
+            return
         if box in self.__boxes:
-            self.undo_stack.append(("delete_box", copy.deepcopy(self.__boxes)))
+            if self.on_change_begin:
+                self.on_change_begin()
             self.__boxes.remove(box)
+            if self.on_change_end:
+                self.on_change_end()
             self.Refresh()  # Redraw the image panel
 
     def on_add_tag(self, box: BoxData, tag_number: int, tag: str) -> None:
         if box in self.__boxes and tag not in box.tags:
-            self.undo_stack.append(("add_tag", copy.deepcopy(self.__boxes)))
+            if self.on_change_begin:
+                self.on_change_begin()
             box.tags.append(tag)
+            box.pin_id = None
+            box.match_confidence = None
+            box.identity_confirmed = False
+            if self.on_change_end:
+                self.on_change_end()
             self.Refresh()
 
     def on_remove_tag(self, box: BoxData, tag_number: int, tag: str) -> None:
         if box in self.__boxes and tag in box.tags:
-            self.undo_stack.append(("remove_tag", copy.deepcopy(self.__boxes)))
+            if self.on_change_begin:
+                self.on_change_begin()
             box.tags.remove(tag)
+            box.pin_id = None
+            box.match_confidence = None
+            box.identity_confirmed = False
+            if self.on_change_end:
+                self.on_change_end()
             self.Refresh()
-
-    def __on_box_edited(self, event: BoxEditedEvent) -> None:
-        """Handle box edited event."""
-        getLog().info(f'Box {event.box} edited in {event.GetEventObject()}')
-        self.Refresh()
 
     @property
     def boxes(self) -> list[BoxData]:
@@ -446,81 +640,28 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
 
     @boxes.setter
     def boxes(self, new_boxes: list[BoxData]) -> None:
-        """Set the list of boxes and clear undo/redo stacks."""
-        if new_boxes is None:
-            new_boxes = []
-        else:
-            self.__boxes = new_boxes
-        getLog().debug(f'Setting {len(new_boxes)} boxes in ImagePanel mutator')
+        """Show the current frame's shared list of boxes."""
+        self._clear_box_tooltip()
+        self.__boxes = new_boxes if new_boxes is not None else []
+        self._set_selection(list(self._selected_boxes))
+        getLog().debug(f'Setting {len(self.__boxes)} boxes in ImagePanel mutator')
 
         self.Refresh()  # Redraw the image panel
 
-    @staticmethod
-    def rotate_point(x: int, y: int, w: int, h: int, angle, orig_w, orig_h):
-        if angle == 90:
-            return orig_h - y - h, x, h, w
-        elif angle == 180:
-            return orig_w - x - w, orig_h - y - h, w, h
-        elif angle == 270:
-            return y, orig_w - x - w, h, w
-        else:
-            return x, y, w, h
-
-    def paint_box(
-        self,
-        dc: wx.DC,
-        box: BoxData,
-        offset_x: int,
-        offset_y: int,
-        img_w: int,
-        img_h: int,
-        bx: int,
-        by: int
-    ) -> None:
+    def paint_box(self, dc: wx.DC, box: BoxData) -> None:
         # Check if the box is selected
         is_selected = self._selected_box is not None and self._is_box_selected(box)
-        coords = box.coords  # (x, y, w, h) in original image space
-
-        # Use original image size for rotation
-        x, y, w, h = ImagePanel.rotate_point(
-                         coords[0], coords[1], coords[2], coords[3],
-                         self.rotation_angle,
-                         self.img_size[0], self.img_size[1]
-                    )
-
-        # Map image coordinates to bitmap coordinates using swapped dimensions
-        bmp_x1 = int(x / img_w * bx)
-        bmp_y1 = int(y / img_h * by)
-        bmp_x2 = int((x + w) / img_w * bx)
-        bmp_y2 = int((y + h) / img_h * by)
-
-        rect = wx.Rect(bmp_x1 + offset_x, bmp_y1 + offset_y, bmp_x2 - bmp_x1, bmp_y2 - bmp_y1)
+        x, y, w, h = self._box_panel_rect(box)
+        rect = wx.Rect(x, y, w, h)
         stroke_width = 3 if is_selected else 1
 
         # Draw label area at the bottom edge
         label_text = self.get_box_label_text(box) or ""
         label_rect_height = 18  # px, adjust as needed
-        label_rect = wx.Rect(
-            bmp_x1 + offset_x,
-            bmp_y2 + offset_y - label_rect_height,
-            bmp_x2 - bmp_x1,
-            label_rect_height
-        )
+        label_rect = wx.Rect(x, y + h - label_rect_height, w, label_rect_height)
 
-        if label_text.startswith("unknown-"):
-            getLog().debug(f'Painting {box} with unknown label.')
-        else:
-            getLog().debug(f'Painting box {box}')
-
-        colour: wx.Colour
+        colour = self.get_box_colour(box)
         text_colour = wx.WHITE
-        if box.source == 'user':
-            colour = wx.RED
-        elif box.source == 'automatic':
-            colour = wx.BLUE
-        else:
-            colour = wx.YELLOW
-            text_colour = wx.BLACK
         dc.SetPen(wx.Pen(colour, stroke_width))
         dc.SetBrush(wx.TRANSPARENT_BRUSH)
         dc.DrawRectangle(rect)
@@ -544,3 +685,8 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     def selected_box(self) -> BoxData | None:
         """Get the currently selected box."""
         return self._selected_box
+
+    @property
+    def selected_boxes(self) -> list[BoxData]:
+        """Get the current visible selection in display order."""
+        return list(self._selected_boxes)

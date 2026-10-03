@@ -1,30 +1,34 @@
-import json
-from typing import List
-
 import wx
 
-from boxdata import BoxData
-# from imagescrubber import ImageScrubber
 from videoscrubber import VideoScrubber
+from pin_catalog import PinCatalog
+from pinpanion_sync import start_catalog_sync
 
-test_files: List[str] = [
-    "PXL_20250715_015847092.mp4",
-    "PXL_20250823_004545173.mp4",
-    "PXL_20250823_004717468.mp4",
-    "PXL_20250823_005120992.mp4",
-]
-test_file_path = "e:\\pindev"
-
-if __name__ == '__main__':
+def main() -> None:
     app = wx.App(False)
-    # For images:
-    # frame = ImageScrubber(None, 'Image Scrubber', 'e:\\pindev\\output')
-    # For video:
-    opencv_exe_path: str = 'e:\\pindev\\opencv\\build\\x64\\vc15\\bin\\opencv_video.exe'
-    # "E:\\opencv\\build\\x64\\vc16\\bin"
-    file_name = f'{test_file_path}\\{test_files[1]}'
-    frame = VideoScrubber(None, 'Pinny Arcade video pin tagging tool', opencv_exe_path, file_name)
-    frame.get_frame(1)
+    with wx.FileDialog(None, 'Open a pin video',
+                       wildcard='Video files|*.mp4;*.avi;*.mov;*.mkv|All files|*.*',
+                       style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dialog:
+        if dialog.ShowModal() != wx.ID_OK:
+            return
+        video_path = dialog.GetPath()
+
+    frame = VideoScrubber(None, 'Pinny Arcade video pin tagging tool', '',
+                          video_path=video_path, load_catalog=False)
     frame.load_box_data()
     frame.Show()
+
+    def model_ready(matcher):
+        def install():
+            try:
+                frame.set_pin_matcher(matcher)
+            except RuntimeError:
+                pass  # The video window was closed while the background sync ran.
+        wx.CallAfter(install)
+
+    start_catalog_sync(PinCatalog(), model_ready)
     app.MainLoop()
+
+
+if __name__ == '__main__':
+    main()
