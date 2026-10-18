@@ -31,6 +31,7 @@ class BoxTagLabelRow(wx.Panel):
         self._visible_catalog_labels: list[str] = []
         self._popup: wx.PopupWindow | None = None
         self._results: wx.ListBox | None = None
+        self._edit_pending = False
 
         self.__text_entry = wx.TextCtrl(self, value=label)
         self.__text_entry.SetMinSize(wx.Size(280, -1))
@@ -222,6 +223,7 @@ class BoxTagLabelRow(wx.Panel):
             self.set_only_row(is_only_row)
 
     def label_edited(self, _event: wx.Event) -> None:
+        self._edit_pending = True
         self._search_timer.Start(self.SEARCH_DELAY_MS, oneShot=True)
         self.timer.Start(500, oneShot=True)
 
@@ -230,11 +232,28 @@ class BoxTagLabelRow(wx.Panel):
         event.Skip()
 
     def fire_edited_event(self) -> None:
+        self._edit_pending = True
+        wx.PostEvent(self, self._edited_event())
+
+    def commit_current_value(self) -> None:
+        """Apply typed text before an explicit save waits for the debounce timer."""
+        if not self._edit_pending:
+            return
+        self.timer.Stop()
+        self._search_timer.Stop()
+        self.ProcessEvent(self._edited_event())
+
+    def mark_edit_committed(self, event: BoxLabelEditedEvent) -> None:
+        current = self._edited_event()
+        if (current.new_label, current.pin_id) == (event.new_label, event.pin_id):
+            self._edit_pending = False
+
+    def _edited_event(self) -> BoxLabelEditedEvent:
         value = self.tag
         selected = self._catalog_by_display.get(value)
-        wx.PostEvent(self, BoxLabelEditedEvent(
+        return BoxLabelEditedEvent(
             self, self.__tag_index, selected[1] if selected else value,
-            selected[0] if selected else None))
+            selected[0] if selected else None)
 
     def on_remove_button_clicked(self, event: wx.CommandEvent) -> None:
         if self.__is_only_row:

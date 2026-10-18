@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { emptyFilters, facetChoices, filterCatalog, parseFeed } from './dist/catalog.js';
+import { emptyFilters, facetChoices, filterCatalog, loadRecentPinIds,
+  parseFeed, prioritizeRecents, rememberRecentPin } from './dist/catalog.js';
 
 const feed = {
   categories: [{ id: 38, name: 'Core' }, { id: 16, name: 'Merch' }],
@@ -46,4 +47,24 @@ test('combined filters narrow valid pins and facet lists without free-form names
   assert.equal(filterCatalog(catalog, filters).length, 0);
   assert.deepEqual(facetChoices(catalog, filters, 'setId').map(choice =>
     [choice.label, choice.count]), [['Starter Set', 0]]);
+});
+
+test('recent catalog pins persist in newest-first order without duplicating remaining pins', () => {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); }
+  };
+  let ids = loadRecentPinIds(storage);
+  for (const id of ['pinpanion:5', 'pinpanion:8', 'pinpanion:90',
+    'pinpanion:101', 'pinpanion:102', 'pinpanion:103', 'pinpanion:8'])
+    ids = rememberRecentPin(ids, id, storage);
+  assert.deepEqual(ids, ['pinpanion:8', 'pinpanion:103', 'pinpanion:102',
+    'pinpanion:101', 'pinpanion:90']);
+  assert.deepEqual(loadRecentPinIds(storage), ids);
+  const pins = parseFeed(feed).pins;
+  const grouped = prioritizeRecents(pins, ids, true);
+  assert.deepEqual(grouped.recents.map(pin => pin.pin_id), ['pinpanion:8', 'pinpanion:90']);
+  assert.deepEqual(grouped.remaining.map(pin => pin.pin_id), ['pinpanion:5']);
+  assert.deepEqual(prioritizeRecents(pins, ids, false).recents, []);
 });

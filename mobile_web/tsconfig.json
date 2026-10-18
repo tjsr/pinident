@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "noEmitOnError": true
   },
-  "include": ["app.ts", "library.ts", "catalog.ts", "scanner.ts"]
+  "include": ["app.ts", "library.ts", "catalog.ts", "scanner.ts", "stage_geometry.ts", "scan_session.ts", "reviews.ts", "model.ts", "identity.ts"]
 }

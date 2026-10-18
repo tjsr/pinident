@@ -24,9 +24,9 @@ def png_bytes(seed: int) -> tuple[np.ndarray, bytes]:
 
 
 def feed_bytes() -> bytes:
-    return json.dumps({'pins': [
+    return json.dumps({'events': [{'id': 11, 'name': 'PAX East 2013'}], 'pins': [
         {'id': 5, 'name': 'Pinny Arcade Logo', 'image_name': 'logo.webp',
-         'categoryIds': [38], 'year': 2013, 'setId': None},
+         'categoryIds': [38], 'year': 2013, 'paxEventId': 11, 'setId': None},
         {'id': 8, 'name': 'Merch', 'image_name': 'merch.webp',
          'categoryIds': [16, 38], 'year': 2013, 'setId': None},
     ]}).encode()
@@ -53,6 +53,9 @@ def test_sync_imports_new_pin_records_once_and_retains_metadata(tmp_path):
     assert calls.count(IMAGE_BASE_URL + 'merch.webp') == 1
     assert catalog.pin_ids() == {'pinpanion:5', 'pinpanion:8'}
     assert len(catalog.references()) == 2
+    refs = {reference.pin_id: reference for reference in catalog.references()}
+    assert (refs['pinpanion:5'].year, refs['pinpanion:5'].show) == (2013, 'East')
+    assert (refs['pinpanion:8'].year, refs['pinpanion:8'].show) == (2013, None)
     with sqlite3.connect(catalog.path) as db:
         raw, image_url = db.execute(
             'SELECT raw_json, image_url FROM pinpanion_metadata WHERE pin_id = ?',
@@ -63,6 +66,28 @@ def test_sync_imports_new_pin_records_once_and_retains_metadata(tmp_path):
     assert json.loads(raw)['categoryIds'] == [38]
     assert image_url == source == IMAGE_BASE_URL + 'logo.webp'
     assert rights == 'source terms unverified'
+
+
+def test_event_names_refresh_existing_catalog_matcher(tmp_path):
+    catalog = PinCatalog(tmp_path / 'catalog.sqlite3')
+    image, image_bytes = png_bytes(5)
+    record = {'id': 90, 'name': 'West Staff', 'image_name': 'west.webp',
+              'year': 2021, 'paxEventId': 52}
+    assert catalog.import_pinpanion_pin(
+        record, image_bytes, IMAGE_BASE_URL + 'west.webp')
+    feed = json.dumps({'events': [{'id': 52, 'name': 'PAX West 2021'}],
+                       'pins': [record]}).encode()
+    updates = []
+
+    worker = start_catalog_sync(catalog, updates.append,
+                                lambda _url, _limit: feed)
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert len(updates) == 2
+    assert updates[0].rank_matches(image)[0].show is None
+    match = updates[1].rank_matches(image)[0]
+    assert (match.year, match.show) == (2021, 'West')
 
 
 def test_transparent_pin_artwork_masks_background_features(tmp_path):

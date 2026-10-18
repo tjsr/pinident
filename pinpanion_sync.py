@@ -26,6 +26,7 @@ class SyncResult:
     existing: int
     imported: int
     failed: int
+    events_updated: int = 0
 
 
 def fetch_public_bytes(url: str, limit: int) -> bytes:
@@ -72,7 +73,12 @@ def parse_pin_records(data: bytes) -> list[dict]:
 def sync_pinpanion_catalog(catalog: PinCatalog,
                            fetch: Callable[[str, int], bytes] = fetch_public_bytes) -> SyncResult:
     """Import unseen IDs; failed images remain eligible for the next startup."""
-    records = parse_pin_records(fetch(FEED_URL, MAX_FEED_BYTES))
+    feed = fetch(FEED_URL, MAX_FEED_BYTES)
+    records = parse_pin_records(feed)
+    payload = json.loads(feed)
+    events = payload.get('events', [])
+    events_updated = catalog.upsert_event_names(
+        events if isinstance(events, list) else [])
     existing_ids = catalog.pin_ids()
     existing = imported = failed = 0
     for record in records:
@@ -99,7 +105,7 @@ def sync_pinpanion_catalog(catalog: PinCatalog,
         except (OSError, ValueError) as error:
             failed += 1
             getLog().warning("Could not import Pinpanion pin %s: %s", pin_id, error)
-    return SyncResult(len(records), existing, imported, failed)
+    return SyncResult(len(records), existing, imported, failed, events_updated)
 
 
 def start_catalog_sync(catalog: PinCatalog, on_model_ready: Callable[[PinMatcher], None],
@@ -110,7 +116,7 @@ def start_catalog_sync(catalog: PinCatalog, on_model_ready: Callable[[PinMatcher
             on_model_ready(PinMatcher(catalog.references()))
             result = sync_pinpanion_catalog(catalog, fetch)
             getLog().info("Pinpanion sync: %s", result)
-            if result.imported:
+            if result.imported or result.events_updated:
                 on_model_ready(PinMatcher(catalog.references()))
         except Exception:
             getLog().exception("Pinpanion catalog sync failed; existing annotations remain available")

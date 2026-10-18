@@ -1,7 +1,8 @@
-import type { PinIdentity } from './library.js';
+import type { PinIdentity, StorageLike } from './library.js';
 
 const DATABASE_NAME = 'pinident.mobile.catalog';
 const STORE = 'snapshot';
+const RECENTS_KEY = 'pinident.mobile.recent-pins.v1';
 
 export interface CatalogPin extends PinIdentity {
   year?: number;
@@ -115,6 +116,32 @@ function matches(pin: CatalogPin, filters: CatalogFilters, except?: FacetKey): b
 export function filterCatalog(snapshot: CatalogSnapshot, filters: CatalogFilters): CatalogPin[] {
   return snapshot.pins.filter(pin => matches(pin, filters)).sort((a, b) =>
     a.name.localeCompare(b.name) || a.pin_id.localeCompare(b.pin_id));
+}
+
+export function loadRecentPinIds(storage: Pick<StorageLike, 'getItem'> = localStorage): string[] {
+  try {
+    const saved: unknown = JSON.parse(storage.getItem(RECENTS_KEY) ?? '[]');
+    return Array.isArray(saved) ? [...new Set(saved.filter((id: unknown) =>
+      typeof id === 'string' && /^pinpanion:\d+$/.test(id)))].slice(0, 5) : [];
+  } catch { return []; }
+}
+
+export function rememberRecentPin(ids: readonly string[], pinId: string,
+                                  storage: Pick<StorageLike, 'setItem'> = localStorage): string[] {
+  if (!/^pinpanion:\d+$/.test(pinId)) return [...ids];
+  const next = [pinId, ...ids.filter(id => id !== pinId)].slice(0, 5);
+  try { storage.setItem(RECENTS_KEY, JSON.stringify(next)); }
+  catch { /* Keep this session's recents if browser storage is unavailable. */ }
+  return next;
+}
+
+export function prioritizeRecents(pins: CatalogPin[], recentIds: readonly string[],
+                                  showRecents: boolean): { recents: CatalogPin[]; remaining: CatalogPin[] } {
+  if (!showRecents) return { recents: [], remaining: pins };
+  const byId = new Map(pins.map(pin => [pin.pin_id, pin]));
+  const recents = recentIds.flatMap(id => byId.has(id) ? [byId.get(id)!] : []);
+  const recentSet = new Set(recents.map(pin => pin.pin_id));
+  return { recents, remaining: pins.filter(pin => !recentSet.has(pin.pin_id)) };
 }
 
 function valuesFor(pin: CatalogPin, key: FacetKey): number[] {

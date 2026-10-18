@@ -8,7 +8,7 @@ import wx
 
 from boxdata import BoxData
 from controls.boxgeometry import rotate_rect
-from scrubberframe import save_boxes_to_stream
+from scrubberframe import load_boxes_from_stream, save_boxes_to_stream
 from videoscrubber import VideoScrubber
 
 
@@ -109,6 +109,11 @@ def test_corner_resize_updates_shared_box_tag_panel_and_json(panel_size):
         assert box.coords[1] + box.coords[3] == 240
         assert len(panel.boxes) == 1
         assert window._ScrubberFrame__frame_boxes[0][0] is box
+        assert box.bounds_adjustment is not None
+        assert box.bounds_direct
+        assert box.bounds_adjustment == tuple(
+            box.coords[i] - original for i, original in
+            enumerate((100, 80, 200, 160)))
         tag_panel = window._ScrubberFrame__tag_panel.find_panel_for_box(box)
         heading = next(child for child in tag_panel.GetChildren() if isinstance(child, wx.StaticText))
         assert str(box.coords) in heading.GetLabel()
@@ -116,6 +121,10 @@ def test_corner_resize_updates_shared_box_tag_panel_and_json(panel_size):
         output = StringIO()
         save_boxes_to_stream(output, window._ScrubberFrame__frame_boxes)
         assert json.loads(output.getvalue())['0'][0]['coords'] == list(box.coords)
+        output.seek(0)
+        restored = load_boxes_from_stream(output)[0][0]
+        assert restored.bounds_adjustment == box.bounds_adjustment
+        assert restored.bounds_direct
 
         panel.on_left_up(Mouse(x + 20, y + 12))
         assert not panel.HasCapture()

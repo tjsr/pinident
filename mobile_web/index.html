@@ -19,18 +19,24 @@
   <main>
     <nav class="tabs" aria-label="Main sections">
       <button id="scanTab" class="tab active" type="button" aria-current="page">Scan</button>
+      <button id="trainingTab" class="tab" type="button">Training <span id="trainingCount">0</span></button>
       <button id="libraryTab" class="tab" type="button">My library <span id="libraryCount">0</span></button>
     </nav>
 
     <section id="scanView" class="view">
-      <div class="section-heading"><div><p class="eyebrow">Capture</p><h1>Find your pins</h1></div><p>Scan a board with your camera or review a recorded video. Detection runs on your phone.</p></div>
+      <div class="section-heading"><div><p class="eyebrow">Capture</p><h1>Find your pins</h1></div><p>Scan with the camera, or annotate a photo or a frame from a recorded video. Detection runs on your device.</p></div>
 
       <div class="source-actions">
-        <button id="cameraButton" class="primary" type="button">Use live camera</button>
-        <label class="button" for="photoInput">Take or choose photo</label>
-        <label class="button" for="videoInput">Open recorded video</label>
-        <button id="stopButton" class="quiet" type="button" hidden>Stop scanning</button>
-        <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
+        <button id="cameraButton" class="primary source-choice" type="button">Use live camera</button>
+        <label class="button source-choice" for="cameraPhotoInput">Take photo</label>
+        <label class="button source-choice" for="photoInput">Choose photo</label>
+        <label class="button source-choice" for="videoInput">Open recorded video</label>
+        <button id="freezeButton" class="button" type="button" hidden>Pause to annotate frame</button>
+        <button id="resumeButton" class="button" type="button" hidden>Resume video</button>
+        <button id="finishScanButton" class="primary" type="button" hidden>OK — Save and finish</button>
+        <button id="stopButton" class="quiet" type="button" hidden>Stop without saving</button>
+        <input id="cameraPhotoInput" type="file" accept="image/*" capture="environment" hidden>
+        <input id="photoInput" type="file" accept="image/*" hidden>
         <input id="videoInput" type="file" accept="video/*" hidden>
       </div>
 
@@ -41,9 +47,36 @@
         <canvas id="boxOverlay" aria-hidden="true"></canvas>
       </div>
       <p id="scanStatus" class="status" role="status">Scanning starts when you choose a source.</p>
+      <p id="modelStatus" class="helper" role="status">Loading pin/non-pin model…</p>
+      <p id="identityStatus" class="helper" role="status">Loading catalog matching…</p>
+      <div class="annotation-actions">
+        <button id="autoAreaButton" class="button tool-button" type="button" aria-pressed="true" hidden>Select or draw</button>
+        <button id="drawAreaButton" class="button tool-button" type="button" aria-pressed="false" hidden>Draw area</button>
+        <button id="selectAreasButton" class="button tool-button" type="button" aria-pressed="false" hidden>Select areas</button>
+        <button id="deleteAreasButton" class="button delete-areas" type="button" disabled hidden>Delete area</button>
+        <button id="saveFrameButton" class="button" type="button" hidden>Save frame annotation</button>
+        <button id="queueTrainingButton" class="button" type="button" hidden>Review areas for training</button>
+      </div>
+      <p id="annotationHint" class="helper" hidden>Drag across existing areas to select them, or drag empty space to draw a missing area.</p>
 
       <div class="results-heading"><div><p class="eyebrow">Review</p><h2>Detected areas</h2></div><button id="manualSearchButton" class="text-button" type="button">Browse known pins</button></div>
       <div id="results" class="results"><p class="empty-message">Detected pins will appear here. You can also browse the catalog.</p></div>
+    </section>
+
+    <section id="trainingView" class="view" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Review</p><h1>Training mode</h1></div><p>Classify candidate crops from a photo or paused video frame. If a close-up is too difficult to judge, mark it Unknown so similar crops appear after clearer candidates.</p></div>
+      <p id="trainingStatus" class="status" role="status">Capture a frame in Scan, then choose “Review areas for training”.</p>
+      <div id="trainingCard" class="training-card" hidden>
+        <img id="trainingImage" alt="Candidate area to classify">
+        <p id="trainingSuggestion" class="helper"></p>
+        <div class="training-options">
+          <div class="training-presence"><button id="notPinButton" type="button">This is not a pin</button><button id="difficultButton" type="button" title="Too difficult to tell; does not label this crop as a pin or non-pin">Unknown</button></div>
+          <button id="unknownPinButton" type="button">This is a pin (unknown)</button>
+          <button id="suggestedPinButton" type="button" hidden></button>
+          <div class="other-pin"><label for="otherPinQuery">Other pin</label><input id="otherPinQuery" type="search" placeholder="Search known pins" autocomplete="off"><select id="otherPinSelect" aria-label="Other pin"><option value="">Choose a pin</option></select><button id="otherPinButton" type="button">Use selected pin</button></div>
+        </div>
+      </div>
+        <p class="sync-note">Reviewed crops and saved frame annotations, including their images, sync to Cloudflare for desktop training. Unknown saves a difficulty mark without a pin/non-pin label; only its compact visual signature is shared to order future review queues. Offline decisions remain on this device and retry when you reconnect. Catalog visual matches are provisional and their percentages are match strengths, not measured probabilities.</p>
     </section>
 
     <section id="libraryView" class="view" hidden>

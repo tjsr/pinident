@@ -9,12 +9,14 @@ import wx
 
 from boxdata import BoxData
 from controls.imagepanel import ImagePanel
+from detection_feedback import make_feedback_example
 from frame_processing import FrameJob, process_frame
 from pin_catalog import PinMatch
 from pin_detection import (add_new_detections, associate_frame_boxes,
                            identify_candidates, match_existing_candidates)
 from scrubberframe import (load_boxes_from_stream, propagate_confirmations,
                            reconcile_saved_frames, save_boxes_to_stream)
+from session_training import reviewed_observations
 from videoscrubber import VideoScrubber
 
 
@@ -135,13 +137,17 @@ def test_adjacent_conflicting_direct_pin_ids_remain_separate():
     assert earlier.identity_confirmed and current.identity_confirmed
 
 
-def test_confirmed_unknown_track_skips_catalog_matching():
+def test_confirmed_unknown_track_retries_catalog_matching():
     image = np.random.default_rng(1).integers(0, 255, (90, 90, 3), dtype=np.uint8)
     confirmed = BoxData((10, 10, 35, 35), [], 'automatic', review_state='confirmed')
     tracked = associate_frame_boxes(image, image.copy(), [confirmed], [confirmed.coords])[0]
     assert tracked.review_state == 'inherited'
-    matcher = type('Matcher', (), {'match': lambda self, crop: pytest.fail('matched confirmed track')})()
+    scans = []
+    matcher = type('Matcher', (), {
+        'match': lambda self, crop: scans.append(crop.shape) or None})()
     identify_candidates(image, [tracked], matcher)
+    assert scans == [(35, 35, 3)]
+    assert tracked.review_state == 'inherited' and not tracked.identity_confirmed
 
 
 def test_existing_candidate_match_requires_the_same_appearance():
@@ -343,12 +349,14 @@ def test_pin_presence_confirmation_tracks_without_approving_suggested_name():
                      identity_confirmed=False)
     provisional = BoxData(source.coords, ['Possible Luigi'], 'automatic',
                           pin_id='pinpanion:8')
+    scans = []
     job = FrameJob(1, 0, [source], [provisional], [], image, image, None,
-                   type('NoRematch', (), {
-                       'match': lambda self, crop: pytest.fail('rematched a known candidate')
+                   type('UnverifiedRematch', (), {
+                       'match': lambda self, crop: scans.append(crop.shape) or None
                    })())
     with patch('frame_processing.detect_pin_boxes', return_value=[]):
         result = process_frame(job, lambda _index: pytest.fail('decoded a cached frame'))
+    assert scans == [(40, 40, 3)]
     tracked = result.boxes[0]
     assert tracked.track_id == source.track_id
     assert tracked.review_state == 'inherited'
@@ -835,6 +843,22 @@ def test_adjacent_identified_pin_does_not_create_box_without_visual_match():
     assert frames[0] == []
 
 
+def test_adjacent_reviewed_area_survives_overlapping_unreviewed_saved_candidate():
+    image = np.random.default_rng(211).integers(0, 255, (140, 180, 3), dtype=np.uint8)
+    source = BoxData((50, 45, 40, 40), [], 'user', review_state='confirmed')
+    broad = BoxData((20, 15, 110, 110), [], 'automatic')
+    frames = {0: [source], 1: [broad]}
+
+    assert reconcile_saved_frames(1, 2, frames, lambda _index: image,
+                                  reference_index=0)
+
+    assert broad in frames[1] and broad.coords == (20, 15, 110, 110)
+    tracked = [box for box in frames[1] if box.track_id == source.track_id]
+    assert len(tracked) == 1
+    assert tracked[0].coords == source.coords
+    assert tracked[0].review_state == 'inherited'
+
+
 def test_adjacent_pin_keeps_conflicting_manual_label_and_rejected_area():
     image = np.random.default_rng(138).integers(0, 255, (100, 180, 3), dtype=np.uint8)
     source = BoxData((10, 15, 40, 40), ['Mario'], 'automatic',
@@ -893,6 +917,169 @@ def test_navigation_uses_identified_adjacent_pin_on_processed_frame(
         assert tracked.pin_id == 'pinpanion:7' and tracked.tags == ['Mario']
         assert tracked.review_state == 'inherited' and tracked.identity_confirmed
         assert window._ScrubberFrame__tag_panel.find_panel_for_box(tracked) is not None
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize('source_index', [0, 1])
+def test_navigation_replaces_overlapping_saved_proposal_with_reviewed_area(
+        tmp_path, source_index):
+    app = wx.App.Get() or wx.App(False)
+    image = np.random.default_rng(212).integers(0, 255, (140, 180, 3), dtype=np.uint8)
+    window = VideoScrubber(None, 'Adjacent reviewed area', '',
+                           image_array=[image, image], load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        window.Show()
+        wx.Yield()
+        target_index = 1 - source_index
+        source = BoxData((50, 45, 40, 40), [], 'user', review_state='confirmed')
+        broad = BoxData((20, 15, 110, 110), [], 'automatic')
+        window._ScrubberFrame__frame_boxes[source_index] = [source]
+        window._ScrubberFrame__frame_boxes[target_index] = [broad]
+        window._ScrubberFrame__detected_frames.update({0, 1})
+        window._invalidate_reconciliation()
+        assert window.goto_frame(source_index)
+        wait_for_reconciliation(window)
+
+        if source_index == 0:
+            window.on_next_async(None)
+        else:
+            window.on_prev(None)
+        wait_for_reconciliation(window)
+
+        target = window._ScrubberFrame__frame_boxes[target_index]
+        assert broad not in target
+        assert len(target) == 1
+        tracked = [box for box in target if box.track_id == source.track_id]
+        assert len(tracked) == 1
+        assert tracked[0].coords == source.coords
+        assert tracked[0].review_state == 'inherited'
+        assert window._ScrubberFrame__tag_panel.find_panel_for_box(tracked[0]) is not None
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_next_replaces_overlapping_saved_proposal_with_reviewed_track(tmp_path):
+    app = wx.App.Get() or wx.App(False)
+    image = np.random.default_rng(214).integers(0, 255, (140, 180, 3), dtype=np.uint8)
+    window = VideoScrubber(None, 'Unprocessed adjacent area', '',
+                           image_array=[image, image], load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        window.Show()
+        wx.Yield()
+        source = BoxData((50, 45, 40, 40), [], 'user', review_state='confirmed')
+        broad = BoxData((20, 15, 110, 110), [], 'automatic')
+        window._ScrubberFrame__frame_boxes[0] = [source]
+        window._ScrubberFrame__frame_boxes[1] = [broad]
+        window._ScrubberFrame__detected_frames.add(0)
+        window.display_image(reconcile=False)
+
+        with (patch('frame_processing.detect_pin_boxes', return_value=[]),
+              patch.object(window, '_schedule_reconciliation')):
+            window.on_next_async(None)
+            future = window._pending_frame_job
+            assert future is not None
+            future.result(timeout=5)
+            deadline = monotonic() + 5
+            while window._pending_frame_job is not None and monotonic() < deadline:
+                wx.Yield()
+                sleep(0.005)
+        assert window._pending_frame_job is None
+        target = window._ScrubberFrame__frame_boxes[1]
+        assert broad not in target
+        assert len(target) == 1
+        tracked = [box for box in target if box.track_id == source.track_id]
+        assert len(tracked) == 1
+        assert tracked[0].coords == source.coords
+        assert tracked[0].review_state == 'inherited'
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_same_pin_duplicates_merge_across_frames_and_prune_duplicate_crops(tmp_path):
+    app = wx.App.Get() or wx.App(False)
+    image = np.random.default_rng(215).integers(0, 255, (140, 180, 3), dtype=np.uint8)
+    window = VideoScrubber(None, 'Merge same pin', '', image_array=[image, image],
+                           load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        first = BoxData((45, 40, 45, 45), ['Mario'], 'user',
+                        track_id='first', pin_id='pinpanion:7',
+                        review_state='confirmed', feedback_id='first-review',
+                        feedback_label='positive', identity_confirmed=True)
+        duplicate = BoxData((47, 42, 44, 44), ['Mario'], 'user',
+                            track_id='duplicate', pin_id='pinpanion:7',
+                            review_state='confirmed', feedback_id='duplicate-review',
+                            feedback_label='positive', identity_confirmed=True)
+        following = BoxData((46, 41, 45, 45), ['Mario'], 'automatic',
+                            track_id='first', pin_id='pinpanion:7',
+                            review_state='inherited', identity_confirmed=True)
+        following_duplicate = BoxData((48, 43, 44, 44), ['Mario'], 'automatic',
+                                      track_id='duplicate', pin_id='pinpanion:7',
+                                      review_state='inherited', identity_confirmed=True)
+        frames = window._ScrubberFrame__frame_boxes
+        frames.update({0: [first, duplicate], 1: [following, following_duplicate]})
+        observations = reviewed_observations(frames, window._feedback_source)
+        examples = [make_feedback_example(
+            item.example_id, item.label, window.get_frame(item.frame_index, 0),
+            item.coords, window._feedback_source, item.frame_index,
+            item.track_id, item.pin_id, item.tags)
+            for item in observations]
+        window._feedback_store.apply_source_delta(window._feedback_source,
+                                                  examples, set())
+        window._feedback_model.reload()
+        assert window._feedback_store.counts()['positive'] == 4
+
+        window._sync_automatic_consolidation()
+
+        assert frames[0] == [first]
+        assert frames[1] == [following]
+        assert window._feedback_store.counts()['positive'] == 2
+        assert window._feedback_store.get('first-review') is not None
+        assert window._feedback_store.get('duplicate-review') is None
+        output = StringIO()
+        save_boxes_to_stream(output, frames)
+        assert all(len(boxes) == 1 for boxes in
+                   load_boxes_from_stream(StringIO(output.getvalue())).values())
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_confirming_duplicate_identity_merges_and_undo_restores_candidate(tmp_path):
+    app = wx.App.Get() or wx.App(False)
+    image = np.random.default_rng(216).integers(0, 255, (140, 180, 3), dtype=np.uint8)
+    window = VideoScrubber(None, 'Undo duplicate merge', '', image_array=[image],
+                           load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        reviewed = BoxData((40, 40, 45, 45), ['Mario'], 'user',
+                           pin_id='pinpanion:7', review_state='confirmed',
+                           identity_confirmed=True, feedback_id='reviewed',
+                           feedback_label='positive')
+        candidate = BoxData((42, 42, 44, 44), ['Mario'], 'automatic',
+                            pin_id='pinpanion:7')
+        window._ScrubberFrame__frame_boxes[0] = [reviewed, candidate]
+        window.confirm_pin_identity(candidate)
+        assert window._ScrubberFrame__frame_boxes[0] == [reviewed]
+
+        window.undo_action()
+        assert window._ScrubberFrame__frame_boxes[0] == [reviewed, candidate]
+        assert candidate.review_state == 'unconfirmed'
+        assert candidate.feedback_id is None
+        assert not candidate.identity_confirmed
+
+        window.redo_action()
+        assert window._ScrubberFrame__frame_boxes[0] == [reviewed]
     finally:
         window.Destroy()
         wx.Yield()
@@ -1044,7 +1231,7 @@ def test_label_actions_update_frame_and_saved_boxes():
                                                             label.confirm_button.GetId()))
         assert box.review_state == 'confirmed'
         assert not box.identity_confirmed
-        assert ImagePanel.get_box_colour(box) == wx.Colour(0, 160, 60)
+        assert ImagePanel.get_box_colour(box) == wx.Colour(230, 140, 0)
         label.delete_button.ProcessEvent(wx.CommandEvent(wx.EVT_BUTTON.typeId,
                                                            label.delete_button.GetId()))
         assert window._ScrubberFrame__frame_boxes[0] == []
@@ -1103,11 +1290,14 @@ def test_context_menu_actions_and_playback_pause_on_image_click():
             assert window._ScrubberFrame__button_panel.play_btn.GetLabel() == 'Play'
             menu = panel.make_box_context_menu(box)
             assert [item.GetItemLabelText() for item in menu.GetMenuItems()] == [
-                'Confirm is a pin', 'Confirm pin identity', 'Remove area', 'Not a pin']
+                'Confirm is a pin', 'Confirm pin identity', 'Remove area',
+                'Attempt detection', 'Not a pin']
             item = menu.GetMenuItems()[0]
+            assert item.IsEnabled()
             menu.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, item.GetId()))
             menu.Destroy()
             assert box.review_state == 'confirmed'
+            assert ImagePanel.get_box_colour(box) == wx.Colour(230, 140, 0)
 
             window.on_play(None)
             window._on_play_timer(None)
@@ -1154,7 +1344,7 @@ def test_manual_box_has_blank_edit_field_and_separate_identity_confirmation():
         assert editor.IsShown()
 
         menu = image_panel.make_box_context_menu(box)
-        presence, identity, _remove = menu.GetMenuItems()
+        presence, identity, _remove, _attempt = menu.GetMenuItems()
         assert not presence.IsEnabled() and not identity.IsEnabled()
         menu.Destroy()
         assert box.review_state == 'confirmed'
@@ -1171,8 +1361,8 @@ def test_manual_box_has_blank_edit_field_and_separate_identity_confirmation():
         assert box.tags == ['Mario']
         assert not box.identity_confirmed
         menu = image_panel.make_box_context_menu(box)
-        presence, identity, _wrong, _remove = menu.GetMenuItems()
-        assert not presence.IsEnabled() and identity.IsEnabled()
+        identity, _wrong, _remove, _attempt = menu.GetMenuItems()
+        assert identity.IsEnabled()
         menu.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, identity.GetId()))
         menu.Destroy()
         assert box.identity_confirmed
@@ -1181,7 +1371,7 @@ def test_manual_box_has_blank_edit_field_and_separate_identity_confirmation():
         inherited = BoxData(box.coords, ['Mario'], 'automatic',
                             review_state='inherited', identity_confirmed=True)
         inherited_menu = image_panel.make_box_context_menu(inherited)
-        assert inherited_menu.GetMenuItems()[1].IsEnabled()
+        assert inherited_menu.GetMenuItems()[0].IsEnabled()
         inherited_menu.Destroy()
         saved = StringIO()
         save_boxes_to_stream(saved, window._ScrubberFrame__frame_boxes)

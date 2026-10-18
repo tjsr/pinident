@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 import cv2
 import numpy as np
@@ -22,6 +24,21 @@ class PinReference:
     name: str
     image: np.ndarray
     mask: np.ndarray | None = None
+    year: int | None = None
+    show: str | None = None
+
+
+@dataclass(frozen=True)
+class CatalogStockImage:
+    """One original Pinpanion image and its stored source provenance."""
+
+    reference_id: int
+    pin_id: str
+    name: str
+    image_bytes: bytes
+    source: str
+    rights: str
+    tags: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -30,6 +47,15 @@ class PinMatch:
     name: str
     inliers: int
     confidence: float | None = None
+    year: int | None = None
+    show: str | None = None
+
+
+def _short_show_name(name: str, year: int | None) -> str:
+    show = re.sub(r'^PAX\s+', '', name.strip(), flags=re.IGNORECASE)
+    if year is not None:
+        show = re.sub(rf'\s+{year}$', '', show)
+    return show.strip()
 
 
 class PinCatalog:
@@ -46,6 +72,32 @@ class PinCatalog:
         db.execute("""CREATE TABLE IF NOT EXISTS pinpanion_metadata (
             pin_id TEXT PRIMARY KEY REFERENCES pins(pin_id),
             raw_json TEXT NOT NULL, image_url TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS pinpanion_events (
+            event_id INTEGER PRIMARY KEY, name TEXT NOT NULL)""")
+
+    def upsert_event_names(self, events: list[dict]) -> int:
+        """Save changed public event names for existing and future pin records."""
+        changed = 0
+        with sqlite3.connect(self.path) as db:
+            self._ensure_schema(db)
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                event_id, name = event.get('id'), event.get('name')
+                if (isinstance(event_id, bool) or not isinstance(event_id, int) or
+                        not isinstance(name, str) or not name.strip()):
+                    continue
+                name = name.strip()
+                previous = db.execute(
+                    'SELECT name FROM pinpanion_events WHERE event_id = ?',
+                    (event_id,)).fetchone()
+                if previous is not None and previous[0] == name:
+                    continue
+                db.execute("""INSERT INTO pinpanion_events (event_id, name)
+                    VALUES (?, ?) ON CONFLICT(event_id) DO UPDATE SET name = excluded.name""",
+                    (event_id, name))
+                changed += 1
+        return changed
 
     def pin_ids(self) -> set[str]:
         if not self.path.is_file():
@@ -133,10 +185,13 @@ class PinCatalog:
             return []
         with sqlite3.connect(self.path) as db:
             self._ensure_schema(db)
-            rows = db.execute("""SELECT p.pin_id, p.name, r.image FROM pin_references r
-                JOIN pins p ON p.pin_id = r.pin_id ORDER BY p.pin_id, r.id""").fetchall()
+            rows = db.execute("""SELECT p.pin_id, p.name, r.image, m.raw_json
+                FROM pin_references r JOIN pins p ON p.pin_id = r.pin_id
+                LEFT JOIN pinpanion_metadata m ON m.pin_id = p.pin_id
+                ORDER BY p.pin_id, r.id""").fetchall()
+            event_names = dict(db.execute('SELECT event_id, name FROM pinpanion_events'))
         references = []
-        for pin_id, name, data in rows:
+        for pin_id, name, data, raw_json in rows:
             decoded = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
             if decoded is None:
                 continue
@@ -149,8 +204,51 @@ class PinCatalog:
             else:
                 rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
                 mask = None
-            references.append(PinReference(pin_id, name, rgb, mask))
+            metadata = json.loads(raw_json) if raw_json else {}
+            raw_year = metadata.get('year')
+            year = (raw_year if isinstance(raw_year, int) and
+                    not isinstance(raw_year, bool) else None)
+            event_id = metadata.get('paxEventId')
+            event_name = (event_names.get(event_id)
+                          if isinstance(event_id, int) and not isinstance(event_id, bool)
+                          else None)
+            show = _short_show_name(event_name, year) if event_name else None
+            references.append(PinReference(pin_id, name, rgb, mask, year, show))
         return references
+
+    def stock_training_images(self) -> Iterator[CatalogStockImage]:
+        """Read every locally imported Pinpanion stock image on the caller's thread.
+
+        The metadata URL identifies the original feed image. Other manually
+        added references, even for the same pin ID, are not stock images.
+        """
+        if not self.path.is_file():
+            return
+        with sqlite3.connect(self.path) as db:
+            self._ensure_schema(db)
+            rows = db.execute("""SELECT r.id, p.pin_id, p.name, r.image, r.source, r.rights,
+                m.raw_json
+                FROM pin_references r JOIN pins p ON p.pin_id = r.pin_id
+                JOIN pinpanion_metadata m ON m.pin_id = p.pin_id
+                WHERE r.source = m.image_url ORDER BY r.id""")
+            for reference_id, pin_id, name, image, source, rights, raw_json in rows:
+                source_name = json.loads(raw_json).get('name')
+                tag = (source_name if isinstance(source_name, str) and
+                       source_name.strip() else name)
+                yield CatalogStockImage(reference_id, pin_id, name, image,
+                                        source, rights, (tag,))
+
+    def stock_training_state(self) -> tuple[int, int, int]:
+        """Cheap append-only catalog revision for classifier freshness checks."""
+        if not self.path.is_file():
+            return (0, 0, 0)
+        with sqlite3.connect(self.path) as db:
+            self._ensure_schema(db)
+            row = db.execute("""SELECT COUNT(*), COALESCE(MAX(r.id), 0),
+                COALESCE(SUM(LENGTH(r.image)), 0)
+                FROM pin_references r JOIN pinpanion_metadata m ON m.pin_id = r.pin_id
+                WHERE r.source = m.image_url""").fetchone()
+        return tuple(int(value) for value in row)
 
 
 class PinMatcher:
@@ -175,9 +273,12 @@ class PinMatcher:
         if len(self._references) > 32:
             # Train an approximate descriptor index so a large catalog does
             # not require a full comparison with every pin for every crop.
+            # Multi-probe level 2 explores hundreds of neighbouring hash
+            # buckets per query on a large catalog. Twelve independent tables
+            # recover the same candidates much faster without that expansion.
             self._index = cv2.FlannBasedMatcher(
-                dict(algorithm=6, table_number=12, key_size=20, multi_probe_level=2),
-                dict(checks=64))
+                dict(algorithm=6, table_number=12, key_size=20, multi_probe_level=0),
+                dict(checks=16))
             self._index.add([item[2] for item in self._references])
             self._index.train()
 
@@ -236,7 +337,8 @@ class PinMatcher:
             old = best_by_pin.get(reference.pin_id)
             if old is None or inliers > old.inliers:
                 best_by_pin[reference.pin_id] = PinMatch(
-                    reference.pin_id, reference.name, inliers, inliers / len(good))
+                    reference.pin_id, reference.name, inliers, inliers / len(good),
+                    reference.year, reference.show)
         ranked = sorted(best_by_pin.values(), key=lambda match: match.inliers, reverse=True)
         if not ranked or (len(ranked) > 1 and ranked[0].inliers < ranked[1].inliers + 4):
             return None
@@ -264,7 +366,8 @@ class PinMatcher:
             return None
         similarity, reference = best
         return PinMatch(reference.pin_id, reference.name, 0,
-                        max(0.0, min(1.0, similarity)))
+                        max(0.0, min(1.0, similarity)),
+                        reference.year, reference.show)
 
     def rank_matches(self, crop: np.ndarray, limit: int = 20,
                      excluded_pin_ids: frozenset[str] = frozenset(),
@@ -286,7 +389,8 @@ class PinMatcher:
             old = best_by_pin.get(reference.pin_id)
             if old is None or confidence > (old.confidence or 0.0):
                 best_by_pin[reference.pin_id] = PinMatch(
-                    reference.pin_id, reference.name, 0, confidence)
+                    reference.pin_id, reference.name, 0, confidence,
+                    reference.year, reference.show)
         return sorted(best_by_pin.values(),
                       key=lambda match: (-float(match.confidence or 0.0),
                                          match.name.casefold(), match.pin_id))[:limit]

@@ -1,4 +1,6 @@
 import { makeId, type PinIdentity } from './library.js';
+import { classifyProposal, type MobileModel } from './model.js';
+import { matchProposal, type IdentityIndex } from './identity.js';
 
 export type Coords = [number, number, number, number];
 export type ReviewState = 'unconfirmed' | 'confirmed' | 'inherited' | 'rejected';
@@ -9,6 +11,9 @@ export interface ScanBox {
   review_state: ReviewState;
   pin_id: string | null;
   name: string | null;
+  suggested_pin_id?: string | null;
+  suggested_name?: string | null;
+  match_strength?: number | null;
   signature: number[];
 }
 
@@ -24,9 +29,61 @@ export interface PixelFrame {
   data: Uint8ClampedArray;
 }
 
-function overlap(a: Coords, b: Coords): number {
-  const area = Math.max(0, Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0])) *
+export interface ScanDiagnostics {
+  proposals: Coords[];
+  modelRejected: Coords[];
+  tracked: number;
+  belowMatchThreshold?: Coords[];
+  sizeFiltered?: Coords[];
+}
+
+/** A marquee must cover strictly more than half of each visible box it selects. */
+export function selectAreasInRectangle(state: ScanState, rectangle: Coords): string[] {
+  const [left, top, width, height] = rectangle;
+  if (width <= 0 || height <= 0) return [];
+  return state.boxes.filter(box => {
+    if (box.review_state === 'rejected') return false;
+    const [x, y, w, h] = box.coords;
+    const covered = Math.max(0, Math.min(left + width, x + w) - Math.max(left, x)) *
+      Math.max(0, Math.min(top + height, y + h) - Math.max(top, y));
+    return covered > w * h / 2;
+  }).map(box => box.track_id);
+}
+
+export type AreaDragMode = 'auto' | 'draw' | 'select';
+
+/** Default drags select covered areas; an empty marquee becomes a new area. */
+export function resolveAreaDrag(state: ScanState, rectangle: Coords, mode: AreaDragMode):
+  { action: 'select'; trackIds: string[] } | { action: 'draw' } {
+  if (mode === 'draw') return { action: 'draw' };
+  const trackIds = selectAreasInRectangle(state, rectangle);
+  return mode === 'select' || trackIds.length ? { action: 'select', trackIds } : { action: 'draw' };
+}
+
+/** Delete annotations only; this does not create a non-pin review. */
+export function deleteAreas(state: ScanState, trackIds: ReadonlySet<string>): number {
+  const before = state.boxes.length;
+  state.boxes = state.boxes.filter(box => !trackIds.has(box.track_id));
+  return before - state.boxes.length;
+}
+
+export function areaAtPoint(state: ScanState, point: [number, number]): string | null {
+  const [px, py] = point;
+  return state.boxes.filter(box => {
+    if (box.review_state === 'rejected') return false;
+    const [x, y, width, height] = box.coords;
+    return px >= x && py >= y && px <= x + width && py <= y + height;
+  }).sort((left, right) => left.coords[2] * left.coords[3] -
+    right.coords[2] * right.coords[3])[0]?.track_id ?? null;
+}
+
+function intersectionArea(a: Coords, b: Coords): number {
+  return Math.max(0, Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0])) *
     Math.max(0, Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]));
+}
+
+function overlap(a: Coords, b: Coords): number {
+  const area = intersectionArea(a, b);
   const union = a[2] * a[3] + b[2] * b[3] - area;
   return union > 0 ? area / union : 0;
 }
@@ -60,7 +117,9 @@ function similarity(a: number[], b: number[]): number {
 function components(mask: Uint8Array, width: number, height: number): Coords[] {
   const visited = new Uint8Array(mask.length);
   const minSide = Math.max(8, Math.floor(Math.min(width, height) * 0.04));
-  const maxSide = Math.floor(Math.max(width, height) * 0.45);
+  // A nearby pin can occupy most of the camera frame. The old 45% cap discarded
+  // its silhouette and left only small high-contrast artwork as candidates.
+  const maxSide = Math.floor(Math.max(width, height) * 0.95);
   const boxes: Coords[] = [];
   const queue = new Int32Array(mask.length);
   for (let start = 0; start < mask.length; start++) {
@@ -150,17 +209,42 @@ export function detectCandidates(frame: PixelFrame): Coords[] {
   proposed.sort((a, b) => b[2] * b[3] - a[2] * a[3]);
   const result: Coords[] = [];
   for (const box of proposed) {
-    if (result.every(previous => overlap(box, previous) < 0.35)) result.push(box);
+    // IoU alone retains tiny artwork inside a close-up pin because its area is
+    // small relative to the silhouette. Compare coverage of the smaller box.
+    if (result.every(previous => overlap(box, previous) < 0.35 &&
+        intersectionArea(box, previous) < box[2] * box[3] * 0.85)) result.push(box);
     if (result.length >= 40) break;
   }
   return result;
 }
 
-export function scanFrame(frame: PixelFrame, previous: ScanState | null = null): ScanState {
+export function scanFrame(frame: PixelFrame, previous: ScanState | null = null,
+                          model: MobileModel | null = null,
+                          diagnostics?: ScanDiagnostics,
+                          identityIndex: IdentityIndex | null = null,
+                          negativeExamples: readonly number[][] = []): ScanState {
   const proposals = detectCandidates(frame);
-  const candidates = proposals.map(coords => ({ coords, signature: signature(frame, coords) }));
+  if (diagnostics) {
+    diagnostics.proposals = proposals.map(coords => [...coords]);
+    diagnostics.modelRejected = [];
+    diagnostics.tracked = 0;
+    diagnostics.belowMatchThreshold = [];
+    diagnostics.sizeFiltered = [];
+  }
+  const candidates = proposals.map(coords => {
+    const appearance = signature(frame, coords);
+    const match = identityIndex
+      ? matchProposal(identityIndex, frame, coords, negativeExamples) : null;
+    const modelNegative = model && classifyProposal(model, frame, coords) === 'negative';
+    return { coords, appearance, match, modelNegative };
+  });
+  const anchor = strongestMatchSizeReference(candidates.filter(candidate =>
+    !candidate.modelNegative).map(candidate => ({
+      coords: candidate.coords, strength: candidate.match?.strength ?? 0
+    })));
   const used = new Set<string>();
-  const boxes = candidates.map(({ coords, signature: appearance }): ScanBox => {
+  const boxes: ScanBox[] = [];
+  for (const { coords, appearance, match, modelNegative } of candidates) {
     let best: ScanBox | null = null, bestScore = 0;
     if (previous && previous.width === frame.width && previous.height === frame.height) {
       for (const old of previous.boxes) {
@@ -174,16 +258,56 @@ export function scanFrame(frame: PixelFrame, previous: ScanState | null = null):
       }
     }
     if (best) {
+      if (diagnostics) diagnostics.tracked++;
       used.add(best.track_id);
-      return { coords, signature: appearance, track_id: best.track_id,
+      const updatedSuggestion = !best.pin_id && !!match && match.strength >= 0.5;
+      boxes.push({ coords, signature: appearance, track_id: best.track_id,
         review_state: best.review_state === 'rejected' ? 'rejected' :
           best.review_state === 'unconfirmed' ? 'unconfirmed' : 'inherited',
-        pin_id: best.pin_id, name: best.name };
+        pin_id: best.pin_id, name: best.name,
+        suggested_pin_id: updatedSuggestion ? match!.pin_id : null,
+        suggested_name: updatedSuggestion ? match!.name : null,
+        match_strength: updatedSuggestion ? match!.strength : null });
+      continue;
     }
-    return { coords, signature: appearance, track_id: makeId(),
-      review_state: 'unconfirmed', pin_id: null, name: null };
-  });
+    if (modelNegative) {
+      if (diagnostics) diagnostics.modelRejected.push([...coords]);
+      continue;
+    }
+    if (!match || match.strength < 0.5) {
+      if (diagnostics) diagnostics.belowMatchThreshold!.push([...coords]);
+      continue;
+    }
+    if (anchor && !similarSize(coords, anchor, frame.width, frame.height)) {
+      if (diagnostics) diagnostics.sizeFiltered!.push([...coords]);
+      continue;
+    }
+    boxes.push({ coords, signature: appearance, track_id: makeId(),
+      review_state: 'unconfirmed', pin_id: null, name: null,
+      suggested_pin_id: match.pin_id, suggested_name: match.name,
+      match_strength: match.strength });
+  }
   return { width: frame.width, height: frame.height, boxes };
+}
+
+export function strongestMatchSizeReference(
+  candidates: ReadonlyArray<{ coords: Coords; strength: number }>): Coords | null {
+  let best: { coords: Coords; strength: number } | null = null;
+  for (const candidate of candidates) {
+    if (candidate.strength >= 0.5 && (!best || candidate.strength > best.strength))
+      best = candidate;
+  }
+  return best?.coords ?? null;
+}
+
+export function similarSize(coords: Coords, reference: Coords,
+                            frameWidth: number, frameHeight: number): boolean {
+  const clippedX = coords[0] === 0 || coords[0] + coords[2] === frameWidth;
+  const clippedY = coords[1] === 0 || coords[1] + coords[3] === frameHeight;
+  return (coords[2] <= reference[2] * 4 / 3 &&
+    (clippedX || coords[2] >= reference[2] * 0.75)) &&
+    (coords[3] <= reference[3] * 4 / 3 &&
+    (clippedY || coords[3] >= reference[3] * 0.75));
 }
 
 export function tagTrack(state: ScanState, trackId: string, pin: PinIdentity): boolean {
@@ -191,8 +315,35 @@ export function tagTrack(state: ScanState, trackId: string, pin: PinIdentity): b
   if (!box || box.review_state === 'rejected') return false;
   box.pin_id = pin.pin_id;
   box.name = pin.name;
+  box.suggested_pin_id = null;
+  box.suggested_name = null;
+  box.match_strength = null;
   box.review_state = 'confirmed';
   return true;
+}
+
+export function confirmUnknown(state: ScanState, trackId: string): boolean {
+  const box = state.boxes.find(candidate => candidate.track_id === trackId);
+  if (!box || box.review_state === 'rejected') return false;
+  box.pin_id = null;
+  box.name = null;
+  box.suggested_pin_id = null;
+  box.suggested_name = null;
+  box.match_strength = null;
+  box.review_state = 'confirmed';
+  return true;
+}
+
+export function addManualBox(state: ScanState, frame: PixelFrame, coords: Coords): ScanBox | null {
+  const [x, y, width, height] = coords;
+  if (state.width !== frame.width || state.height !== frame.height ||
+      !Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(width) ||
+      !Number.isInteger(height) || x < 0 || y < 0 || width < 4 || height < 4 ||
+      x + width > frame.width || y + height > frame.height) return null;
+  const box: ScanBox = { coords, track_id: makeId(), review_state: 'confirmed',
+    pin_id: null, name: null, signature: signature(frame, coords) };
+  state.boxes.push(box);
+  return box;
 }
 
 export function rejectTrack(state: ScanState, trackId: string): boolean {
@@ -200,6 +351,9 @@ export function rejectTrack(state: ScanState, trackId: string): boolean {
   if (!box) return false;
   box.pin_id = null;
   box.name = null;
+  box.suggested_pin_id = null;
+  box.suggested_name = null;
+  box.match_strength = null;
   box.review_state = 'rejected';
   return true;
 }

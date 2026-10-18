@@ -57,7 +57,7 @@ class Key:
         self.skipped = True
 
 
-def make_window():
+def make_window(unnamed_index: int | None = None):
     app = wx.App.Get() or wx.App(False)
     image = np.random.default_rng(405).integers(0, 255, (120, 240, 3), dtype=np.uint8)
     window = VideoScrubber(None, 'Multi selection', '',
@@ -65,7 +65,9 @@ def make_window():
                            load_catalog=False)
     window.Show()
     wx.Yield()
-    boxes = [BoxData((x, 20, 30, 30), [f'Pin {index}'], 'automatic')
+    boxes = [BoxData((x, 20, 30, 30),
+                     [] if index == unnamed_index else [f'Pin {index}'],
+                     'automatic')
              for index, x in enumerate((20, 90, 180), 1)]
     window._ScrubberFrame__frame_boxes[0] = boxes
     window.display_image(reconcile=False)
@@ -122,11 +124,11 @@ def test_right_click_preserves_group_and_uses_bulk_menu():
             x, y = center(panel, boxes[0])
             panel.on_right_up(Mouse(x, y))
         assert panel.selected_boxes == boxes[:2]
-        assert labels == ['Confirm selected as pins', 'Not a pin (automatic only)',
-                          'Remove selected areas']
+        assert labels == ['Confirm selected identities', 'Remove selected areas',
+                          'Attempt detection', 'Not a pin (automatic only)']
         menu = panel.make_selection_context_menu(boxes[:2])
         assert [item.GetItemLabel() for item in menu.GetMenuItems()][1:] == [
-            '&Not a pin (automatic only)', 'Remove selected areas\tDel']
+            'Remove selected areas\tDel', '&Not a pin (automatic only)']
         menu.Destroy()
 
         labels.clear()
@@ -205,11 +207,13 @@ def test_bulk_confirm_not_pin_and_remove_are_single_undo_actions():
     original = list(boxes)
     try:
         panel = window._ScrubberFrame__image_panel
+        boxes[1].tags = []
         panel._set_selection(boxes[:2])
         activate(panel.make_selection_context_menu(panel.selected_boxes),
                  'Confirm selected as pins')
         assert [box.review_state for box in boxes] == [
             'confirmed', 'confirmed', 'unconfirmed']
+        assert not boxes[0].identity_confirmed
         assert len(window._undo_history[0]) == 1
         assert window._feedback_store.counts()['positive'] == 2
         window.undo_action()
@@ -237,6 +241,115 @@ def test_bulk_confirm_not_pin_and_remove_are_single_undo_actions():
         output = StringIO()
         save_boxes_to_stream(output, window._ScrubberFrame__frame_boxes)
         assert output.getvalue().count('"coords"') == 3
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_bulk_confirm_verifies_all_selected_unconfirmed_identities():
+    app, window, _image, boxes = make_window()
+    try:
+        panel = window._ScrubberFrame__image_panel
+        boxes[0].pin_id = 'pin-1'
+        boxes[1].pin_id = 'pin-2'
+        boxes[1].review_state = 'confirmed'
+        panel._set_selection(boxes[:2])
+        menu = panel.make_selection_context_menu(panel.selected_boxes)
+        confirm = menu.GetMenuItems()[0]
+        assert confirm.GetItemLabelText() == 'Confirm selected identities'
+        assert confirm.IsEnabled()
+        activate(menu, 'Confirm selected identities')
+
+        assert all(box.review_state == 'confirmed' and box.identity_confirmed
+                   for box in boxes[:2])
+        assert [box.pin_id for box in boxes[:2]] == ['pin-1', 'pin-2']
+        assert len(window._undo_history[0]) == 1
+        assert window._feedback_store.counts()['positive'] == 2
+        assert {example.pin_id for example in window._feedback_store.examples()} == {
+            'pin-1', 'pin-2'}
+
+        window.undo_action()
+        assert boxes[0].review_state == 'unconfirmed'
+        assert boxes[1].review_state == 'confirmed'
+        assert not boxes[0].identity_confirmed
+        assert not boxes[1].identity_confirmed
+        assert window._feedback_store.counts()['positive'] == 0
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_bulk_identity_menu_includes_already_verified_selected_label():
+    app, window, _image, boxes = make_window()
+    try:
+        panel = window._ScrubberFrame__image_panel
+        boxes[0].review_state = 'confirmed'
+        boxes[0].identity_confirmed = True
+        panel._set_selection(boxes[:2])
+
+        menu = panel.make_selection_context_menu(panel.selected_boxes)
+        assert menu.GetMenuItems()[0].GetItemLabelText() == 'Confirm selected identities'
+        activate(menu, 'Confirm selected identities')
+
+        assert [box.tags for box in boxes[:2]] == [['Pin 1'], ['Pin 2']]
+        assert all(box.review_state == 'confirmed' and box.identity_confirmed
+                   for box in boxes[:2])
+        assert len(window._undo_history[0]) == 1
+        window.undo_action()
+        assert boxes[0].identity_confirmed
+        assert not boxes[1].identity_confirmed
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_bulk_presence_menu_keeps_label_just_typed_in_editor():
+    app, window, _image, boxes = make_window(unnamed_index=2)
+    try:
+        panel = window._ScrubberFrame__image_panel
+        panel._set_selection(boxes[:2])
+        editor = window._ScrubberFrame__tag_panel.find_panel_for_box(boxes[0])
+        text = editor._BoxTagPanelEdit__box_tags[0]._BoxTagLabelRow__text_entry
+        text.SetValue('Newly typed pin')
+        assert boxes[0].tags == ['Pin 1']  # The text edit is still debounced.
+
+        def popup(menu):
+            item = next(item for item in menu.GetMenuItems()
+                        if item.GetItemLabelText() == 'Confirm selected as pins')
+            menu.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, item.GetId()))
+
+        with patch.object(panel, 'PopupMenu', side_effect=popup):
+            x, y = center(panel, boxes[0])
+            panel.on_right_up(Mouse(x, y))
+
+        assert boxes[0].tags == ['Newly typed pin']
+        assert [box.review_state for box in boxes[:2]] == ['confirmed', 'confirmed']
+        assert not boxes[0].identity_confirmed
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_mixed_selection_can_confirm_only_its_existing_labels():
+    app, window, _image, boxes = make_window(unnamed_index=2)
+    try:
+        panel = window._ScrubberFrame__image_panel
+        panel._set_selection(boxes[:2])
+        menu = panel.make_selection_context_menu(panel.selected_boxes)
+        assert [item.GetItemLabelText() for item in list(menu.GetMenuItems())[:2]] == [
+            'Confirm selected identities', 'Confirm selected as pins']
+        activate(menu, 'Confirm selected identities')
+
+        assert boxes[0].tags == ['Pin 1']
+        assert boxes[0].review_state == 'confirmed'
+        assert boxes[0].identity_confirmed
+        assert boxes[1].review_state == 'unconfirmed'
+        assert boxes[1].tags == []
+        assert len(window._undo_history[0]) == 1
     finally:
         window.Destroy()
         wx.Yield()
@@ -320,7 +433,7 @@ def test_shortcuts_leave_focused_pin_name_field_alone():
         text.SetFocus()
         wx.Yield()
         assert wx.Window.FindFocus() is text
-        for code in (wx.WXK_DELETE, ord('X'), ord('N')):
+        for code in (wx.WXK_DELETE, ord('X'), ord('N'), ord('Y')):
             key = Key(code)
             window.on_key_down(key)
             assert key.skipped
@@ -330,6 +443,75 @@ def test_shortcuts_leave_focused_pin_name_field_alone():
         cut = Key(ord('X'), ctrl=True)
         window.on_key_down(cut)
         assert cut.skipped
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_y_shortcut_confirms_only_one_selected_specific_identity():
+    app, window, _image, boxes = make_window()
+    try:
+        panel = window._ScrubberFrame__image_panel
+        boxes[0].pin_id = 'pin-first'
+        x, y = center(panel, boxes[0])
+        panel.on_left_down(Mouse(x, y, down=True))
+        panel.on_left_up(Mouse(x, y))
+        wx.Yield()
+        editor = window._ScrubberFrame__tag_panel.find_panel_for_box(boxes[0])
+        assert wx.Window.FindFocus() is editor
+
+        menu = panel.make_box_context_menu(boxes[0])
+        confirm = next(item for item in menu.GetMenuItems()
+                       if item.GetItemLabelText() == 'Confirm pin identity')
+        assert confirm.GetItemLabel() == 'Confirm pin identity (&Y)'
+        menu.Destroy()
+
+        key = Key(ord('y'))
+        window.on_key_down(key)
+        assert not key.skipped
+        assert boxes[0].review_state == 'confirmed'
+        assert boxes[0].identity_confirmed
+        assert window._feedback_store.counts()['positive'] == 1
+
+        window.undo_action()
+        assert boxes[0].review_state == 'unconfirmed'
+        assert not boxes[0].identity_confirmed
+
+        panel._set_selection(boxes[:2])
+        panel.SetFocus()
+        wx.Yield()
+        multiple = Key(ord('Y'))
+        window.on_key_down(multiple)
+        assert multiple.skipped
+        assert not boxes[0].identity_confirmed
+
+        panel._set_selection([boxes[0]])
+        panel.SetFocus()
+        wx.Yield()
+        modified = Key(ord('Y'), ctrl=True)
+        window.on_key_down(modified)
+        assert modified.skipped
+        assert not boxes[0].identity_confirmed
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_y_shortcut_leaves_unidentified_selection_unconfirmed():
+    app, window, _image, boxes = make_window(unnamed_index=2)
+    try:
+        panel = window._ScrubberFrame__image_panel
+        panel._set_selection([boxes[1]])
+        panel.SetFocus()
+        wx.Yield()
+        key = Key(ord('Y'))
+        window.on_key_down(key)
+        assert key.skipped
+        assert boxes[1].review_state == 'unconfirmed'
+        assert not boxes[1].identity_confirmed
+        assert window._feedback_store.counts()['positive'] == 0
     finally:
         window.Destroy()
         wx.Yield()

@@ -1,13 +1,17 @@
 import cv2
 import wx
 from pathlib import Path
+from threading import Condition, Thread, current_thread
 from time import perf_counter
+from frame_cache import FrameCache
 from logutil import getLog
 
 from scrubberframe import ScrubberFrame
 
 class VideoScrubber(ScrubberFrame):
     __cap: cv2.VideoCapture | None
+    IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff'}
+    PREFETCH_FRAMES = 4
 
     @property
     def current_index(self):
@@ -24,8 +28,21 @@ class VideoScrubber(ScrubberFrame):
         self._processing_cap = None
         self._processing_last_index = -1
         self._processing_last_frame = None
+        self._frame_cache = FrameCache()
+        self._prefetch_condition = Condition()
+        self._prefetch_target = -1
+        self._prefetch_revision = 0
+        self._prefetch_stopped = False
+        self._prefetch_thread = None
         self.image_array = image_array
-        if video_path:
+        if video_path and Path(video_path).suffix.lower() in self.IMAGE_SUFFIXES:
+            still = cv2.imread(str(video_path), cv2.IMREAD_COLOR)
+            if still is None:
+                raise FileNotFoundError(f'Cannot open image: {video_path}')
+            self.image_array = [still]
+            self._video_path = None
+            num_frames = 1
+        elif video_path:
             self.__cap = cv2.VideoCapture(video_path)
             if not self.__cap.isOpened():
                 self.__cap.release()
@@ -57,8 +74,8 @@ class VideoScrubber(ScrubberFrame):
         if self.__cap:
             if not 0 <= index < self._ScrubberFrame__num_frames:
                 return None
-            if index == self._ui_last_index and self._ui_last_frame is not None:
-                img = self._ui_last_frame
+            img = self._frame_cache.get(index)
+            if img is not None:
                 mode = 'cache'
             else:
                 mode = 'sequential' if index == self._ui_last_index + 1 else 'seek'
@@ -73,6 +90,8 @@ class VideoScrubber(ScrubberFrame):
                 img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 self._ui_last_index = index
                 self._ui_last_frame = img
+                self._frame_cache.put(index, img)
+            self._schedule_prefetch(index)
         elif self.image_array:
             if not 0 <= index < len(self.image_array):
                 return None
@@ -99,6 +118,11 @@ class VideoScrubber(ScrubberFrame):
         if not 0 <= index < self._ScrubberFrame__num_frames:
             return None
         if self._video_path:
+            cached = self._frame_cache.get(index)
+            if cached is not None:
+                getLog().info('frame=%d decode=%.1fms seek=0.0ms mode=cache thread=worker',
+                              index, (perf_counter() - started) * 1000)
+                return cached
             if self._processing_cap is None:
                 self._processing_cap = cv2.VideoCapture(self._video_path)
                 if not self._processing_cap.isOpened():
@@ -121,12 +145,89 @@ class VideoScrubber(ScrubberFrame):
                 result = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 self._processing_last_index = index
                 self._processing_last_frame = result
+                self._frame_cache.put(index, result)
         else:
             frame = self.image_array[index]
             result = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         getLog().info('frame=%d decode=%.1fms seek=%.1fms mode=%s thread=worker',
                       index, (perf_counter() - started) * 1000, seek_ms, mode)
         return result
+
+    def _schedule_prefetch(self, index: int) -> None:
+        if not self._video_path or index >= self._ScrubberFrame__num_frames - 1:
+            return
+        with self._prefetch_condition:
+            if self._prefetch_stopped or index == self._prefetch_target:
+                return
+            self._prefetch_target = index
+            self._prefetch_revision += 1
+            if self._prefetch_thread is None:
+                self._prefetch_thread = Thread(
+                    target=self._prefetch_frames, name='pin-frame-prefetch', daemon=True)
+                self._prefetch_thread.start()
+            self._prefetch_condition.notify()
+
+    def _prefetch_frames(self) -> None:
+        """Decode a short forward window with a capture owned by this thread."""
+        capture = None
+        last_index = -1
+        seen_revision = 0
+        try:
+            while True:
+                with self._prefetch_condition:
+                    self._prefetch_condition.wait_for(
+                        lambda: self._prefetch_stopped or
+                        self._prefetch_revision != seen_revision)
+                    if self._prefetch_stopped:
+                        return
+                    seen_revision = self._prefetch_revision
+                    target = self._prefetch_target
+                end = min(target + self.PREFETCH_FRAMES + 1,
+                          self._ScrubberFrame__num_frames)
+                for index in range(target + 1, end):
+                    with self._prefetch_condition:
+                        if self._prefetch_stopped or self._prefetch_revision != seen_revision:
+                            break
+                    if self._frame_cache.get(index) is not None:
+                        continue
+                    if capture is None:
+                        capture = cv2.VideoCapture(self._video_path)
+                        if not capture.isOpened():
+                            getLog().warning('Could not open video for frame prefetch')
+                            return
+                    if index != last_index + 1:
+                        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                    ok, frame = capture.read()
+                    if not ok:
+                        last_index = -1
+                        break
+                    last_index = index
+                    self._frame_cache.put(index, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        except Exception:
+            getLog().exception('Background frame prefetch failed')
+        finally:
+            if capture is not None:
+                capture.release()
+
+    def _stop_prefetch(self, timeout: float = 1) -> None:
+        with self._prefetch_condition:
+            self._prefetch_stopped = True
+            self._prefetch_condition.notify_all()
+        if self._prefetch_thread is not None and self._prefetch_thread is not current_thread():
+            self._prefetch_thread.join(timeout=timeout)
+
+    def _shutdown_stop_prefetch(self) -> bool:
+        self._stop_prefetch(timeout=0)
+        return self._prefetch_thread is None or not self._prefetch_thread.is_alive()
+
+    def _shutdown_resume_prefetch(self) -> None:
+        with self._prefetch_condition:
+            if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+                return
+            self._prefetch_thread = None
+            self._prefetch_stopped = False
+            self._prefetch_target = -1
+        self._schedule_prefetch(self._current_index)
 
     def close_processing_reader(self) -> None:
         if self._processing_cap is not None:
@@ -136,6 +237,8 @@ class VideoScrubber(ScrubberFrame):
         self._processing_last_frame = None
 
     def __del__(self):
+        if hasattr(self, '_prefetch_thread'):
+            self._stop_prefetch()
         if self.__cap:
             self.__cap.release()
         self.close_processing_reader()

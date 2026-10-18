@@ -32,9 +32,7 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         on_change_begin: Callable[[], None] | None = None,
         on_change_end: Callable[[], None] | None = None,
         on_presence_change: Callable[[str, bool], None] | None = None,
-        on_feedback_info: Callable[[], None] | None = None,
         catalog_options: list[tuple[str, str]] | None = None,
-        on_add_training_data: Callable[[], None] | None = None,
         on_confirm_identity: Callable[[BoxData], None] | None = None,
     ) -> None:
         super().__init__(parent)
@@ -49,21 +47,13 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         self._on_change_begin = on_change_begin
         self._on_change_end = on_change_end
         self._on_presence_change = on_presence_change
-        self._on_feedback_info = on_feedback_info
         self._catalog_options = catalog_options or []
-        self._on_add_training_data = on_add_training_data
 
         self.pin_cb = wx.CheckBox(self, label="Contains pin")
         self.set_cb = wx.CheckBox(self, label="Contains set")
         self.card_cb = wx.CheckBox(self, label="With backing card")
-        self.feedback_info_btn = wx.Button(self, label="Feedback model...")
-        self.training_btn = wx.Button(self, label="Add to training data")
         self.training_gauge = wx.Gauge(self, range=100)
-        self.training_status = wx.StaticText(self, label="Training idle")
-        self.training_btn.Bind(wx.EVT_BUTTON, lambda _event: self._on_add_training_data()
-                               if self._on_add_training_data else None)
-        if on_feedback_info:
-            self.feedback_info_btn.Bind(wx.EVT_BUTTON, lambda _event: on_feedback_info())
+        self.training_status = wx.StaticText(self, label="Reviewed-crop indexing idle")
         self.pin_cb.Bind(wx.EVT_CHECKBOX, self._on_pin_checked)
         self.set_cb.Bind(wx.EVT_CHECKBOX, self._on_set_checked)
         self.__box_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -74,8 +64,6 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         self.vbox.Add(self.pin_cb, 0, wx.ALL, 5)
         self.vbox.Add(self.set_cb, 0, wx.ALL, 5)
         self.vbox.Add(self.card_cb, 0, wx.ALL, 5)
-        self.vbox.Add(self.feedback_info_btn, 0, wx.ALL, 5)
-        self.vbox.Add(self.training_btn, 0, wx.ALL, 5)
         self.vbox.Add(self.training_gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
         self.vbox.Add(self.training_status, 0, wx.ALL, 5)
         self.vbox.Add(self.__box_sizer, 1, wx.EXPAND | wx.ALL, 5)
@@ -138,7 +126,18 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
     def set_training_progress(self, percent: int, status: str, running: bool) -> None:
         self.training_gauge.SetValue(max(0, min(100, percent)))
         self.training_status.SetLabel(status)
-        self.training_btn.Enable(not running)
+        if not running:
+            self.training_status.Wrap(max(200, self.GetClientSize().width - 20))
+            self.vbox.Layout()
+            self.FitInside()
+
+    def set_review_status(self, status: str) -> None:
+        self.training_status.SetLabel(status)
+
+    def commit_pending_labels(self) -> None:
+        for panel in list(self.__box_panels):
+            if not panel.IsBeingDeleted():
+                panel.commit_pending_labels()
 
     def Refresh(self, eraseBackground=True, rect=None) -> bool:
         return super().Refresh(eraseBackground, rect)
@@ -353,8 +352,14 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
     def on_box_selected(self, event: BoxSelectedEvent) -> None:
         """Handle box selection event."""
         getLog().debug(f'Box selected {event.box}')
+        selected_panel = None
         for panel in self.__box_panels:
             panel.selected = event.box is not None and panel.is_box(event.box)
+            if panel.selected:
+                selected_panel = panel
+        if selected_panel is not None and event.focus_editor:
+            self.ScrollChildIntoView(selected_panel)
+            selected_panel.SetFocusIgnoringChildren()
 
     def on_size(self, event):
         event.Skip()

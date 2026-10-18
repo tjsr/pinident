@@ -10,7 +10,7 @@ from frame_presence import FramePresence
 _FIELDS = ('coords', 'tags', 'source', 'track_id', 'pin_id',
            'review_state', 'prev_box_id', 'feedback_id', 'feedback_label',
            'match_confidence', 'identity_confirmed', 'identity_inferred',
-           'identity_rejections')
+           'identity_rejections', 'bounds_adjustment', 'bounds_direct')
 
 
 @dataclass(frozen=True)
@@ -90,8 +90,21 @@ def make_entry(before: dict[int, BoxSnapshot], after: dict[int, BoxSnapshot],
         old, new = before.get(identity), after.get(identity)
         old_location = old.location if old else None
         new_location = new.location if new else None
-        fields = ({field: (old.values[field], new.values[field]) for field in _FIELDS
-                   if old.values[field] != new.values[field]} if old and new else {})
+        if old and new:
+            fields = {field: (old.values[field], new.values[field])
+                      for field in _FIELDS
+                      if old.values[field] != new.values[field]}
+        elif old:
+            # A box can be edited and then merged away in one owner action.
+            # Record those field changes so undo restores its pre-action state.
+            current = {field: getattr(old.box, field) for field in _FIELDS}
+            current['tags'] = (tuple(old.box.tags)
+                               if old.box.tags is not None else None)
+            fields = {field: (old.values[field], current[field])
+                      for field in _FIELDS
+                      if old.values[field] != current[field]}
+        else:
+            fields = {}
         if old_location != new_location or fields:
             changes.append(BoxChange((old or new).box, old_location, new_location, fields))
     return HistoryEntry(changes, before_rotation, after_rotation,

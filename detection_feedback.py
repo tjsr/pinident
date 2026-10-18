@@ -1,8 +1,9 @@
 """Local reviewed pin/non-pin examples and a conservative proposal ranker.
 
 The database retains cropped source pixels and provenance for later model
-training. The current online model is a nearest-neighbour visual baseline,
-not a learned neural object detector.
+training. The online ranker is a nearest-neighbour visual baseline. An
+optional saved OpenCV SVM can classify its proposed rectangles; neither is a
+neural object detector.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import numpy as np
 
 from boxdata import Coordinate
 from logutil import getLog
+from pin_catalog import PinMatch
 
 
 DEFAULT_FEEDBACK_DB = Path(__file__).with_name('detection_feedback.sqlite3')
@@ -117,6 +119,22 @@ class FeedbackStore:
         return [FeedbackExample(row[0], 'wrong_identity', row[1], row[2], row[3],
                                 row[4], tuple(json.loads(row[5])), row[6],
                                 tuple(json.loads(row[7]))) for row in rows]
+
+    def identity_rejections(self) -> list[FeedbackExample]:
+        rows = self.db.execute("""SELECT example_id, source_path, frame_index,
+            track_id, pin_id, coords_json, crop_png, tags_json
+            FROM identity_rejections ORDER BY rowid""")
+        return [FeedbackExample(row[0], 'wrong_identity', row[1], row[2], row[3],
+                                row[4], tuple(json.loads(row[5])), row[6],
+                                tuple(json.loads(row[7]))) for row in rows]
+
+    def get_identity_rejection(self, example_id: str) -> FeedbackExample | None:
+        row = self.db.execute("""SELECT example_id, source_path, frame_index,
+            track_id, pin_id, coords_json, crop_png, tags_json
+            FROM identity_rejections WHERE example_id = ?""", (example_id,)).fetchone()
+        return (FeedbackExample(row[0], 'wrong_identity', row[1], row[2], row[3],
+                                row[4], tuple(json.loads(row[5])), row[6],
+                                tuple(json.loads(row[7]))) if row else None)
 
     def delete_missing_identity_rejections(self, source_path: str,
                                            active_ids: set[str]) -> None:
@@ -261,25 +279,38 @@ def _descriptor(crop: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
     return gray.ravel(), chroma
 
 
+def _classifier_feature(descriptor: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    gray, chroma = descriptor
+    return np.concatenate((gray, chroma / 80.0 * 0.15)).astype(np.float32)
+
+
 class FeedbackModel:
     """Use reviewed crops to rank proposals and suppress very close negatives."""
 
     def __init__(self, store: FeedbackStore):
         self.store = store
         self.version = 0
+        self.trained_model = None
         self.reload()
 
     def reload(self) -> None:
-        self._samples: dict[str, tuple[str, np.ndarray, np.ndarray]] = {}
+        self._samples: dict[str, tuple[str, str | None, str, np.ndarray, np.ndarray]] = {}
         for example in self.store.examples():
+            self._load_example(example)
+        for example in self.store.identity_rejections():
             self._load_example(example)
         self._rebuild_vectors()
         self.version += 1
 
     def refresh(self, example_ids: set[str]) -> None:
+        if any((self._samples.get(example_id, ('',))[0] in ('positive', 'negative') or
+                self.store.get(example_id) is not None)
+               for example_id in example_ids):
+            self.trained_model = None
         for example_id in example_ids:
             self._samples.pop(example_id, None)
-            example = self.store.get(example_id)
+            example = (self.store.get(example_id) or
+                       self.store.get_identity_rejection(example_id))
             if example is not None:
                 self._load_example(example)
         self._rebuild_vectors()
@@ -292,7 +323,11 @@ class FeedbackModel:
         snapshot.version = self.version
         snapshot._vectors = {label: (gray, chroma)
                              for label, (gray, chroma) in self._vectors.items()}
+        snapshot._identity_vectors = self._identity_vectors
+        snapshot._wrong_identity_vectors = self._wrong_identity_vectors
+        snapshot.identity_sample_count = self.identity_sample_count
         snapshot.sample_counts = dict(self.sample_counts)
+        snapshot.trained_model = self.trained_model
         return snapshot
 
     def _load_example(self, example: FeedbackExample) -> None:
@@ -302,19 +337,72 @@ class FeedbackModel:
             return
         descriptor = _descriptor(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         if descriptor is not None:
-            self._samples[example.example_id] = (example.label, *descriptor)
+            self._samples[example.example_id] = (
+                example.label, example.pin_id,
+                next((tag for tag in example.tags if tag.strip()), example.pin_id or ''),
+                *descriptor)
 
     def _rebuild_vectors(self) -> None:
         grouped: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {
             'positive': [], 'negative': []}
-        for label, gray, chroma in self._samples.values():
-            grouped[label].append((gray, chroma))
+        identities: dict[str, tuple[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+        wrong: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
+        for label, pin_id, name, gray, chroma in self._samples.values():
+            if label in grouped:
+                grouped[label].append((gray, chroma))
+            if pin_id and label == 'positive':
+                entry = identities.setdefault(pin_id, (name, []))
+                entry[1].append((gray, chroma))
+            elif pin_id and label == 'wrong_identity':
+                wrong.setdefault(pin_id, []).append((gray, chroma))
         self._vectors = {
             label: (np.stack([item[0] for item in samples]) if samples else None,
                     np.stack([item[1] for item in samples]) if samples else None)
             for label, samples in grouped.items()}
         self.sample_counts = {label: len(samples)
                               for label, samples in grouped.items()}
+        self._identity_vectors = {
+            pin_id: (name, np.stack([item[0] for item in samples]),
+                     np.stack([item[1] for item in samples]))
+            for pin_id, (name, samples) in identities.items()}
+        self._wrong_identity_vectors = {
+            pin_id: (np.stack([item[0] for item in samples]),
+                     np.stack([item[1] for item in samples]))
+            for pin_id, samples in wrong.items()}
+        self.identity_sample_count = sum(len(samples) for _, samples in identities.values())
+
+    @staticmethod
+    def _similarity(descriptor: tuple[np.ndarray, np.ndarray],
+                    vectors: np.ndarray, colours: np.ndarray) -> float:
+        gray, chroma = descriptor
+        texture = np.maximum(0.0, vectors @ gray)
+        colour = np.maximum(0.0, 1.0 - np.linalg.norm(colours - chroma, axis=1) / 80.0)
+        return float(np.max(0.85 * texture + 0.15 * colour))
+
+    def suggest_identity(self, crop: np.ndarray,
+                         excluded_pin_ids: frozenset[str] = frozenset(),
+                         excluded_names: frozenset[str] = frozenset()) -> PinMatch | None:
+        """Suggest only a well-separated visual match to directly reviewed IDs."""
+        if not self._identity_vectors:
+            return None
+        descriptor = _descriptor(crop)
+        if descriptor is None:
+            return None
+        ranked: list[tuple[float, str, str]] = []
+        for pin_id, (name, vectors, colours) in self._identity_vectors.items():
+            if pin_id in excluded_pin_ids or name.casefold() in excluded_names:
+                continue
+            positive = self._similarity(descriptor, vectors, colours)
+            negatives = self._wrong_identity_vectors.get(pin_id)
+            if negatives is not None and self._similarity(descriptor, *negatives) >= positive - 0.05:
+                continue
+            ranked.append((positive, pin_id, name))
+        ranked.sort(reverse=True)
+        if not ranked or ranked[0][0] < 0.90 or (
+                len(ranked) > 1 and ranked[0][0] < ranked[1][0] + 0.05):
+            return None
+        score, pin_id, name = ranked[0]
+        return PinMatch(pin_id, name, 0, score)
 
     def _best_similarity(self, descriptor: tuple[np.ndarray, np.ndarray],
                          label: str) -> float:
@@ -330,6 +418,7 @@ class FeedbackModel:
                         boxes: list[Coordinate]) -> list[Coordinate]:
         scored: list[tuple[float, int, Coordinate]] = []
         suppressed = 0
+        trained_negative = 0
         unscored = 0
         for index, coords in enumerate(boxes):
             x, y, width, height = coords
@@ -341,15 +430,26 @@ class FeedbackModel:
                 unscored += 1
                 scored.append((0.0, index, coords))
                 continue
+            trained = self.trained_model
+            model_penalty = 0.0
+            if trained is not None:
+                feature = trained.feature(image[y:y + height, x:x + width])
+                if feature is not None and trained.classify_feature(feature) == 'negative':
+                    # Stock artwork and real video crops have different
+                    # backgrounds. A binary prediction is useful ordering
+                    # evidence, but a hard veto loses visible pins entirely.
+                    trained_negative += 1
+                    model_penalty = 0.03
             positive = self._best_similarity(descriptor, 'positive')
             negative = self._best_similarity(descriptor, 'negative')
             if negative >= 0.88 and negative > positive + 0.06:
                 suppressed += 1
                 continue
-            scored.append((positive - negative, index, coords))
+            scored.append((positive - negative - model_penalty, index, coords))
         scored.sort(key=lambda item: (-item[0], item[1]))
         getLog().info(
-            'feedback revision=%d samples=%d/%d proposals=%d suppressed=%d unscored=%d kept=%d',
+            'feedback revision=%d samples=%d/%d proposals=%d suppressed=%d '
+            'trained_negative=%d unscored=%d kept=%d',
             self.version, self.sample_counts['positive'], self.sample_counts['negative'],
-            len(boxes), suppressed, unscored, len(scored))
+            len(boxes), suppressed, trained_negative, unscored, len(scored))
         return [coords for _, _, coords in scored]

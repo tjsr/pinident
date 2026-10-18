@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 from collections import defaultdict, deque
 from copy import copy, deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -12,7 +13,7 @@ import cv2
 import numpy as np
 import wx
 
-from boxdata import (BoxData, Coordinate, IdentityRejection,
+from boxdata import (BoxData, Coordinate, IdentityRejection, is_placeholder_tag,
                      has_specific_identity, rejects_identity, same_specific_name)
 from annotation_history import BoxSnapshot, HistoryEntry, make_entry, snapshot
 from detection_feedback import (FeedbackModel, FeedbackStore,
@@ -20,6 +21,13 @@ from detection_feedback import (FeedbackModel, FeedbackStore,
 from frame_processing import FrameJob, FrameResult, process_frame
 from frame_presence import FramePresence, checkbox_values, marked_pin_count
 from controlspanel import ControlsPanel
+from settings_dialog import SettingsDialog
+from shutdown_progress import ShutdownProgressDialog
+from trained_detection_model import (TrainedDetectionModel, examples_digest,
+                                     metadata_path, model_path_for_feedback,
+                                     PortableDetectionModel)
+from cloud_sync import (CloudConfig, CloudSyncError, cloud_cursor, fetch_model, fetch_review_page,
+                        apply_reviews, publish_model)
 from events.BoxSelectedEvent import BoxSelectedEvent
 from events.events import EVT_BOX_SELECTED
 from controls.imagepanel import ImagePanel
@@ -27,12 +35,18 @@ from logutil import getLog
 from controls.markerpanel import MarkerPanel  # Adjust import as needed
 from controls.tagpanel import TagPanel
 from pin_catalog import PinCatalog, PinMatch, PinMatcher
-from session_training import (TrainingDelta, reviewed_observations,
-                              plan_training_delta, build_training_examples)
-from pin_detection import (add_new_detections, add_unique_boxes, associate_frame_boxes,
+from session_training import (LINKED_POSITIVE_PREFIX, TrainingDelta,
+                              TrainingObservation, build_training_examples,
+                              observation_metadata, plan_training_delta,
+                              reviewed_observations)
+from pin_detection import (add_adjacent_tracked_boxes, add_new_detections,
+                           add_unique_boxes, associate_frame_boxes,
                            can_link_saved_target,
+                           consolidate_overlapping_boxes,
                            detect_pin_boxes, detect_pin_boxes_relaxed,
+                           filter_new_candidates_by_pin_size,
                            identify_candidates, inherit_confirmed_catalog_matches,
+                           inherit_corrected_bounds,
                            needs_catalog_match,
                            match_existing_candidates,
                            match_rejected_candidates)
@@ -42,13 +56,20 @@ def remove_empty(tags: List[str]) -> List[str]:
     return [tag for tag in tags if tag.strip()]
 
 def save_boxes_to_stream(stream, frame_boxes: dict[int, list[BoxData]],
-                         presence: dict[int, FramePresence] | None = None) -> None:
+                         presence: dict[int, FramePresence] | None = None,
+                         progress: Callable[[int], None] | None = None) -> None:
     # frame_boxes: {frame_number: [BoxData, ...]}
-    serializable = {
-        frame: [
+    serializable = {}
+    total_frames = len(frame_boxes)
+    for position, (frame, boxes) in enumerate(frame_boxes.items(), 1):
+        serializable[frame] = [
             {"coords": box.coords, "tags": remove_empty(box.tags), "source": box.source,
              "prev_box_id": box.prev_box_id, "track_id": box.track_id,
              "review_state": box.review_state,
+             **({"bounds_adjustment": box.bounds_adjustment}
+                if box.bounds_adjustment is not None else {}),
+             **({"bounds_direct": True} if box.bounds_direct and box.source != 'user'
+                else {}),
              **({"feedback_id": box.feedback_id, "feedback_label": box.feedback_label}
                 if box.feedback_id and box.feedback_label else {}),
              **({"pin_id": box.pin_id} if box.pin_id else {}),
@@ -65,8 +86,8 @@ def save_boxes_to_stream(stream, frame_boxes: dict[int, list[BoxData]],
                 if box.identity_rejections else {})}
             for box in boxes
         ]
-        for frame, boxes in frame_boxes.items()
-    }
+        if progress:
+            progress(round(85 * position / max(1, total_frames)))
     if presence:
         assertions = {str(frame): {'contains_pin': flags.pin_asserted,
                                     'contains_set': flags.set_asserted}
@@ -75,12 +96,34 @@ def save_boxes_to_stream(stream, frame_boxes: dict[int, list[BoxData]],
         if assertions:
             serializable['_frame_presence'] = assertions
     json.dump(serializable, stream)
+    if progress:
+        progress(90)
 
 def save_boxes_to_file(filename: str, frame_boxes: dict[int, list[BoxData]],
-                       presence: dict[int, FramePresence] | None = None) -> None:
-    with open(filename, "w", encoding="utf-8") as f:
-        save_boxes_to_stream(f, frame_boxes, presence)
-        f.close()
+                       presence: dict[int, FramePresence] | None = None,
+                       progress: Callable[[int], None] | None = None) -> None:
+    """Replace the sidecar only after the complete JSON has reached disk."""
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', delete=False,
+                dir=os.path.dirname(os.path.abspath(filename)),
+                prefix='.pinident-', suffix='.tmp') as stream:
+            temporary_name = stream.name
+            if progress is None:
+                save_boxes_to_stream(stream, frame_boxes, presence)
+            else:
+                save_boxes_to_stream(stream, frame_boxes, presence, progress)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if progress:
+            progress(95)
+        os.replace(temporary_name, filename)
+        if progress:
+            progress(100)
+    finally:
+        if temporary_name is not None and os.path.exists(temporary_name):
+            os.unlink(temporary_name)
 
 def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
     """Merge boxes with the same coordinates and tags."""
@@ -96,7 +139,9 @@ def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
                                   match_confidence=box.match_confidence,
                                   identity_confirmed=box.identity_confirmed,
                                   identity_inferred=box.identity_inferred,
-                                  identity_rejections=box.identity_rejections)
+                                  identity_rejections=box.identity_rejections,
+                                  bounds_adjustment=box.bounds_adjustment,
+                                  bounds_direct=box.bounds_direct)
         else:
             merged[key].tags.extend(box.tags)
             merged[key].tags = remove_empty(merged[key].tags)
@@ -130,6 +175,9 @@ def load_boxes_from_stream(stream) -> dict[int, list[BoxData]]:
                     match_confidence=jsonbox.get("match_confidence"),
                     identity_confirmed=jsonbox.get("identity_confirmed"),
                     identity_inferred=jsonbox.get("identity_inferred", False),
+                    bounds_adjustment=(tuple(jsonbox['bounds_adjustment'])
+                                       if 'bounds_adjustment' in jsonbox else None),
+                    bounds_direct=jsonbox.get('bounds_direct'),
                     identity_rejections=tuple(IdentityRejection(
                         item['example_id'], item.get('pin_id'),
                         tuple(item.get('tags', [])), tuple(item['coords']),
@@ -396,12 +444,27 @@ def reconcile_saved_frames(index: int, num_frames: int,
         sources = [box for box in frame_boxes.get(reference_index, [])
                    if box.review_state != 'rejected' and
                    (box.review_state in ('confirmed', 'inherited') or
-                    has_specific_identity(box))]
+                    has_specific_identity(box) or
+                    box.bounds_adjustment is not None or
+                    any(target.track_id == box.track_id and
+                        target.bounds_adjustment is not None and
+                        not target.bounds_direct
+                        for target in frame_boxes.get(index, [])))]
         if sources:
             source_frame, target_frame = frame_at(reference_index), frame_at(index)
             if source_frame is not None and target_frame is not None:
+                for source, target in match_existing_candidates(
+                        source_frame, target_frame, sources,
+                        frame_boxes.get(index, [])):
+                    if inherit_corrected_bounds(source_frame, target_frame,
+                                                source, target):
+                        target.track_id = source.track_id
+                        if reference_index < index:
+                            target.prev_box_id = source.id
                 proposed = associate_frame_boxes(source_frame, target_frame, sources, [])
-                frame_boxes[index] = add_unique_boxes(frame_boxes.get(index, []), proposed)
+                frame_boxes[index] = add_adjacent_tracked_boxes(
+                    source_frame, target_frame, sources,
+                    frame_boxes.get(index, []), proposed)
                 propagate_confirmations(frame_boxes)
     current = frame_boxes.get(index, [])
     if not any(box.source in ('automatic', 'user') and box.review_state != 'rejected'
@@ -434,6 +497,8 @@ def reconcile_saved_frames(index: int, num_frames: int,
                             frame_boxes[source_index], frame_boxes[target_index]):
                         old_track = target.track_id
                         if old_track == source.track_id:
+                            inherit_corrected_bounds(source_frame, target_frame,
+                                                     source, target)
                             if (source.identity_confirmed and
                                     target.review_state == 'confirmed' and
                                     not target.identity_confirmed and
@@ -453,6 +518,8 @@ def reconcile_saved_frames(index: int, num_frames: int,
                                 any(box.pin_id and box.pin_id != source.pin_id
                                     for box in members)):
                             continue
+                        inherit_corrected_bounds(source_frame, target_frame,
+                                                 source, target)
                         if (source.identity_confirmed and
                                 target.review_state == 'confirmed' and
                                 not target.identity_confirmed and
@@ -572,6 +639,7 @@ class ScrubberFrame(wx.Frame):
                 self._pending_rejection_history = None
                 propagate_rejections(self.__frame_boxes)
                 propagate_confirmations(self.__frame_boxes)
+                self._consolidate_frames()
                 self.__detected_frames = {
                     index for index in boxes
                     if self.__frame_boxes.get(index) and
@@ -606,6 +674,8 @@ class ScrubberFrame(wx.Frame):
         self._primary_only_frames: set[int] = set()
         self.__matched_frames: set[int] = set()
         self._pending_catalog: dict[int, Future[list[BoxData]]] = {}
+        self._pending_catalog_targets: dict[int, tuple[BoxData, bool]] = {}
+        self._pending_attempt: Future[BoxData | None] | None = None
         self._undo_history: dict[int, list[HistoryEntry]] = {}
         self._redo_history: dict[int, list[HistoryEntry]] = {}
         self._history_pending: tuple[int, dict[int, BoxSnapshot], int,
@@ -615,7 +685,49 @@ class ScrubberFrame(wx.Frame):
         self._feedback_source = feedback_source or f'session:{uuid4().hex}'
         self._feedback_store = FeedbackStore(feedback_path)
         self._feedback_model = FeedbackModel(self._feedback_store)
+        self._pin_catalog = PinCatalog(catalog_path) if catalog_path else PinCatalog()
         self._training_future: Future | None = None
+        self._model_training_future: Future | None = None
+        self._trained_model_path = model_path_for_feedback(self._feedback_store.path)
+        self._cloud_config = CloudConfig.from_environment()
+        self._cloud_model_version = 0
+        self._cloud_status = 'Not checked'
+        self._cloud_sync_future: Future | None = None
+        self._cloud_publish_future: Future | None = None
+        self._cloud_train_after_sync = False
+        self._cloud_ready_for_publish = False
+        self._training_base_cloud_version = 0
+        self._sync_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pin-cloud')
+        if (self._trained_model_path is not None and
+                self._trained_model_path.is_file()):
+            try:
+                saved_model = TrainedDetectionModel.load(self._trained_model_path)
+                if (saved_model.catalog_state ==
+                        self._pin_catalog.stock_training_state() and
+                        saved_model.review_digest ==
+                        examples_digest(self._feedback_store.examples())):
+                    self._feedback_model.trained_model = saved_model
+                else:
+                    getLog().warning(
+                        'Saved classifier is stale for current reviews or Pinpanion catalog; '
+                        'run training again')
+            except (OSError, ValueError, KeyError, cv2.error):
+                getLog().exception('Could not load trained classifier from %s',
+                                   self._trained_model_path)
+        if (self._trained_model_path is not None and
+                not isinstance(self._feedback_model.trained_model,
+                               TrainedDetectionModel)):
+            cache_path = self._trained_model_path.with_suffix('.cloud.json')
+            if (cache_path.is_file() and
+                    (not self._trained_model_path.is_file() or
+                     cache_path.stat().st_mtime >= self._trained_model_path.stat().st_mtime)):
+                try:
+                    cached = json.loads(cache_path.read_text(encoding='utf-8'))
+                    self._cloud_model_version = cached['cloud_version']
+                    self._feedback_model.trained_model = PortableDetectionModel.from_payload(
+                        cached['model'])
+                except (OSError, KeyError, ValueError, TypeError):
+                    getLog().exception('Could not load cached Cloudflare classifier')
         self._playback_step = False
         self._playing = False
         self._play_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pin-detection')
@@ -628,11 +740,19 @@ class ScrubberFrame(wx.Frame):
         self._annotation_revision = 0
         self._play_generation = 0
         self._closing = False
+        self._shutdown_dialog: ShutdownProgressDialog | None = None
+        self._shutdown_stage = 0
+        self._shutdown_prepared = False
+        self._shutdown_play_barrier: Future | None = None
+        self._shutdown_cloud_barrier: Future | None = None
+        self._shutdown_save_future: Future | None = None
+        self._shutdown_reader_future: Future | None = None
+        self._shutdown_save_executor: ThreadPoolExecutor | None = None
+        self._shutdown_timer: wx.Timer | None = None
         self._display_source_frame: np.ndarray | None = None
         self._tags_dirty = False
         self._play_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_play_timer, self._play_timer)
-        self._pin_catalog = PinCatalog(catalog_path) if catalog_path else PinCatalog()
         self._pin_matcher = PinMatcher(self._pin_catalog.references() if load_catalog else [])
 
         self._current_index = 0
@@ -648,8 +768,10 @@ class ScrubberFrame(wx.Frame):
         self.__image_panel = ImagePanel(main_panel)
         self.__image_panel.on_confirm_box = self.confirm_box
         self.__image_panel.on_confirm_boxes = self.confirm_boxes
+        self.__image_panel.on_confirm_identities = self._confirm_identities
         self.__image_panel.on_confirm_identity = self.confirm_pin_identity
         self.__image_panel.on_wrong_identity = self.mark_wrong_identity
+        self.__image_panel.on_attempt_detection = self.attempt_detection
         self.__image_panel.on_rank_replacements = self.rank_pin_replacements
         self.__image_panel.on_replace_pin = self.replace_with_pin
         self.__image_panel.on_reject_replacements = self.reject_pin_replacements
@@ -676,10 +798,9 @@ class ScrubberFrame(wx.Frame):
             on_change_begin=self._begin_history,
             on_change_end=self._finish_history,
             on_presence_change=self._on_presence_change,
-            on_feedback_info=self.show_feedback_info,
             catalog_options=self._pin_catalog.list_pins() if load_catalog else [],
-            on_add_training_data=self.add_to_training_data,
         )
+        self.__image_panel.on_before_context_menu = self.__tag_panel.commit_pending_labels
         self.__image_panel.Bind(EVT_BOX_SELECTED, self.__tag_panel.on_box_selected)
         frame_boxes = self.__get_frame_boxes(self._current_index)
         self.__tag_panel.boxes = frame_boxes
@@ -694,7 +815,8 @@ class ScrubberFrame(wx.Frame):
         # Add ControlsPanel below image_panel
         self.__button_panel = ControlsPanel(main_panel)
         vbox.Add(self.__button_panel, 0, wx.CENTER, 0)
-        self.__button_panel.bind_buttons(self.on_prev, self.on_next_async, self.on_next_empty, self.on_rotate_ccw, self.on_rotate_cw, self.__on_remove_selected, self.on_detect_async, self.file_select, self.on_play)
+        self.__button_panel.bind_buttons(self.on_prev, self.on_next_async, self.on_next_empty, self.on_rotate_ccw, self.on_rotate_cw, self.__on_remove_selected, self.on_detect_async, self.on_play, self.confirm_all_suggestions)
+        self._create_menu_bar()
 
         # Add MarkerPanel below image_panel
         self.marker_panel = MarkerPanel(main_panel, num_frames)
@@ -714,6 +836,40 @@ class ScrubberFrame(wx.Frame):
 
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key_down)
         self.Bind(wx.EVT_SHOW, self.on_show)
+        self._cloud_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_cloud_timer, self._cloud_timer)
+        self._cloud_timer.Start(5 * 60 * 1000)
+        self._start_cloud_sync()
+
+    def _create_menu_bar(self) -> None:
+        file_menu = wx.Menu()
+        save_item = file_menu.Append(wx.ID_ANY, 'Save')
+        settings_item = file_menu.Append(wx.ID_ANY, 'Settings')
+        load_item = file_menu.Append(wx.ID_ANY, 'Load Annotations...')
+
+        training_menu = wx.Menu()
+        feedback_item = training_menu.Append(wx.ID_ANY, 'Feedback model...')
+        self._training_add_item = training_menu.Append(wx.ID_ANY, 'Add to training data')
+        self._training_run_item = training_menu.Append(wx.ID_ANY, 'Run training now')
+        self._training_add_item.SetHelp('Save reviewed crops and refresh the example matcher.')
+        self._training_run_item.SetHelp('Index reviews, then train and save the pin classifier.')
+
+        menu_bar = wx.MenuBar()
+        menu_bar.Append(file_menu, 'File')
+        menu_bar.Append(training_menu, 'Training')
+        self.SetMenuBar(menu_bar)
+
+        self.Bind(wx.EVT_MENU, self.file_select, load_item)
+        self.Bind(wx.EVT_MENU, self.save_annotations, save_item)
+        self.Bind(wx.EVT_MENU, self.show_settings, settings_item)
+        self.Bind(wx.EVT_MENU, lambda _event: self.show_feedback_info(), feedback_item)
+        self.Bind(wx.EVT_MENU, lambda _event: self.add_to_training_data(), self._training_add_item)
+        self.Bind(wx.EVT_MENU, lambda _event: self.run_training_now(), self._training_run_item)
+
+    def _set_training_progress(self, percent: int, status: str, running: bool) -> None:
+        self.__tag_panel.set_training_progress(percent, status, running)
+        self._training_add_item.Enable(not running)
+        self._training_run_item.Enable(not running)
 
     def get_frame(self, index: int, rotation_angle: int = 0):
         raise NotImplementedError
@@ -754,7 +910,7 @@ class ScrubberFrame(wx.Frame):
             pending.cancel()
         frame = (self._display_source_frame if index == self._current_index and
                  self._rotation_angle == 0 else None)
-        self._schedule_catalog_match(index, frame, None)
+        self._schedule_catalog_match(index, frame, None, target_box=box)
 
     def _reconcile_frame(self, index: int) -> None:
         """Carry trusted identities through saved adjacent candidate chains."""
@@ -772,6 +928,12 @@ class ScrubberFrame(wx.Frame):
         for future in self._pending_catalog.values():
             future.cancel()
         self._pending_catalog.clear()
+        self._pending_catalog_targets.clear()
+
+    def _cancel_attempt_detection(self) -> None:
+        if self._pending_attempt is not None:
+            self._pending_attempt.cancel()
+            self._pending_attempt = None
 
     def _invalidate_reconciliation(self) -> None:
         self._cancel_reconciliation()
@@ -787,7 +949,12 @@ class ScrubberFrame(wx.Frame):
         has_reference = (reference_index is not None and abs(reference_index - index) == 1
                          and any(box.review_state != 'rejected' and
                                  (box.review_state in ('confirmed', 'inherited') or
-                                  has_specific_identity(box))
+                                  has_specific_identity(box) or
+                                  box.bounds_adjustment is not None or
+                                  any(target.track_id == box.track_id and
+                                      target.bounds_adjustment is not None and
+                                      not target.bounds_direct
+                                      for target in self.__frame_boxes.get(index, [])))
                                  for box in self.__frame_boxes.get(reference_index, [])))
         pair = (reference_index, index) if has_reference else None
         if index in self._reconcile_done and (pair is None or pair in self._reconciled_pairs):
@@ -858,6 +1025,13 @@ class ScrubberFrame(wx.Frame):
         for frame_index, updated in analyzed_boxes.items():
             count = initial_counts[frame_index]
             for original, analyzed in zip(self.__frame_boxes[frame_index], updated[:count]):
+                if (original.source == 'automatic' and
+                        original.review_state in ('unconfirmed', 'inherited') and
+                        not original.bounds_direct and original.feedback_id is None and
+                        (original.coords != analyzed.coords or
+                         original.bounds_adjustment != analyzed.bounds_adjustment)):
+                    original.coords = analyzed.coords
+                    original.bounds_adjustment = analyzed.bounds_adjustment
                 original.track_id = analyzed.track_id
                 original.pin_id = analyzed.pin_id
                 original.tags = list(analyzed.tags or [])
@@ -867,6 +1041,7 @@ class ScrubberFrame(wx.Frame):
                 original.review_state = analyzed.review_state
                 original.identity_rejections = analyzed.identity_rejections
             self.__frame_boxes[frame_index].extend(updated[count:])
+        self._sync_automatic_consolidation(invalidate=False)
         pending_history = self._pending_rejection_history
         if pending_history is not None and pending_history[1] == revision:
             origin_frame, _, before, entry = pending_history
@@ -948,58 +1123,97 @@ class ScrubberFrame(wx.Frame):
                       (tags_ready-bitmap_ready)*1000, (perf_counter()-started)*1000)
 
     def _schedule_catalog_match(self, index: int, frame: np.ndarray | None,
-                                reference_index: int | None) -> bool:
+                                reference_index: int | None,
+                                target_box: BoxData | None = None,
+                                skip_box: BoxData | None = None,
+                                best_effort: bool = False) -> bool:
         if index in self._pending_catalog:
-            return True
+            if target_box is None:
+                return True
+            self._pending_catalog.pop(index).cancel()
+            self._pending_catalog_targets.pop(index, None)
+        if target_box is not None:
+            self.__matched_frames.discard(index)
         if self._closing or index in self.__matched_frames:
             return False
-        if not getattr(self._pin_matcher, 'has_references', True):
+        if (not getattr(self._pin_matcher, 'has_references', True) and
+                not self._feedback_model.identity_sample_count):
             self.__matched_frames.add(index)
             return False
         candidates = [(box, deepcopy(box), deepcopy(box))
-                      for box in self.__frame_boxes.get(index, [])
-                      if needs_catalog_match(box)]
+                      for box in sorted(
+                          ([target_box] if target_box is not None else
+                           self.__frame_boxes.get(index, [])),
+                          key=lambda item: ({'confirmed': 0, 'inherited': 1}.get(
+                              item.review_state, 2), item.source != 'user'))
+                      if box is not skip_box and
+                      needs_catalog_match(box, best_effort=best_effort)]
         if not candidates:
             self.__matched_frames.add(index)
             return False
         matcher = self._pin_matcher
+        feedback = self._feedback_model.snapshot_for_processing()
         revision = self._annotation_revision
         started = perf_counter()
         def scan() -> list[BoxData] | None:
             image = frame.copy() if frame is not None else self.read_frame_for_processing(index)
             if image is None:
                 return None
-            result = identify_candidates(image, [copy for _, _, copy in candidates], matcher)
+            result = identify_candidates(
+                image, [copy for _, _, copy in candidates], matcher,
+                best_effort=best_effort, feedback_model=feedback,
+                prefer_reviewed_identity=best_effort)
             getLog().info('frame=%d catalog=%.1fms candidates=%d thread=worker',
                           index, (perf_counter() - started) * 1000, len(result))
             return result
         future = self._play_executor.submit(scan)
         self._pending_catalog[index] = future
+        if target_box is not None:
+            self._pending_catalog_targets[index] = (target_box, best_effort)
         future.add_done_callback(lambda completed: wx.CallAfter(
             self._complete_catalog_match, completed, index, revision, matcher,
-            candidates, reference_index))
+            candidates, reference_index, target_box is not None, best_effort))
         return True
 
     def _complete_catalog_match(self, future: Future[list[BoxData] | None], index: int,
                                 revision: int, matcher: PinMatcher,
                                 candidates: list[tuple[BoxData, BoxData, BoxData]],
-                                reference_index: int | None) -> None:
+                                reference_index: int | None,
+                                target_only: bool = False,
+                                best_effort: bool = False) -> None:
         if future is not self._pending_catalog.get(index):
             return
         del self._pending_catalog[index]
+        self._pending_catalog_targets.pop(index, None)
         if (self._closing or revision != self._annotation_revision or
                 matcher is not self._pin_matcher or index in self.__matched_frames):
             getLog().debug('frame=%d catalog result stale closing=%s revision=%d/%d matcher=%s matched=%s',
                            index, self._closing, revision, self._annotation_revision,
                            matcher is self._pin_matcher, index in self.__matched_frames)
+            if target_only and not self._closing and index == self._current_index:
+                original, before, _ = candidates[0]
+                if (any(existing is original for existing in self.__current_boxes) and
+                        original.coords == before.coords and
+                        original.track_id == before.track_id and
+                        original.review_state == before.review_state and
+                        original.identity_confirmed == before.identity_confirmed and
+                        original.pin_id == before.pin_id and
+                        original.tags == before.tags):
+                    self._schedule_catalog_match(
+                        index, None, reference_index, target_box=original,
+                        best_effort=best_effort)
             return
         try:
             analyzed = future.result()
         except Exception:
             getLog().exception('Background catalog matching failed for frame %d', index)
+            if target_only and best_effort and self._current_index == index:
+                self.SetStatusText(f'Frame {index}: identity retry failed; see console log', 1)
             return
         if analyzed is None:
             getLog().warning('Background catalog matching could not decode frame %d', index)
+            if target_only and best_effort and self._current_index == index:
+                self.SetStatusText(f'Frame {index}: could not decode selected area', 1)
             return
         current = self.__frame_boxes.get(index, [])
         if any((all(box is not original for box in current) or
@@ -1021,19 +1235,132 @@ class ScrubberFrame(wx.Frame):
                 original.tags = list(result.tags or [])
                 original.match_confidence = result.match_confidence
                 changed = True
-        self.__matched_frames.add(index)
+        if not target_only:
+            self.__matched_frames.add(index)
         if changed:
             self._invalidate_reconciliation()
+            self._sync_automatic_consolidation(invalidate=False)
         if self._current_index == index:
             if changed:
                 self.__image_panel.Refresh()
                 self.__tag_panel.boxes = self.__current_boxes
                 self._sync_presence_ui()
+            if target_only and best_effort:
+                self.SetStatusText(
+                    f'Frame {index}: suggested {(analyzed[0].tags or [analyzed[0].pin_id])[0]}'
+                    if changed else
+                    f'Frame {index}: no other pin identity match for selected area', 1)
             if not self._playing:
                 self._schedule_reconciliation(index, reference_index)
+        if target_only:
+            self._schedule_catalog_match(index, None, reference_index,
+                                         skip_box=candidates[0][0])
+
+    def attempt_detection(self, box: BoxData) -> None:
+        """Rescan one saved area for a provisional pin identity."""
+        self.pause_playback()
+        if (self._closing or box.review_state == 'rejected' or
+                all(existing is not box for existing in self.__current_boxes)):
+            return
+        index = self._current_index
+        before = deepcopy(box)
+        probe = deepcopy(box)
+        probe.pin_id = None
+        probe.tags = []
+        probe.match_confidence = None
+        probe.identity_confirmed = False
+        probe.identity_inferred = False
+        if probe.source == 'processed':
+            probe.source = 'automatic'
+        # The probe is only a matching input. An explicit attempt may compare
+        # any visible area with reviewed identity crops without confirming it.
+        if probe.review_state == 'unconfirmed':
+            probe.review_state = 'confirmed'
+        matcher = self._pin_matcher
+        feedback = self._feedback_model.snapshot_for_processing()
+        if (not getattr(matcher, 'has_references', True) and
+                not feedback.identity_sample_count):
+            self.SetStatusText(
+                f'Frame {index}: no catalog images or reviewed pin identities are loaded', 1)
+            return
+        revision = self._annotation_revision
+        generation = self._play_generation
+        self.SetStatusText(f'Frame {index}: attempting identity detection for selected area', 1)
+
+        def scan() -> BoxData | None:
+            image = self.read_frame_for_processing(index)
+            if image is None:
+                return None
+            return identify_candidates(image, [probe], matcher, best_effort=True,
+                                       feedback_model=feedback,
+                                       prefer_reviewed_identity=True)[0]
+
+        future = self._play_executor.submit(scan)
+        self._pending_attempt = future
+        future.add_done_callback(lambda completed: wx.CallAfter(
+            self._complete_attempt_detection, completed, index, revision,
+            generation, matcher, box, before))
+
+    def _complete_attempt_detection(self, future: Future[BoxData | None], index: int,
+                                    revision: int, generation: int,
+                                    matcher: PinMatcher, box: BoxData,
+                                    before: BoxData) -> None:
+        if future is not self._pending_attempt:
+            return
+        self._pending_attempt = None
+        if (self._closing or index != self._current_index or
+                revision != self._annotation_revision or
+                generation != self._play_generation or
+                matcher is not self._pin_matcher or
+                all(existing is not box for existing in self.__current_boxes) or
+                any(getattr(box, name) != getattr(before, name) for name in (
+                    'coords', 'tags', 'pin_id', 'match_confidence', 'review_state',
+                    'identity_confirmed', 'identity_inferred', 'identity_rejections',
+                    'track_id', 'source'))):
+            return
+        try:
+            result = future.result()
+        except Exception:
+            getLog().exception('Frame %d: selected-area identity detection failed', index)
+            self.SetStatusText(f'Frame {index}: identity detection failed; see console log', 1)
+            return
+        if result is None:
+            self.SetStatusText(f'Frame {index}: could not decode selected area', 1)
+            return
+        if result.pin_id is None:
+            self.SetStatusText(
+                f'Frame {index}: no new identity match; current suggestion unchanged'
+                if box.pin_id else
+                f'Frame {index}: no pin identity match for selected area', 1)
+            return
+        label = (result.tags or [result.pin_id])[0]
+        if (box.identity_confirmed or
+                (box.pin_id is None and has_specific_identity(box))):
+            self.SetStatusText(
+                f'Frame {index}: model suggests {label}; kept the reviewed or manually entered identity', 1)
+            return
+        if (box.pin_id, box.tags, box.match_confidence) == (
+                result.pin_id, result.tags, result.match_confidence):
+            self.SetStatusText(
+                f'Frame {index}: {label} is already the best match; '
+                'use Not this pin to exclude it', 1)
+            return
+        if (box.pin_id, box.tags, box.match_confidence) != (
+                result.pin_id, result.tags, result.match_confidence):
+            self._begin_history()
+            box.pin_id = result.pin_id
+            box.tags = list(result.tags or [])
+            box.match_confidence = result.match_confidence
+            self._finish_history()
+            self.__image_panel.Refresh()
+            self.__tag_panel.boxes = self.__current_boxes
+            self._sync_presence_ui()
+            self._schedule_reconciliation(index)
+        self.SetStatusText(f'Frame {index}: updated suggested pin to {label}', 1)
 
     def on_resize(self, event: wx.CommandEvent):
-        self.display_image(self._display_source_frame, reconcile=False)
+        if self._display_source_frame is not None and hasattr(self, 'slider'):
+            self.display_image(self._display_source_frame, reconcile=False)
         event.Skip()
 
     def on_prev(self, _event: wx.CommandEvent):
@@ -1061,13 +1388,16 @@ class ScrubberFrame(wx.Frame):
                         proposed = associate_frame_boxes(current_frame, next_frame, previous_boxes, detections)
                     else:
                         proposed = add_new_detections([], detections)
-                    self.__frame_boxes[next_index] = add_unique_boxes(
-                        self.__get_frame_boxes(next_index), proposed)
+                    existing = self.__get_frame_boxes(next_index)
+                    proposed = filter_new_candidates_by_pin_size(next_frame, existing,
+                                                                 proposed)
+                    self.__frame_boxes[next_index] = add_unique_boxes(existing, proposed)
                     self._invalidate_reconciliation()
                     self._reconcile_frame(next_index)
                     self._reconcile_done.add(next_index)
                     self.__frame_boxes[next_index] = identify_candidates(
-                        next_frame, self.__frame_boxes[next_index], self._pin_matcher)
+                        next_frame, self.__frame_boxes[next_index], self._pin_matcher,
+                        feedback_model=self._feedback_model)
                     inherit_confirmed_catalog_matches(previous_boxes,
                                                       self.__frame_boxes[next_index])
                     if (marked_pin_count(self.__frame_boxes[next_index]) <
@@ -1075,15 +1405,24 @@ class ScrubberFrame(wx.Frame):
                             or not any(box.review_state != 'rejected'
                                        for box in self.__frame_boxes[next_index])):
                         extra = detect_pin_boxes_relaxed(next_frame, self._feedback_model)
+                        proposed_extra = filter_new_candidates_by_pin_size(
+                            next_frame, self.__frame_boxes[next_index],
+                            add_new_detections([], extra))
                         self.__frame_boxes[next_index] = add_unique_boxes(
-                            self.__frame_boxes[next_index], add_new_detections([], extra))
+                            self.__frame_boxes[next_index], proposed_extra)
                         identify_candidates(next_frame, self.__frame_boxes[next_index],
-                                            self._pin_matcher)
+                                            self._pin_matcher,
+                                            feedback_model=self._feedback_model)
                         inherit_confirmed_catalog_matches(previous_boxes,
                                                           self.__frame_boxes[next_index])
                     propagate_confirmations(self.__frame_boxes)
+                    self._sync_automatic_consolidation()
                     self.__matched_frames.add(next_index)
                     self.__detected_frames.add(next_index)
+            elif any(box.review_state in ('confirmed', 'inherited') and
+                     needs_catalog_match(box)
+                     for box in self.__frame_boxes.get(next_index, [])):
+                self.__matched_frames.discard(next_index)
             self._current_index = next_index
             self.display_image(reference_index=reference_index)
 
@@ -1091,6 +1430,11 @@ class ScrubberFrame(wx.Frame):
         """Go to a specific frame index."""
         self.pause_playback()
         if 0 <= index < self.__num_frames:
+            if (index != self._current_index and any(
+                    box.review_state in ('confirmed', 'inherited') and
+                    needs_catalog_match(box)
+                    for box in self.__frame_boxes.get(index, []))):
+                self.__matched_frames.discard(index)
             reference_index = self._current_index if abs(index - self._current_index) == 1 else None
             reference_frame = self._display_source_frame if reference_index is not None else None
             self._current_index = index
@@ -1160,11 +1504,20 @@ class ScrubberFrame(wx.Frame):
         delete_keys = (wx.WXK_DELETE, getattr(wx, 'WXK_NUMPAD_DELETE', -1))
         wrong_identity_keys = (ord('X'), ord('x'))
         not_pin_keys = (ord('N'), ord('n'))
-        shortcut = keycode in (*delete_keys, *wrong_identity_keys, *not_pin_keys)
+        confirm_identity_keys = (ord('Y'), ord('y'))
+        shortcut = keycode in (*delete_keys, *wrong_identity_keys,
+                               *not_pin_keys, *confirm_identity_keys)
         if keycode in delete_keys:
             actionable = selected
         elif keycode in wrong_identity_keys:
             actionable = selected if len(selected) == 1 and has_specific_identity(selected[0]) else []
+        elif keycode in confirm_identity_keys:
+            actionable = selected if (
+                len(selected) == 1 and has_specific_identity(selected[0])
+                and selected[0].review_state != 'rejected'
+                and (selected[0].review_state != 'confirmed'
+                     or not selected[0].identity_confirmed
+                     or selected[0].identity_inferred)) else []
         else:
             actionable = [box for box in selected if box.source == 'automatic']
         if shortcut and actionable and not modified:
@@ -1174,6 +1527,8 @@ class ScrubberFrame(wx.Frame):
                 self.remove_boxes(selected)
             elif keycode in wrong_identity_keys:
                 self.mark_wrong_identity(actionable[0])
+            elif keycode in confirm_identity_keys:
+                self.confirm_pin_identity(actionable[0])
             else:
                 self.mark_not_pin_boxes(selected)
             return
@@ -1238,10 +1593,12 @@ class ScrubberFrame(wx.Frame):
         entry = make_entry(before, snapshot(self.__frame_boxes), rotation,
                            self._rotation_angle, presence,
                            dict(self._frame_presence))
+        consolidated = False
         if any({'tags', 'pin_id', 'identity_confirmed', 'review_state', 'track_id',
                  'identity_rejections'}
                & change.changed_fields.keys() for change in entry.boxes):
             propagate_confirmations(self.__frame_boxes)
+            consolidated = self._consolidate_frames()
             entry = make_entry(before, snapshot(self.__frame_boxes), rotation,
                                self._rotation_angle, presence,
                                dict(self._frame_presence))
@@ -1251,12 +1608,50 @@ class ScrubberFrame(wx.Frame):
             self._undo_history.setdefault(frame, []).append(entry)
             self._redo_history.pop(frame, None)
             self._sync_feedback_for_entry(entry)
+            if consolidated:
+                self._prune_linked_feedback()
             if any(change.box.identity_rejections or
                    'identity_rejections' in change.changed_fields
                    for change in entry.boxes):
                 self._sync_identity_feedback()
             self._invalidate_reconciliation()
         self._sync_presence_ui()
+
+    def _consolidate_frames(self) -> bool:
+        """Remove overlapping automatic duplicates and same-pin observations."""
+        changed = False
+        for boxes in self.__frame_boxes.values():
+            kept, removed = consolidate_overlapping_boxes(boxes)
+            if removed:
+                boxes[:] = kept
+                changed = True
+        return changed
+
+    def _sync_automatic_consolidation(self, *, invalidate: bool = True) -> None:
+        before = snapshot(self.__frame_boxes)
+        if not self._consolidate_frames():
+            return
+        entry = make_entry(before, snapshot(self.__frame_boxes),
+                           self._rotation_angle, self._rotation_angle)
+        self._sync_feedback_for_entry(entry)
+        self._prune_linked_feedback()
+        if any(change.box.identity_rejections for change in entry.boxes):
+            self._sync_identity_feedback()
+        if invalidate:
+            self._invalidate_reconciliation()
+
+    def _prune_linked_feedback(self) -> None:
+        stored = self._feedback_store.metadata_for_source(self._feedback_source)
+        active = {item.example_id for item in reviewed_observations(
+            self.__frame_boxes, self._feedback_source)
+            if item.example_id.startswith(LINKED_POSITIVE_PREFIX)}
+        removed = {example_id for example_id in stored
+                   if example_id.startswith(LINKED_POSITIVE_PREFIX)
+                   and example_id not in active}
+        if removed:
+            self._feedback_store.apply_source_delta(self._feedback_source, [], removed)
+            self._feedback_model.refresh(removed)
+            self._update_feedback_status()
 
     def undo_action(self) -> None:
         self.pause_playback()
@@ -1326,6 +1721,7 @@ class ScrubberFrame(wx.Frame):
         stored = {item.example_id: item for item in
                   self._feedback_store.identity_rejections_for_source(self._feedback_source)}
         active: set[str] = set()
+        changed: set[str] = set()
         frames: dict[int, np.ndarray | None] = {}
         for frame_index, boxes in self.__frame_boxes.items():
             for box in boxes:
@@ -1351,10 +1747,15 @@ class ScrubberFrame(wx.Frame):
                             review.example_id, 'wrong_identity', frame, review.coords,
                             self._feedback_source, source_index, box.track_id,
                             review.pin_id, review.tags))
+                        changed.add(review.example_id)
                     except ValueError as error:
                         getLog().warning('Skipping invalid wrong-identity crop: %s', error)
+        changed.update(set(stored) - active)
         self._feedback_store.delete_missing_identity_rejections(self._feedback_source,
                                                                 active)
+        if changed:
+            self._feedback_model.refresh(changed)
+            self._update_feedback_status()
         getLog().info('identity feedback: %d wrong-name examples indexed', len(active))
 
     def _seed_feedback_from_annotations(self) -> None:
@@ -1405,9 +1806,23 @@ class ScrubberFrame(wx.Frame):
                     active_ids.add(box.feedback_id)
                 except ValueError as error:
                     getLog().warning(f'Skipping invalid feedback crop: {error}')
+        for item in reviewed_observations(self.__frame_boxes, self._feedback_source):
+            if (item.example_id.startswith(LINKED_POSITIVE_PREFIX) and
+                    stored.get(item.example_id) == observation_metadata(item)):
+                active_ids.add(item.example_id)
         self._feedback_store.delete_missing_source(self._feedback_source, active_ids)
         self._feedback_model.reload()
+        self._discard_stale_local_classifier()
         self._update_feedback_status()
+
+    def _discard_stale_local_classifier(self) -> None:
+        trained = self._feedback_model.trained_model
+        if (isinstance(trained, TrainedDetectionModel) and
+                (trained.catalog_state != self._pin_catalog.stock_training_state() or
+                 trained.review_digest !=
+                 examples_digest(self._feedback_store.examples()))):
+            self._feedback_model.trained_model = None
+            getLog().warning('Saved classifier became stale after review or catalog changes')
 
     def _update_feedback_status(self) -> None:
         stored = self._feedback_store.counts()
@@ -1416,7 +1831,9 @@ class ScrubberFrame(wx.Frame):
             f"Feedback v{self._feedback_model.version}: "
             f"pin {usable['positive']}/{stored['positive']}, "
             f"non-pin {usable['negative']}/{stored['negative']} usable, "
-            f"wrong ID {self._feedback_store.identity_rejection_count(self._feedback_source)} saved"
+            f"identity {self._feedback_model.identity_sample_count} usable, "
+            f"wrong ID {self._feedback_store.identity_rejection_count(self._feedback_source)} saved, "
+            f"OpenCV classifier {'active' if self._feedback_model.trained_model else 'not active'}"
         )
         status = self.GetStatusBar()
         if status is not None:
@@ -1427,67 +1844,236 @@ class ScrubberFrame(wx.Frame):
         stored = self._feedback_store.counts()
         usable = self._feedback_model.sample_counts
         message = (
-            f"Current feedback model: revision {self._feedback_model.version}\n"
+            f"In-memory example matcher: revision {self._feedback_model.version}\n"
             f"Confirmed pins: {stored['positive']} saved, {usable['positive']} usable\n"
             f"Rejected automatic candidates: {stored['negative']} saved, "
             f"{usable['negative']} usable\n"
+            f"Verified identity examples: {self._feedback_model.identity_sample_count} usable\n"
             f"Wrong pin identities: {self._feedback_store.identity_rejection_count(self._feedback_source)} "
-            "saved for this source\n\n"
+            "saved for this source in the separate identity_rejections table\n\n"
             "Confirm is a pin adds a positive crop. Not a pin on an automatic "
             "area adds a negative crop. Remove area does not label a location "
             "as non-pin. Undo and redo update "
             "the saved examples and refresh the feedback model immediately. "
-            "Rejecting a suggested identity saves one wrong-ID crop per pin, "
+            "Rejecting a suggested identity immediately saves one wrong-ID crop per pin, "
             "including every candidate in a None of these menu page. "
             "Add to training data indexes new or changed session reviews "
-            "and removes examples no longer present.\n\n"
-            "The current model is a local nearest-neighbour proposal ranker, "
-            "not a trained neural detector. It can rank candidates and suppress "
-            "close matches to rejected crops, but cannot find a pin that the "
-            "proposal stage misses. Wrong-ID reviews exclude those identities "
-            "from the current tracked area's suggestions; an identity model "
-            "does not yet learn from them. Samples without enough visual detail "
-            "remain saved for future training but are not usable by this ranker."
+            "and removes examples no longer present. Run training now also fits "
+            "and saves an OpenCV pin/non-pin classifier from usable reviewed crops "
+            "and Pinpanion stock images.\n\n"
+            "The in-memory nearest-neighbour baseline is not a trained neural detector. "
+            "It ranks pin candidates and compares confirmed "
+            "pin IDs with reviewed image crops when catalog matching is weak. "
+            "Wrong-ID crops block a visually similar wrong suggestion. "
+            "Identity suggestions remain unconfirmed and their scores are "
+            "similarities, not calibrated probabilities. The OpenCV classifier "
+            "downranks predicted non-pin proposals when active; a prediction alone "
+            "does not discard a rectangle. Neither method is a "
+            "neural object detector or can find a pin that the proposal stage "
+            "misses. Low-detail crops remain saved but are not usable by these models."
         )
         wx.MessageBox(message, 'Detection feedback', wx.OK | wx.ICON_INFORMATION)
 
-    def add_to_training_data(self) -> None:
+    def show_settings(self, _event: wx.CommandEvent | None = None) -> None:
+        trained = self._feedback_model.trained_model
+        dialog = SettingsDialog(
+            self,
+            feedback_path=self._feedback_store.path,
+            catalog_path=self._pin_catalog.path,
+            annotations_path=self.box_data_filename,
+            feedback_counts=self._feedback_store.counts(),
+            wrong_identity_count=self._feedback_store.identity_rejection_count(),
+            model_revision=self._feedback_model.version,
+            model_path=self._trained_model_path,
+            model_active=trained is not None,
+            model_current=(isinstance(trained, TrainedDetectionModel) and
+                           trained.review_digest ==
+                           examples_digest(self._feedback_store.examples()) and
+                           trained.catalog_state ==
+                           self._pin_catalog.stock_training_state()),
+            catalog_training_summary=(
+                f'{trained.catalog_usable}/{trained.catalog_total} Pinpanion stock '
+                f'images used; {trained.catalog_unverified} with unverified rights. '
+                'Original Pinpanion names are saved as tags with source and pin IDs '
+                'in model metadata.'
+                if isinstance(trained, TrainedDetectionModel) else
+                'No locally trained catalog-inclusive classifier is active.'),
+            cloud_origin=self._cloud_config.origin,
+            cloud_status=self._cloud_status,
+            cloud_cache_path=(self._trained_model_path.with_suffix('.cloud.json')
+                              if self._trained_model_path is not None else None),
+        )
+        try:
+            dialog.ShowModal()
+        finally:
+            dialog.Destroy()
+
+    def save_annotations(self, _event: wx.CommandEvent | None = None) -> bool:
+        """Save the current annotations without ending the editing session."""
+        filename = self.box_data_filename
+        if filename is None:
+            self.SetStatusText('No annotation file selected to save', 1)
+            return False
+        try:
+            self.__tag_panel.commit_pending_labels()
+            save_boxes_to_file(filename, self.__frame_boxes, self._frame_presence)
+        except Exception:
+            getLog().exception('Could not save annotations to %s', filename)
+            self.SetStatusText('Save failed; see console log', 1)
+            return False
+        count = self.count_boxes()
+        getLog().info('%d boxes saved to %s', count, filename)
+        self.SetStatusText(f'Saved {count} areas to {os.path.basename(filename)}', 1)
+        return True
+
+    def _on_cloud_timer(self, _event: wx.TimerEvent) -> None:
+        if self._training_future is None and self._model_training_future is None:
+            self._start_cloud_sync()
+
+    def _start_cloud_sync(self, *, then_train: bool = False) -> None:
+        if (self._closing and not then_train) or self._trained_model_path is None:
+            if then_train:
+                self.add_to_training_data(then_train=True)
+            return
+        if self._cloud_sync_future is not None:
+            if then_train:
+                self._cloud_train_after_sync = True
+            return
+        self._cloud_train_after_sync = then_train
+        cursor = cloud_cursor(self._feedback_store)
+        config = self._cloud_config
+
+        def download() -> tuple[tuple[int, PortableDetectionModel] | None,
+                                list[dict], int, bool]:
+            model = fetch_model(config)
+            events: list[dict] = []
+            after = cursor
+            if config.token:
+                for _ in range(10):  # Bound memory to 50 events per UI commit.
+                    page, next_cursor = fetch_review_page(config, after)
+                    events.extend(page)
+                    if next_cursor <= after or len(page) < 5:
+                        after = next_cursor
+                        break
+                    after = next_cursor
+                else:
+                    return model, events, after, True
+            return model, events, after, False
+
+        future = self._sync_executor.submit(download)
+        self._cloud_sync_future = future
+        future.add_done_callback(lambda done: wx.CallAfter(self._finish_cloud_sync, done))
+
+    def _finish_cloud_sync(self, future: Future) -> None:
+        if future is not self._cloud_sync_future:
+            return
+        self._cloud_sync_future = None
+        then_train = self._cloud_train_after_sync
+        self._cloud_train_after_sync = False
+        try:
+            model, events, cursor, has_more = future.result()
+            changed = apply_reviews(self._feedback_store, events, cursor) if self._cloud_config.token else 0
+            if changed:
+                self._feedback_model.reload()
+                self._discard_stale_local_classifier()
+                self._update_feedback_status()
+            if model is not None and model[0] > self._cloud_model_version:
+                version, classifier = model
+                cache_path = self._trained_model_path.with_suffix('.cloud.json')
+                temporary = cache_path.with_suffix('.cloud.tmp')
+                try:
+                    temporary.write_text(json.dumps({
+                        'cloud_version': version, 'model': classifier.web_payload()
+                    }, separators=(',', ':')), encoding='utf-8')
+                    os.replace(temporary, cache_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                self._cloud_model_version = version
+                if not isinstance(self._feedback_model.trained_model,
+                                  TrainedDetectionModel):
+                    self._feedback_model.trained_model = classifier
+                    self._feedback_model.version += 1
+                    self._update_feedback_status()
+            self._cloud_ready_for_publish = bool(self._cloud_config.token)
+            self._cloud_status = (f'Model v{self._cloud_model_version}; {changed} web training crops '
+                                  f'changed; through revision {cursor}')
+            self.SetStatusText(f'Cloud sync: {self._cloud_status}', 1)
+            if has_more:
+                self._start_cloud_sync(then_train=then_train)
+                return
+        except Exception as exc:
+            self._cloud_ready_for_publish = False
+            self._cloud_status = 'Unavailable; local annotations and model remain usable'
+            if isinstance(exc, CloudSyncError):
+                getLog().warning('Cloudflare model/review sync unavailable: %s', exc)
+            else:
+                getLog().exception('Cloudflare model/review sync failed')
+            self.SetStatusText(f'Cloud sync: {self._cloud_status}', 1)
+        if then_train:
+            self.add_to_training_data(then_train=True)
+
+    def _finish_cloud_publish(self, future: Future) -> None:
+        if self._closing or future is not self._cloud_publish_future:
+            return
+        self._cloud_publish_future = None
+        try:
+            version = future.result()
+            self._cloud_model_version = version
+            self._cloud_status = f'Model v{version} published for the web app'
+            self.SetStatusText(self._cloud_status, 1)
+        except Exception:
+            self._cloud_status = 'Model trained locally; cloud publish failed'
+            getLog().exception('Could not publish trained model to Cloudflare')
+            self.SetStatusText(self._cloud_status, 1)
+
+    def run_training_now(self) -> None:
+        """Index session reviews, then fit and persist the OpenCV classifier."""
+        if self._trained_model_path is None:
+            self._set_training_progress(
+                0, 'Training needs a persistent feedback database.', False)
+            return
+        if self._cloud_config.token:
+            self._start_cloud_sync(then_train=True)
+        else:
+            self.add_to_training_data(then_train=True)
+
+    def add_to_training_data(self, then_train: bool = False) -> None:
         """Index only new and changed direct reviews from this session."""
-        if self._closing or self._training_future is not None:
+        if (self._training_future is not None or
+                self._model_training_future is not None):
             return
         self.pause_playback()
         if self.box_data_filename:
             save_boxes_to_file(self.box_data_filename, self.__frame_boxes,
                                self._frame_presence)
         observations = reviewed_observations(self.__frame_boxes, self._feedback_source)
-        labels_by_id = {item.example_id: item.label for item in observations}
+        observations_by_id = {item.example_id: item for item in observations}
         try:
             delta = plan_training_delta(
                 observations,
                 self._feedback_store.training_metadata_for_source(self._feedback_source))
         except ValueError:
             getLog().exception('Could not plan incremental training update')
-            self.__tag_panel.set_training_progress(
+            self._set_training_progress(
                 0, 'Training data has duplicate example IDs; see console log.', False)
             return
         if not delta.pending:
             if delta.removed_ids:
-                binary_ids = set(self._feedback_store.metadata_for_source(
-                    self._feedback_source)) & delta.removed_ids
                 self._feedback_store.apply_source_delta(
                     self._feedback_source, [], delta.removed_ids)
-                if binary_ids:
-                    self._feedback_model.refresh(binary_ids)
+                self._feedback_model.refresh(delta.removed_ids)
                 self._update_feedback_status()
-                message = (f'100% · {self._training_index_summary(labels_by_id, delta.active_ids)} · '
-                           f'{len(delta.removed_ids)} removed')
+                message = (f'100% · {len(delta.removed_ids)} removed\n'
+                           f'{self._training_index_summary(observations_by_id, delta.active_ids)}')
             else:
-                message = (f'100% · Up to date · '
-                           f'{self._training_index_summary(labels_by_id, delta.active_ids)}')
-            self.__tag_panel.set_training_progress(100, message, False)
+                message = ('100% · Up to date · 0 added now; reviews saved when marked\n'
+                           f'{self._training_index_summary(observations_by_id, delta.active_ids)}')
+            self._set_training_progress(100, message, False)
+            if then_train:
+                self._start_model_training()
             return
         revision = self._annotation_revision
-        self.__tag_panel.set_training_progress(
+        self._set_training_progress(
             0, f'Preparing {len(delta.pending)} new or changed examples...', True)
 
         def progress(done: int, total: int, eta: float | None) -> None:
@@ -1501,60 +2087,191 @@ class ScrubberFrame(wx.Frame):
             self.read_frame_for_processing, progress)
         self._training_future = future
         future.add_done_callback(lambda finished: wx.CallAfter(
-            self._finish_training, finished, revision, delta, labels_by_id))
+            self._finish_training, finished, revision, delta, observations_by_id,
+            then_train))
 
     @staticmethod
-    def _training_index_summary(labels_by_id: dict[str, str], ids: set[str]) -> str:
-        wrong_ids = sum(labels_by_id[item] == 'wrong_identity' for item in ids)
-        return f'{len(ids)} examples indexed ({wrong_ids} wrong IDs)'
+    def _training_index_summary(observations_by_id: dict[str, TrainingObservation],
+                                ids: set[str]) -> str:
+        indexed = [observations_by_id[item] for item in ids]
+        pin_crops = [item for item in indexed if item.label == 'positive']
+        linked_views = sum(item.example_id.startswith(LINKED_POSITIVE_PREFIX)
+                           for item in pin_crops)
+        without_verified_id = sum(item.pin_id is None for item in pin_crops)
+        non_pin_crops = sum(item.label == 'negative' for item in indexed)
+        wrong_ids = sum(item.label == 'wrong_identity' for item in indexed)
+        return (f'{len(ids)} examples indexed: {len(pin_crops)} pin crops '
+                f'(linked frames: {linked_views}, '
+                f'{without_verified_id} without verified ID), '
+                f'{non_pin_crops} non-pin crops, '
+                f'{wrong_ids} wrong IDs')
 
     def _show_training_progress(self, percent: int, message: str) -> None:
-        if not self._closing and self._training_future is not None:
-            self.__tag_panel.set_training_progress(percent, message, True)
+        if (self._closing and self._shutdown_dialog is not None and
+                self._shutdown_stage == 1):
+            self._shutdown_dialog.set_percent(round(45 * percent / 100))
+        elif self._training_future is not None:
+            self._set_training_progress(percent, message, True)
 
     def _finish_training(self, future: Future, revision: int,
-                         delta: TrainingDelta, labels_by_id: dict[str, str]) -> None:
-        if self._closing or future is not self._training_future:
+                         delta: TrainingDelta,
+                         observations_by_id: dict[str, TrainingObservation],
+                         then_train: bool = False) -> None:
+        if future is not self._training_future:
             return
         self._training_future = None
         try:
             examples, skipped = future.result()
             if revision != self._annotation_revision:
-                self.__tag_panel.set_training_progress(
+                self._set_training_progress(
                     0, 'Annotations changed; run training again.', False)
                 return
-            self.__tag_panel.set_training_progress(95, '95% · updating model · estimating...', True)
+            self._set_training_progress(
+                95, '95% · refreshing example matcher · estimating...', True)
             indexed_ids = {example.example_id for example in examples}
             failed_ids = {item.example_id for item in delta.pending} - indexed_ids
             removed_ids = delta.removed_ids | (failed_ids & delta.stored_ids)
             changed_ids = indexed_ids | removed_ids
             if changed_ids:
-                binary_ids = ({item.example_id for item in examples
-                               if item.label in ('positive', 'negative')} |
-                              (removed_ids & set(self._feedback_store.metadata_for_source(
-                                  self._feedback_source))))
                 self._feedback_store.apply_source_delta(
                     self._feedback_source, examples, removed_ids)
-                if binary_ids:
-                    self._feedback_model.refresh(binary_ids)
+                self._feedback_model.refresh(changed_ids)
                 self._update_feedback_status()
             added = len(indexed_ids - delta.stored_ids)
             updated = len(indexed_ids & delta.stored_ids)
-            self.__tag_panel.set_training_progress(
-                100, f'100% · {self._training_index_summary(labels_by_id, delta.active_ids - failed_ids)} · '
-                f'{added} added, {updated} updated, {len(removed_ids)} removed'
-                + (f' · {skipped} skipped' if skipped else '') + ' · 0s remaining', False)
+            self._set_training_progress(
+                100, f'100% · {added} added now, {updated} updated, {len(removed_ids)} removed'
+                + (f' · {skipped} skipped' if skipped else '')
+                + f'\n{self._training_index_summary(observations_by_id, delta.active_ids - failed_ids)}',
+                False)
+            if then_train:
+                self._start_model_training()
         except Exception:
             getLog().exception('Could not add session annotations to training data')
-            self.__tag_panel.set_training_progress(0, 'Training failed; see console log.', False)
+            self._set_training_progress(
+                0, 'Adding training data failed; see console log.', False)
+
+    def _start_model_training(self) -> None:
+        """Pass an immutable crop list to OpenCV on the worker, never SQLite."""
+        if self._trained_model_path is None:
+            return
+        examples = self._feedback_store.examples()
+        counts = self._feedback_store.counts()
+        stock_count = self._pin_catalog.stock_training_state()[0]
+        if not counts['negative'] or (not counts['positive'] and not stock_count):
+            self._set_training_progress(
+                0, 'Need at least one usable pin image and one reviewed non-pin crop.', False)
+            return
+        digest = examples_digest(examples)
+        previous_model = None
+        if self._trained_model_path.is_file():
+            try:
+                previous_model = TrainedDetectionModel.load(self._trained_model_path)
+            except (OSError, ValueError, KeyError, cv2.error):
+                getLog().warning('Saved classifier cannot be continued; fitting from stored crops',
+                                 exc_info=True)
+        self._training_base_cloud_version = self._cloud_model_version
+        self._set_training_progress(
+            0, f"Fitting OpenCV classifier from {counts['positive']} reviewed pins, "
+               f"{stock_count} Pinpanion stock images and "
+               f"{counts['negative']} non-pins...", True)
+        def progress(done: int, total: int) -> None:
+            wx.CallAfter(self._show_model_training_progress, done, total)
+        future = self._play_executor.submit(
+            TrainedDetectionModel.train, examples, self._pin_catalog.path, progress,
+            previous_model)
+        self._model_training_future = future
+        future.add_done_callback(lambda finished: wx.CallAfter(
+            self._finish_model_training, finished, digest,
+            previous_model.training_digest if previous_model else None,
+            previous_model.incremental_updates if previous_model else 0))
+
+    def _show_model_training_progress(self, done: int, total: int) -> None:
+        if (self._closing and self._shutdown_dialog is not None and
+                self._shutdown_stage == 1):
+            self._shutdown_dialog.set_percent(
+                50 + (round(40 * done / total) if total else 40))
+        elif self._model_training_future is not None:
+            percent = round(80 * done / total) if total else 80
+            self._set_training_progress(
+                percent, f'{percent}% · {done}/{total} Pinpanion stock images '
+                         'prepared for classifier...', True)
+
+    def _finish_model_training(self, future: Future, digest: str,
+                               previous_digest: str | None,
+                               previous_updates: int) -> None:
+        if future is not self._model_training_future:
+            return
+        self._model_training_future = None
+        try:
+            model = future.result()
+            if digest != examples_digest(self._feedback_store.examples()):
+                self._set_training_progress(
+                    0, 'Reviews changed during training; run training again.', False)
+                return
+            if model.catalog_state != self._pin_catalog.stock_training_state():
+                self._set_training_progress(
+                    0, 'Pinpanion catalog changed during training; run again.', False)
+                return
+            model.save(self._trained_model_path)
+            # A detection queued while training used an earlier feedback snapshot.
+            # Invalidate it before publishing the new model to future jobs.
+            self.pause_playback()
+            self._feedback_model.trained_model = model
+            self._feedback_model.version += 1
+            self._update_feedback_status()
+            mode = ('already current' if model.training_digest == previous_digest else
+                    'incrementally updated' if model.incremental_updates > previous_updates
+                    else 'rebuilt from current crops')
+            self._set_training_progress(
+                100, f"Pin/non-pin classifier {mode}: "
+                     f"{model.sample_counts['positive'] - model.catalog_usable} "
+                     f"reviewed pin crops + {model.catalog_usable}/{model.catalog_total} "
+                     f"Pinpanion stock images, "
+                     f"{model.sample_counts['negative']} non-pins.", False)
+            self.SetStatusText('Trained pin/non-pin classifier is active for future detections', 1)
+            if model.catalog_unverified:
+                self.SetStatusText(
+                    'Classifier trained locally; Pinpanion image rights are unverified, '
+                    'so web publication is held', 1)
+            elif (not self._closing and self._cloud_ready_for_publish and
+                  self._cloud_config.token):
+                payload = model.web_payload()
+                payload['web_review_revision'] = cloud_cursor(self._feedback_store)
+                future = self._sync_executor.submit(
+                    publish_model, self._cloud_config, payload,
+                    self._training_base_cloud_version)
+                self._cloud_publish_future = future
+                future.add_done_callback(lambda done: wx.CallAfter(
+                    self._finish_cloud_publish, done))
+                self.SetStatusText('Classifier trained; publishing web model...', 1)
+            elif not self._cloud_config.token:
+                self.SetStatusText(
+                    'Classifier trained locally; set PINIDENT_SYNC_TOKEN to publish online', 1)
+        except ValueError as exc:
+            self._set_training_progress(0, str(exc), False)
+        except Exception:
+            getLog().exception('Could not train or save the OpenCV classifier')
+            self._set_training_progress(
+                0, 'Classifier training failed; see console log.', False)
 
     def set_pin_matcher(self, matcher: PinMatcher) -> None:
         """Install a rebuilt reference index on the GUI thread."""
+        pending_targets = list(self._pending_catalog_targets.items())
         self._pin_matcher = matcher
+        self._discard_stale_local_classifier()
         self.__tag_panel.set_catalog_options(self._pin_catalog.list_pins())
         self._cancel_catalog_matches()
         self.__matched_frames.clear()
         self._invalidate_reconciliation()
+        for index, (box, best_effort) in pending_targets:
+            if (index == self._current_index and
+                    any(existing is box for existing in self.__current_boxes)):
+                if not self._schedule_catalog_match(
+                        index, None, None, target_box=box,
+                        best_effort=best_effort):
+                    self.SetStatusText(
+                        f'Frame {index}: no catalog images or reviewed pin identities are loaded', 1)
         if not self.IsBeingDeleted():
             self.display_image()
 
@@ -1591,16 +2308,132 @@ class ScrubberFrame(wx.Frame):
         return count
 
     def on_close(self, event: wx.CloseEvent) -> None:
-        # Save boxes before exiting
-        self.pause_playback()
+        if self._shutdown_dialog is not None:
+            if event.CanVeto():
+                event.Veto()
+            return
+        if not event.CanVeto():
+            event.Skip()
+            return
+        event.Veto()
         self._closing = True
-        self._play_executor.submit(self.close_processing_reader)
-        self._play_executor.shutdown(wait=False)
-        count = self.count_boxes()
-        save_boxes_to_file(self.__box_data_filename, self.__frame_boxes,
-                           self._frame_presence)
-        getLog().info(f'{count} boxes saved to {self.__box_data_filename}')
-        event.Skip()  # Continue closing
+        self._cloud_timer.Stop()
+        self._shutdown_dialog = ShutdownProgressDialog(self)
+        self._shutdown_timer = wx.Timer(self._shutdown_dialog)
+        self._shutdown_dialog.Bind(wx.EVT_TIMER, self._shutdown_tick,
+                                   self._shutdown_timer)
+        self._shutdown_dialog.Show()
+        self.Enable(False)
+        self._shutdown_timer.Start(150)
+        wx.CallAfter(self._shutdown_tick)
+
+    def _shutdown_stop_prefetch(self) -> bool:
+        """Overridden by VideoScrubber, which owns the prefetch thread."""
+        return True
+
+    def _shutdown_resume_prefetch(self) -> None:
+        """Restore optional prefetch after a failed close save."""
+
+    def _shutdown_tick(self, _event: wx.TimerEvent | None = None) -> None:
+        dialog = self._shutdown_dialog
+        if dialog is None:
+            return
+        if self._shutdown_stage == 0:
+            if not self._shutdown_prepared:
+                self.pause_playback()
+                self.__tag_panel.commit_pending_labels()
+                self._shutdown_prepared = True
+            if not self._shutdown_stop_prefetch():
+                return
+            dialog.set_percent(100)
+            dialog.advance()
+            self._shutdown_stage = 1
+        if self._shutdown_stage == 1:
+            # Let a requested training/indexing run finish and commit on the wx
+            # thread before placing the final queue barriers.
+            if (self._cloud_sync_future is not None or
+                    self._training_future is not None or
+                    self._model_training_future is not None):
+                dialog.set_percent(10)
+                return
+            if self._shutdown_play_barrier is None:
+                self._shutdown_play_barrier = self._play_executor.submit(lambda: None)
+                self._shutdown_cloud_barrier = self._sync_executor.submit(lambda: None)
+            complete = sum(future.done() for future in
+                           (self._shutdown_play_barrier, self._shutdown_cloud_barrier))
+            dialog.set_percent(10 + 45 * complete)
+            if complete != 2:
+                return
+            dialog.set_percent(100)
+            dialog.advance()
+            self._shutdown_stage = 2
+        if self._shutdown_stage == 2:
+            if self._shutdown_save_future is None:
+                if self.box_data_filename is None:
+                    dialog.set_percent(100)
+                    dialog.advance()
+                    self._shutdown_stage = 3
+                else:
+                    self._shutdown_save_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix='pin-save')
+                    def update(percent: int) -> None:
+                        wx.CallAfter(self._shutdown_save_progress, percent)
+                    self._shutdown_save_future = self._shutdown_save_executor.submit(
+                        save_boxes_to_file, self.box_data_filename,
+                        self.__frame_boxes, self._frame_presence, update)
+                    return
+            else:
+                if not self._shutdown_save_future.done():
+                    return
+                try:
+                    self._shutdown_save_future.result()
+                except Exception:
+                    getLog().exception('Could not save annotations during close')
+                    if self._shutdown_save_executor is not None:
+                        self._shutdown_save_executor.shutdown(wait=False)
+                        self._shutdown_save_executor = None
+                    self._shutdown_timer.Stop()
+                    self.Enable(True)
+                    dialog.Destroy()
+                    self._shutdown_dialog = None
+                    self._closing = False
+                    self._shutdown_stage = 0
+                    self._shutdown_prepared = False
+                    self._shutdown_save_future = None
+                    self._cloud_timer.Start(5 * 60 * 1000)
+                    self._shutdown_resume_prefetch()
+                    wx.MessageBox('Annotations could not be saved. Pinident remains open; '
+                                  'use File → Save and try closing again.',
+                                  'Close failed', wx.OK | wx.ICON_ERROR)
+                    return
+                getLog().info('%d boxes saved to %s', self.count_boxes(),
+                              self.box_data_filename)
+                dialog.set_percent(100)
+                dialog.advance()
+                self._shutdown_stage = 3
+        if self._shutdown_stage == 3:
+            if self._shutdown_reader_future is None:
+                self._shutdown_reader_future = self._play_executor.submit(
+                    self.close_processing_reader)
+                return
+            if not self._shutdown_reader_future.done():
+                return
+            self._shutdown_reader_future.result()
+            self._play_executor.shutdown(wait=False)
+            self._sync_executor.shutdown(wait=False)
+            if self._shutdown_save_executor is not None:
+                self._shutdown_save_executor.shutdown(wait=False)
+            self._feedback_store.close()
+            dialog.set_percent(100)
+            dialog.advance()
+            self._shutdown_timer.Stop()
+            dialog.Destroy()
+            self._shutdown_dialog = None
+            self.Destroy()
+
+    def _shutdown_save_progress(self, percent: int) -> None:
+        if self._shutdown_dialog is not None and self._shutdown_stage == 2:
+            self._shutdown_dialog.set_percent(percent)
 
     def on_box_selected(self, event: BoxSelectedEvent) -> None:
         selected_box = event.box
@@ -1744,6 +2577,7 @@ class ScrubberFrame(wx.Frame):
     def confirm_boxes(self, selected: list[BoxData]) -> None:
         """Confirm multiple areas as pins in one undoable review."""
         self.pause_playback()
+        self.__tag_panel.commit_pending_labels()
         targets: list[BoxData] = []
         for box in selected:
             if (any(existing is box for existing in self.__current_boxes) and
@@ -1773,16 +2607,48 @@ class ScrubberFrame(wx.Frame):
 
     def confirm_pin_identity(self, box: BoxData) -> None:
         """Confirm the current specific ID or user-entered pin name."""
+        self._confirm_identities([box])
+
+    def confirm_all_suggestions(self, _event: wx.CommandEvent | None = None) -> None:
+        """Directly verify catalog suggestions visible on the current frame."""
+        self.__tag_panel.commit_pending_labels()
+        suggestions = [
+            box for box in self.__current_boxes
+            if box.review_state != 'rejected'
+            and isinstance(box.pin_id, str)
+            and bool(box.pin_id.strip())
+            and not is_placeholder_tag(box.pin_id)
+            and (box.review_state != 'confirmed' or not box.identity_confirmed
+                 or box.identity_inferred)
+        ]
+        count = self._confirm_identities(suggestions)
+        noun = 'identity' if count == 1 else 'identities'
+        self.SetStatusText(
+            f'Confirmed {count} suggested pin {noun} on frame {self._current_index}' if count else
+            'No unconfirmed pin suggestions on this frame', 1)
+
+    def _confirm_identities(self, selected: list[BoxData]) -> int:
+        """Confirm identities in one owner transaction and one undo entry."""
         self.pause_playback()
-        if (all(existing is not box for existing in self.__current_boxes)
-                or not has_specific_identity(box)):
-            return
+        self.__tag_panel.commit_pending_labels()
+        targets: list[BoxData] = []
+        for box in selected:
+            if (any(existing is box for existing in self.__current_boxes)
+                    and box.review_state != 'rejected'
+                    and has_specific_identity(box)
+                    and (box.review_state != 'confirmed' or not box.identity_confirmed
+                         or box.identity_inferred)
+                    and all(existing is not box for existing in targets)):
+                targets.append(box)
+        if not targets:
+            return 0
         self._begin_history()
-        box.review_state = 'confirmed'
-        box.identity_confirmed = True
-        box.identity_inferred = False
-        box.feedback_id = box.feedback_id or uuid4().hex
-        box.feedback_label = 'positive'
+        for box in targets:
+            box.review_state = 'confirmed'
+            box.identity_confirmed = True
+            box.identity_inferred = False
+            box.feedback_id = box.feedback_id or uuid4().hex
+            box.feedback_label = 'positive'
         propagate_confirmations(self.__frame_boxes)
         self.__tag_panel.boxes = self.__current_boxes
         self.__image_panel.Refresh()
@@ -1790,6 +2656,7 @@ class ScrubberFrame(wx.Frame):
         if any(self.__frame_boxes.get(neighbour)
                for neighbour in (self._current_index - 1, self._current_index + 1)):
             self._schedule_reconciliation(self._current_index)
+        return len(targets)
 
     def mark_wrong_identity(self, box: BoxData) -> None:
         """Reject only the proposed identity, keeping the pin-presence decision."""
@@ -1798,7 +2665,7 @@ class ScrubberFrame(wx.Frame):
         self._reject_pin_identities(box, [(box.pin_id, tuple(box.tags or []))],
                                     retry_catalog=True)
 
-    def rank_pin_replacements(self, box: BoxData, limit: int = 20) -> list[PinMatch]:
+    def rank_pin_replacements(self, box: BoxData, limit: int = 10) -> list[PinMatch]:
         """Rank catalog choices for the visible rectangle without changing it."""
         if (all(existing is not box for existing in self.__current_boxes) or
                 box.review_state == 'rejected'):
@@ -1814,12 +2681,22 @@ class ScrubberFrame(wx.Frame):
         if (x < 0 or y < 0 or width <= 0 or height <= 0 or
                 x + width > frame.shape[1] or y + height > frame.shape[0]):
             return []
-        return rank(
+        choices = rank(
             frame[y:y + height, x:x + width], limit=limit,
             excluded_pin_ids=frozenset(item.pin_id for item in box.identity_rejections
                                        if item.pin_id),
             excluded_names=frozenset(tag.casefold() for item in box.identity_rejections
                                      if item.pin_id is None for tag in item.tags))
+        # A geometric or reviewed-crop suggestion can fall outside the colour
+        # top ten. Include it so "none of these" actually excludes the visible
+        # suggestion before the selected rectangle is scanned again.
+        if (choices and box.pin_id and box.tags and
+                not any(match.pin_id == box.pin_id for match in choices) and
+                not rejects_identity(box, box.pin_id, box.tags)):
+            current = PinMatch(box.pin_id, box.tags[0], 0,
+                               box.match_confidence)
+            return [current, *choices[:max(0, limit - 1)]]
+        return choices
 
     def replace_with_pin(self, box: BoxData, match: PinMatch) -> None:
         """Treat the user's menu choice as a direct identity confirmation."""
@@ -1856,10 +2733,10 @@ class ScrubberFrame(wx.Frame):
 
     def reject_pin_replacements(self, box: BoxData,
                                 matches: list[PinMatch]) -> bool:
-        """Reject one displayed page and let the menu show the next page."""
+        """Reject one displayed page, then suggest the next identity for this area."""
         return self._reject_pin_identities(
             box, [(match.pin_id, (match.name,)) for match in matches],
-            retry_catalog=False)
+            retry_catalog=True)
 
     def _reject_pin_identities(self, box: BoxData,
                                candidates: list[tuple[str | None, tuple[str, ...]]],
@@ -1886,16 +2763,34 @@ class ScrubberFrame(wx.Frame):
                 old_names.update(tag.casefold() for tag in clean_tags)
         if not reviews:
             return False
+        stored_before = self._feedback_store.identity_rejection_count(self._feedback_source)
         self._begin_history()
         self._apply_identity_rejections(box, reviews)
         self.__matched_frames.discard(self._current_index)
         self.__image_panel.Refresh()
         self.__tag_panel.boxes = self.__current_boxes
         self._finish_history()
+        stored_total = self._feedback_store.identity_rejection_count(self._feedback_source)
+        saved = stored_total - stored_before
+        noun = 'example' if saved == 1 else 'examples'
+        message = f'{saved} wrong-ID {noun} saved ({stored_total} total)'
+        if saved < len(reviews):
+            message += f'; {len(reviews) - saved} could not be saved'
+        self.SetStatusText(message, 1)
+        if self._training_future is None:
+            self.__tag_panel.set_review_status(message)
         if retry_catalog:
             frame = (self._display_source_frame if self._display_source_frame is not None
                      else self.get_frame(self._current_index, 0))
-            self._schedule_catalog_match(self._current_index, frame, None)
+            if self._schedule_catalog_match(self._current_index, frame, None,
+                                            target_box=box, best_effort=True):
+                self.SetStatusText(message + '; retrying identity for selected area', 1)
+            elif (not getattr(self._pin_matcher, 'has_references', True) and
+                  not self._feedback_model.identity_sample_count):
+                self.SetStatusText(
+                    message + '; no catalog images or reviewed pin identities are loaded', 1)
+            else:
+                self.SetStatusText(message + '; could not retry identity for selected area', 1)
         return True
 
     def _apply_identity_rejections(self, box: BoxData,
@@ -1927,6 +2822,7 @@ class ScrubberFrame(wx.Frame):
         self._play_timer.Stop()
         self._cancel_reconciliation()
         self._cancel_catalog_matches()
+        self._cancel_attempt_detection()
         self._play_generation += 1
         if self._pending_frame_job is not None:
             self._pending_frame_job.cancel()
@@ -1947,6 +2843,7 @@ class ScrubberFrame(wx.Frame):
             self.pause_playback()
         self._cancel_reconciliation()
         self._cancel_catalog_matches()
+        self._cancel_attempt_detection()
         if self._current_index >= self.__num_frames - 1 and self._current_index in self.__detected_frames:
             return
         self.__button_panel.play_btn.SetLabel('Pause')
@@ -1977,12 +2874,14 @@ class ScrubberFrame(wx.Frame):
     def on_detect_async(self, _event: wx.CommandEvent) -> None:
         self.pause_playback()
         self._submit_frame_job(self._current_index, requires_play=False,
-                               catalog_best_effort=True)
+                               catalog_best_effort=True,
+                               diagnostic_run_id=uuid4().hex[:8])
 
     def _submit_frame_job(self, target: int, requires_play: bool,
                           reference_index: int | None = None,
                           reference_frame: np.ndarray | None = None,
-                          catalog_best_effort: bool = False) -> None:
+                          catalog_best_effort: bool = False,
+                          diagnostic_run_id: str | None = None) -> None:
         if self._pending_frame_job is not None:
             return
         started = perf_counter()
@@ -2008,7 +2907,9 @@ class ScrubberFrame(wx.Frame):
             matcher=self._pin_matcher,
             expected_pins=self._frame_presence.get(target, FramePresence()).minimum_pins,
             allow_empty_fallback=not requires_play and target == current,
+            allow_motion_fallback=previous_index is not None,
             catalog_best_effort=catalog_best_effort,
+            diagnostic_run_id=diagnostic_run_id,
         )
         generation = self._play_generation
         revision = self._annotation_revision
@@ -2046,6 +2947,14 @@ class ScrubberFrame(wx.Frame):
         for original, analyzed in zip(existing, result.boxes[:result.existing_count]):
             if (original.source == 'automatic' and
                     original.review_state in ('unconfirmed', 'inherited') and
+                    analyzed.review_state != 'rejected' and
+                    not original.bounds_direct and original.feedback_id is None and
+                    (original.coords != analyzed.coords or
+                     original.bounds_adjustment != analyzed.bounds_adjustment)):
+                original.coords = analyzed.coords
+                original.bounds_adjustment = analyzed.bounds_adjustment
+            if (original.source == 'automatic' and
+                    original.review_state in ('unconfirmed', 'inherited') and
                     not original.identity_confirmed):
                 if analyzed.review_state == 'rejected':
                     if protected_tracks is None:
@@ -2062,9 +2971,12 @@ class ScrubberFrame(wx.Frame):
                 original.identity_confirmed = analyzed.identity_confirmed
                 original.identity_inferred = analyzed.identity_inferred
                 original.identity_rejections = analyzed.identity_rejections
-            elif (result.catalog_best_effort and
-                  needs_catalog_match(original, best_effort=True) and
+            elif (needs_catalog_match(original, best_effort=result.catalog_best_effort) and
                   analyzed.pin_id is not None):
+                if analyzed.identity_confirmed:
+                    original.track_id = analyzed.track_id
+                    original.identity_confirmed = True
+                    original.identity_inferred = original.review_state == 'confirmed'
                 original.pin_id = analyzed.pin_id
                 original.tags = list(analyzed.tags or [])
                 original.match_confidence = analyzed.match_confidence
@@ -2080,12 +2992,15 @@ class ScrubberFrame(wx.Frame):
                     original.tags = list(analyzed.tags or [])
                 original.match_confidence = analyzed.match_confidence
                 original.identity_confirmed = True
-        self.__frame_boxes[target] = add_unique_boxes(
-            existing, result.boxes[result.existing_count:])
+        # The worker already merged proposals against its annotation snapshot.
+        # Reapplying an overlap-only merge here would discard a visually tracked
+        # box beside an unrelated saved automatic candidate.
+        self.__frame_boxes[target] = existing + result.boxes[result.existing_count:]
         self._invalidate_reconciliation()
         if not requires_play:
             propagate_rejections(self.__frame_boxes)
             propagate_confirmations(self.__frame_boxes)
+        self._sync_automatic_consolidation()
         self.__matched_frames.add(target)
         self.__detected_frames.add(target)
         if requires_play and not self.frame_has_boxes(target):
@@ -2095,6 +3010,8 @@ class ScrubberFrame(wx.Frame):
         self._current_index = target
         committed = perf_counter()
         self.display_image(result.frame, reconcile=not requires_play)
+        if result.diagnostic_run_id is not None:
+            self._log_detection_display(result)
         visible = sum(box.review_state != 'rejected' for box in self.__frame_boxes[target])
         if visible:
             summary = (f'Frame {target}: {visible} candidates '
@@ -2110,6 +3027,52 @@ class ScrubberFrame(wx.Frame):
             self.pause_playback()
         elif requires_play and self._playing:
             self._play_timer.StartOnce(50)
+
+    def _log_detection_display(self, result: FrameResult) -> None:
+        """Record both coordinate spaces for an explicit Detect Pins run."""
+        panel = self.__image_panel
+        panel_size = panel.GetSize()
+        run = result.diagnostic_run_id
+        if not hasattr(panel, 'img_size') or not hasattr(panel, 'bmp_size'):
+            getLog().warning('PINIDENT_DETECTION display unavailable run=%s frame=%d',
+                             run, result.index)
+            return
+        header = {
+            'run': run,
+            'frame': result.index,
+            'source_size': [int(result.frame.shape[1]), int(result.frame.shape[0])],
+            'rotation': self._rotation_angle,
+            'display_size': list(panel.img_size),
+            'bitmap_size': list(panel.bmp_size),
+            'panel_size': [panel_size.GetWidth(), panel_size.GetHeight()],
+            'bitmap_offset': list(panel.get_image_offset()),
+            'xywh': 'x,y,width,height',
+            'box_count': len(self.__frame_boxes[result.index]),
+        }
+        getLog().info('PINIDENT_DETECTION display %s',
+                      json.dumps(header, separators=(',', ':')))
+        source_width, source_height = result.frame.shape[1], result.frame.shape[0]
+        for index, box in enumerate(self.__frame_boxes[result.index]):
+            x, y, width, height = box.coords
+            record = {
+                'run': run,
+                'index': index,
+                'origin': 'existing' if index < result.existing_count else 'new',
+                'source_xywh': list(box.coords),
+                'panel_xywh': list(panel._box_panel_rect(box)),
+                'in_source_bounds': (x >= 0 and y >= 0 and width > 0 and height > 0
+                                     and x + width <= source_width
+                                     and y + height <= source_height),
+                'source': box.source,
+                'review_state': box.review_state,
+                'tags': list(box.tags or []),
+                'pin_id': box.pin_id,
+                'match_confidence': box.match_confidence,
+                'identity_confirmed': box.identity_confirmed,
+            }
+            getLog().info('PINIDENT_DETECTION box %s',
+                          json.dumps(record, separators=(',', ':')))
+        getLog().info('PINIDENT_DETECTION end run=%s', run)
 
     def __on_process(self, event: wx.CommandEvent) -> None:
         """Find possible pins without overwriting existing annotations."""
@@ -2129,6 +3092,8 @@ class ScrubberFrame(wx.Frame):
                                                    rejected_next, proposals)
         else:
             proposed_boxes = add_new_detections([], proposals)
+        proposed_boxes = filter_new_candidates_by_pin_size(frame_img, existing,
+                                                            proposed_boxes)
         self.__frame_boxes[self._current_index] = add_unique_boxes(existing, proposed_boxes)
         self._invalidate_reconciliation()
         self._reconcile_frame(self._current_index)
@@ -2140,11 +3105,14 @@ class ScrubberFrame(wx.Frame):
                 or not any(box.review_state != 'rejected'
                            for box in self.__current_boxes)):
             extra = detect_pin_boxes_relaxed(frame_img, self._feedback_model)
+            proposed_extra = filter_new_candidates_by_pin_size(
+                frame_img, self.__current_boxes, add_new_detections([], extra))
             self.__frame_boxes[self._current_index] = add_unique_boxes(
-                self.__current_boxes, add_new_detections([], extra))
+                self.__current_boxes, proposed_extra)
             identify_candidates(frame_img, self.__current_boxes,
                                 self._pin_matcher, best_effort=True)
         propagate_rejections(self.__frame_boxes)
+        self._sync_automatic_consolidation()
         self.__matched_frames.add(self._current_index)
         self.__detected_frames.add(self._current_index)
         self.display_image()

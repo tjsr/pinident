@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["library.test.ts", "scanner.test.ts", "catalog.test.ts", "worker.test.ts"]
+  "include": ["library.test.ts", "scanner.test.ts", "catalog.test.ts", "worker.test.ts", "reviews.test.ts", "model.test.ts", "identity.test.ts"]
 }

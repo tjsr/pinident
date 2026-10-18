@@ -12,6 +12,8 @@ import numpy as np
 from boxdata import BoxData, Coordinate
 from detection_feedback import FeedbackExample, make_feedback_example
 
+LINKED_POSITIVE_PREFIX = 'linked-positive:'
+
 
 @dataclass(frozen=True)
 class TrainingObservation:
@@ -34,15 +36,19 @@ class TrainingDelta:
     updated_count: int
 
 
+def observation_metadata(item: TrainingObservation) -> tuple:
+    return (item.label, item.frame_index, item.track_id, item.pin_id,
+            item.coords, item.tags)
+
+
 def plan_training_delta(observations: list[TrainingObservation],
                         stored: dict[str, tuple]) -> TrainingDelta:
     """Compare training-relevant metadata without opening source frames."""
     active_ids = {item.example_id for item in observations}
     if len(active_ids) != len(observations):
         raise ValueError('Duplicate feedback example ID in session annotations')
-    pending = [item for item in observations if stored.get(item.example_id) != (
-        item.label, item.frame_index, item.track_id, item.pin_id,
-        item.coords, item.tags)]
+    pending = [item for item in observations
+               if stored.get(item.example_id) != observation_metadata(item)]
     stored_ids = set(stored)
     return TrainingDelta(
         pending, stored_ids - active_ids, stored_ids, active_ids,
@@ -52,17 +58,36 @@ def plan_training_delta(observations: list[TrainingObservation],
 
 def reviewed_observations(frame_boxes: dict[int, list[BoxData]],
                           source_path: str) -> list[TrainingObservation]:
-    """Use direct reviews; propagated observations are not independent labels."""
+    """Index each frame of a directly confirmed pin track as its own crop."""
     observations: list[TrainingObservation] = []
     identity_observations: dict[str, TrainingObservation] = {}
     legacy_negative_tracks: set[str] = set()
     explicit_negative_tracks = {box.track_id for boxes in frame_boxes.values()
                                 for box in boxes if box.feedback_label == 'negative'}
+    rejected_tracks = {box.track_id for boxes in frame_boxes.values()
+                       for box in boxes if box.review_state == 'rejected'}
+    direct_positive_frames = {
+        (frame_index, box.track_id)
+        for frame_index, boxes in frame_boxes.items() for box in boxes
+        if box.feedback_label == 'positive' or
+        (box.feedback_label is None and box.review_state == 'confirmed')}
+    positive_tracks = {track_id for _frame, track_id in direct_positive_frames}
+    linked_frames: set[tuple[int, str]] = set()
     for frame_index, boxes in sorted(frame_boxes.items()):
         for box in boxes:
             label = box.feedback_label
+            linked = False
             if label is None and box.review_state == 'confirmed':
                 label = 'positive'
+            elif (label is None and box.review_state == 'inherited' and
+                  box.track_id in positive_tracks and
+                  box.track_id not in explicit_negative_tracks and
+                  box.track_id not in rejected_tracks and
+                  (frame_index, box.track_id) not in direct_positive_frames and
+                  (frame_index, box.track_id) not in linked_frames):
+                label = 'positive'
+                linked = True
+                linked_frames.add((frame_index, box.track_id))
             elif (label is None and box.review_state == 'rejected' and
                   box.source == 'automatic' and
                   box.track_id not in explicit_negative_tracks and
@@ -70,13 +95,17 @@ def reviewed_observations(frame_boxes: dict[int, list[BoxData]],
                 label = 'negative'
                 legacy_negative_tracks.add(box.track_id)
             if label in ('positive', 'negative'):
-                example_id = box.feedback_id or uuid5(
-                    NAMESPACE_URL,
-                    f'{source_path}|{frame_index}|{box.track_id}|{label}').hex
+                if linked:
+                    key = f'{source_path}|{frame_index}|{box.track_id}|linked-positive'
+                    example_id = LINKED_POSITIVE_PREFIX + uuid5(NAMESPACE_URL, key).hex
+                else:
+                    key = f'{source_path}|{frame_index}|{box.track_id}|{label}'
+                    example_id = box.feedback_id or uuid5(NAMESPACE_URL, key).hex
                 observations.append(TrainingObservation(
                     frame_index, box.coords, box.track_id, label,
                     box.pin_id if label == 'positive' and box.identity_confirmed else None,
-                    tuple(tag for tag in box.tags or [] if tag.strip()) if label == 'positive' else (),
+                    tuple(tag for tag in box.tags or [] if tag.strip())
+                    if label == 'positive' and (not linked or box.identity_confirmed) else (),
                     example_id))
             for review in box.identity_rejections:
                 source_frame = review.frame_index if review.frame_index >= 0 else frame_index

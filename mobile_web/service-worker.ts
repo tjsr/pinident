@@ -2,9 +2,11 @@
 
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
-const CACHE = 'pinident-mobile-v2';
+const CACHE = 'pinident-mobile-v15';
 const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/library.js',
-  '/scanner.js', '/catalog.js', '/manifest.webmanifest', '/icon.svg',
+  '/scanner.js', '/stage_geometry.js', '/scan_session.js', '/model.js', '/identity.js',
+  '/catalog.js', '/reviews.js',
+  '/manifest.webmanifest', '/icon.svg',
   '/icon-192.png', '/icon-512.png'];
 
 sw.addEventListener('install', event => {
@@ -23,9 +25,10 @@ sw.addEventListener('activate', event => {
 sw.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
   if (event.request.method !== 'GET' || url.origin !== sw.location.origin ||
-      url.pathname === '/catalog.json') return;
+      url.pathname === '/catalog.json' || url.pathname.startsWith('/api/')) return;
   event.respondWith(fetch(event.request).then(response => {
-    if (response.ok) {
+    if (response.ok && (!['/model.json', '/identity-index.json'].includes(url.pathname) ||
+        response.headers.get('content-type')?.includes('application/json'))) {
       const copy = response.clone();
       void caches.open(CACHE).then(cache => cache.put(event.request, copy));
     }

@@ -63,7 +63,9 @@ class BoxData:
                  match_confidence: float | None = None,
                  identity_confirmed: bool | None = None,
                  identity_inferred: bool = False,
-                 identity_rejections: tuple[IdentityRejection, ...] = ()):
+                 identity_rejections: tuple[IdentityRejection, ...] = (),
+                 bounds_adjustment: Coordinate | None = None,
+                 bounds_direct: bool | None = None):
         if source not in BoxData.VALID_SOURCE_TYPES:
             raise ValueError(f'Source must be "user" or "automatic" but was "{source}"')
         self._coords = coords
@@ -81,6 +83,12 @@ class BoxData:
                                    if identity_confirmed is None else identity_confirmed)
         self.identity_inferred = identity_inferred
         self.identity_rejections = tuple(identity_rejections)
+        # None means detector-owned geometry. A tuple marks bounds authored or
+        # corrected by a user, relative to the detector's last proposal.
+        self.bounds_adjustment = ((0, 0, 0, 0)
+                                  if bounds_adjustment is None and source == 'user'
+                                  else bounds_adjustment)
+        self.bounds_direct = source == 'user' if bounds_direct is None else bounds_direct
 
     @property
     def review_state(self) -> str:

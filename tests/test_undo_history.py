@@ -171,6 +171,9 @@ def test_resize_and_label_edit_undo_change_only_the_edited_fields():
         panel.on_left_up(Mouse(x + width + 10, y + height + 10))
         assert box.coords != (10, 15, 40, 40)
         resized = box.coords
+        adjustment = box.bounds_adjustment
+        assert adjustment is not None
+        assert box.bounds_direct
 
         tag_panel = window._ScrubberFrame__tag_panel.find_panel_for_box(box)
         tag_panel._BoxTagPanelEdit__on_label_edited(
@@ -182,10 +185,14 @@ def test_resize_and_label_edit_undo_change_only_the_edited_fields():
         assert box.tags == ['Mario'] and box.pin_id == 'pinpanion:7'
         window.on_key_down(UndoKey())
         assert box.coords == (10, 15, 40, 40)
+        assert box.bounds_adjustment is None
+        assert not box.bounds_direct
         assert window._ScrubberFrame__frame_boxes[0][0] is box
 
         window.on_key_down(UndoKey(redo=True))
         assert box.coords == resized
+        assert box.bounds_adjustment == adjustment
+        assert box.bounds_direct
         assert box.tags == ['Mario'] and box.pin_id == 'pinpanion:7'
     finally:
         window.Destroy()

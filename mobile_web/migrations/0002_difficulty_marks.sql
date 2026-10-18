@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS difficulty_marks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mark_id TEXT NOT NULL UNIQUE,
+  marked_at TEXT NOT NULL,
+  signature TEXT NOT NULL
+);

@@ -71,6 +71,33 @@ def test_low_detail_feedback_is_saved_but_reported_as_unusable():
         store.close()
 
 
+def test_identity_exemplars_use_confirmed_ids_and_rejected_names():
+    image = sample_frame()
+    coords = (10, 15, 40, 40)
+    store = FeedbackStore()
+    try:
+        store.save(make_feedback_example('confirmed', 'positive', image, coords,
+                                         'video.mp4', 0, 'track', 'pin-7', ('Mario',)))
+        model = FeedbackModel(store)
+        assert model.suggest_identity(image[15:55, 10:50]).pin_id == 'pin-7'
+        assert model.snapshot_for_processing().suggest_identity(
+            image[15:55, 10:50]).pin_id == 'pin-7'
+        store.save(make_feedback_example('ambiguous', 'positive', image, coords,
+                                         'video.mp4', 1, 'other-track',
+                                         'pin-8', ('Luigi',)))
+        model.refresh({'ambiguous'})
+        assert model.suggest_identity(image[15:55, 10:50]) is None
+        store.delete('ambiguous')
+        model.refresh({'ambiguous'})
+        store.save_identity_rejection(make_feedback_example(
+            'wrong', 'wrong_identity', image, coords, 'video.mp4', 1,
+            'other-track', 'pin-7', ('Mario',)))
+        model.refresh({'wrong'})
+        assert model.suggest_identity(image[15:55, 10:50]) is None
+    finally:
+        store.close()
+
+
 @pytest.mark.gui
 def test_context_menu_separates_area_removal_from_negative_review(tmp_path):
     app = wx.App.Get() or wx.App(False)
@@ -92,11 +119,13 @@ def test_context_menu_separates_area_removal_from_negative_review(tmp_path):
         panel: ImagePanel = window._ScrubberFrame__image_panel
         menu = panel.make_box_context_menu(selected)
         assert [item.GetItemLabelText() for item in menu.GetMenuItems()] == [
-            'Confirm is a pin', 'Confirm pin identity', 'Not this pin',
-            'Remove area', 'Not a pin']
-        assert [item.GetItemLabel() for item in menu.GetMenuItems()][2:] == [
-            'Not this pin (&X)', 'Remove area\tDel', '&Not a pin']
-        remove = menu.GetMenuItems()[3]
+            'Confirm pin identity', 'Not this pin',
+            'Remove area', 'Attempt detection', 'Not a pin']
+        assert [item.GetItemLabel() for item in menu.GetMenuItems()][1:] == [
+            'Not this pin (&X)', 'Remove area\tDel',
+            'Attempt detection', '&Not a pin']
+        remove = next(item for item in menu.GetMenuItems()
+                      if item.GetItemLabelText() == 'Remove area')
         menu.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, remove.GetId()))
         menu.Destroy()
         assert window._ScrubberFrame__frame_boxes[0] == []
@@ -106,7 +135,7 @@ def test_context_menu_separates_area_removal_from_negative_review(tmp_path):
         window.undo_action()
         assert window._ScrubberFrame__frame_boxes[0] == [selected]
         menu = panel.make_box_context_menu(selected)
-        not_pin = menu.GetMenuItems()[4]
+        not_pin = menu.GetMenuItems()[-1]
         menu.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, not_pin.GetId()))
         menu.Destroy()
         assert selected.review_state == linked.review_state == 'rejected'
@@ -124,7 +153,8 @@ def test_context_menu_separates_area_removal_from_negative_review(tmp_path):
         manual = BoxData((60, 15, 30, 30), ['Manual'], 'user')
         menu = panel.make_box_context_menu(manual)
         assert [item.GetItemLabelText() for item in menu.GetMenuItems()] == [
-            'Confirm is a pin', 'Confirm pin identity', 'Not this pin', 'Remove area']
+            'Confirm pin identity', 'Not this pin',
+            'Remove area', 'Attempt detection']
         menu.Destroy()
     finally:
         window.Destroy()
@@ -209,9 +239,10 @@ def test_gui_feedback_changes_future_detection_and_undo_redo(tmp_path):
             'positive', 'negative']
         assert window._feedback_model.sample_counts == {'positive': 1, 'negative': 1}
         assert 'pin 1/1, non-pin 1/1 usable' in window.GetStatusBar().GetStatusText(0)
-        info = window._ScrubberFrame__tag_panel.feedback_info_btn
+        info_id = window.GetMenuBar().FindMenuItem('Training', 'Feedback model...')
+        assert info_id != wx.NOT_FOUND
         with patch('scrubberframe.wx.MessageBox') as show_info:
-            info.ProcessEvent(wx.CommandEvent(wx.EVT_BUTTON.typeId, info.GetId()))
+            window.GetEventHandler().ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, info_id))
         explanation = show_info.call_args.args[0]
         assert 'Confirmed pins: 1 saved, 1 usable' in explanation
         assert 'Rejected automatic candidates: 1 saved, 1 usable' in explanation

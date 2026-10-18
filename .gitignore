@@ -6,7 +6,11 @@ labels
 names.txt
 known_pins.sqlite3*
 detection_feedback.sqlite3*
+*.svm.yml*
+.pinident-*
 mobile_web/node_modules/
 mobile_web/dist/
+mobile_web/model.json
+mobile_web/identity-index*.json
 mobile_web/.npm-cache/
 mobile_web/.wrangler/

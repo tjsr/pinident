@@ -6,14 +6,16 @@ from pinpanion_sync import start_catalog_sync
 
 def main() -> None:
     app = wx.App(False)
-    with wx.FileDialog(None, 'Open a pin video',
-                       wildcard='Video files|*.mp4;*.avi;*.mov;*.mkv|All files|*.*',
+    with wx.FileDialog(None, 'Open a pin video or image',
+                       wildcard=('Video and image files|*.mp4;*.avi;*.mov;*.mkv;'
+                                 '*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.tif;*.tiff|'
+                                 'All files|*.*'),
                        style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dialog:
         if dialog.ShowModal() != wx.ID_OK:
             return
         video_path = dialog.GetPath()
 
-    frame = VideoScrubber(None, 'Pinny Arcade video pin tagging tool', '',
+    frame = VideoScrubber(None, 'Pinny Arcade pin tagging tool', '',
                           video_path=video_path, load_catalog=False)
     frame.load_box_data()
     frame.Show()

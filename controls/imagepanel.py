@@ -60,8 +60,11 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         self._box_tooltip_text: str | None = None
         self.on_confirm_box: Callable[[BoxData], None] | None = None
         self.on_confirm_boxes: Callable[[list[BoxData]], None] | None = None
+        self.on_confirm_identities: Callable[[list[BoxData]], None] | None = None
         self.on_confirm_identity: Callable[[BoxData], None] | None = None
+        self.on_before_context_menu: Callable[[], None] | None = None
         self.on_wrong_identity: Callable[[BoxData], None] | None = None
+        self.on_attempt_detection: Callable[[BoxData], None] | None = None
         self.on_rank_replacements: Callable[[BoxData, int], list[PinMatch]] | None = None
         self.on_replace_pin: Callable[[BoxData, PinMatch], None] | None = None
         self.on_reject_replacements: Callable[[BoxData, list[PinMatch]], bool] | None = None
@@ -163,7 +166,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         x, y, w, h = self._box_panel_rect(box)
         return wx.Rect(x, y, w, h).Contains(point)
 
-    def _set_selection(self, boxes: list[BoxData]) -> None:
+    def _set_selection(self, boxes: list[BoxData], *, focus_editor: bool = False) -> None:
         unique: list[BoxData] = []
         visible_ids = {id(box) for box in self.__boxes if box.review_state != 'rejected'}
         seen: set[int] = set()
@@ -174,10 +177,13 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 seen.add(identity)
         if len(unique) == len(self._selected_boxes) and all(
                 old is new for old, new in zip(self._selected_boxes, unique)):
+            if focus_editor and unique:
+                wx.PostEvent(self, BoxSelectedEvent(self, unique[-1], focus_editor=True))
             return
         self._selected_boxes = unique
         self._selected_box = unique[-1] if unique else None
-        wx.PostEvent(self, BoxSelectedEvent(self, self._selected_box))
+        wx.PostEvent(self, BoxSelectedEvent(
+            self, self._selected_box, focus_editor=focus_editor))
         self.Refresh()
 
     def _boxes_overlapping_panel_rect(self, rect: wx.Rect) -> list[BoxData]:
@@ -210,12 +216,12 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
                 selected = [item for item in self._selected_boxes if item is not box]
                 if len(selected) == len(self._selected_boxes):
                     selected.append(box)
-                self._set_selection(selected)
+                self._set_selection(selected, focus_editor=True)
             return
         if box is not None:
             if self.on_change_begin:
                 self.on_change_begin()
-            self._set_selection([box])
+            self._set_selection([box], focus_editor=True)
             self._gesture_rect = rotate_rect(box.coords, self._source_size(), self.rotation_angle)
             self._gesture_anchor = self._panel_to_display(pos)
             if handle:
@@ -248,6 +254,8 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             self.on_interact()
         if self.image is None:
             return
+        if self.on_before_context_menu:
+            self.on_before_context_menu()
         pos = event.GetPosition()
         box, _ = self.hit_test_resize(pos)
         box = box or self.get_box_at_position(pos)
@@ -255,7 +263,7 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             self._set_selection([box])
         if not self._selected_boxes:
             return
-        menu = (self.make_selection_context_menu(list(self._selected_boxes))
+        menu = (self.make_selection_context_menu(list(self._selected_boxes), box)
                 if len(self._selected_boxes) > 1 else
                 self.make_box_context_menu(self._selected_boxes[0]))
         self._popup_review_menu(menu, pos)
@@ -288,17 +296,42 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             empty.Enable(False)
         self._popup_review_menu(menu, pos, position_menu=True)
 
-    def make_selection_context_menu(self, boxes: list[BoxData]) -> wx.Menu:
+    def make_selection_context_menu(self, boxes: list[BoxData],
+                                    clicked_box: BoxData | None = None) -> wx.Menu:
         """Apply one owner transaction to the selected visible boxes."""
         menu = wx.Menu()
-        confirm = menu.Append(wx.ID_ANY, 'Confirm selected as pins')
-        not_pin = menu.Append(wx.ID_ANY, '&Not a pin (automatic only)')
+        confirm_identities = any(
+            has_specific_identity(box) and
+            (box.review_state != 'confirmed' or not box.identity_confirmed
+             or box.identity_inferred)
+            for box in boxes)
+        confirm_identity = (menu.Append(wx.ID_ANY, 'Confirm selected identities')
+                            if confirm_identities else None)
+        confirm_presence = (menu.Append(wx.ID_ANY, 'Confirm selected as pins')
+                            if any(not has_specific_identity(box) for box in boxes)
+                            or not confirm_identities else None)
         remove = menu.Append(wx.ID_ANY, 'Remove selected areas\tDel')
-        menu.Enable(confirm.GetId(), any(box.review_state != 'confirmed' for box in boxes))
+        if clicked_box is not None:
+            attempt = menu.Append(wx.ID_ANY, 'Attempt detection')
+            menu.Bind(wx.EVT_MENU,
+                      lambda _evt: self.on_attempt_detection(clicked_box)
+                      if self.on_attempt_detection else None,
+                      id=attempt.GetId())
+        not_pin = menu.Append(wx.ID_ANY, '&Not a pin (automatic only)')
+        if confirm_presence is not None:
+            menu.Enable(confirm_presence.GetId(), any(
+                box.review_state != 'confirmed' for box in boxes))
         menu.Enable(not_pin.GetId(), any(box.source == 'automatic' for box in boxes))
-        menu.Bind(wx.EVT_MENU,
-                  lambda _evt: self.on_confirm_boxes(list(boxes)) if self.on_confirm_boxes else None,
-                  id=confirm.GetId())
+        if confirm_identity is not None:
+            menu.Bind(wx.EVT_MENU,
+                      lambda _evt: self.on_confirm_identities(list(boxes))
+                      if self.on_confirm_identities else None,
+                      id=confirm_identity.GetId())
+        if confirm_presence is not None:
+            menu.Bind(wx.EVT_MENU,
+                      lambda _evt: self.on_confirm_boxes(list(boxes))
+                      if self.on_confirm_boxes else None,
+                      id=confirm_presence.GetId())
         menu.Bind(wx.EVT_MENU,
                   lambda _evt: self.on_not_pin_boxes(list(boxes)) if self.on_not_pin_boxes else None,
                   id=not_pin.GetId())
@@ -310,22 +343,30 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     def make_box_context_menu(self, box: BoxData) -> wx.Menu:
         """Build actions bound to the same frame owner as the label buttons."""
         menu = wx.Menu()
-        confirm = menu.Append(wx.ID_ANY, 'Confirm is a pin')
-        confirm_identity = menu.Append(wx.ID_ANY, 'Confirm pin identity')
+        has_identity = has_specific_identity(box)
+        confirm = (None if has_identity else
+                   menu.Append(wx.ID_ANY, 'Confirm is a pin'))
+        confirm_identity = menu.Append(wx.ID_ANY, 'Confirm pin identity (&Y)')
         wrong_identity = (menu.Append(wx.ID_ANY, 'Not this pin (&X)')
-                          if has_specific_identity(box) else None)
+                          if has_identity else None)
         replacement_menu = self._make_replacement_menu(box)
         if replacement_menu is not None:
             menu.AppendSubMenu(replacement_menu, 'Replace with pin')
         remove = menu.Append(wx.ID_ANY, 'Remove area\tDel')
+        attempt = menu.Append(wx.ID_ANY, 'Attempt detection')
         not_pin = (menu.Append(wx.ID_ANY, '&Not a pin')
                    if box.source == 'automatic' else None)
-        menu.Enable(confirm.GetId(), box.review_state != 'confirmed')
+        if confirm is not None:
+            menu.Enable(confirm.GetId(), box.review_state != 'confirmed')
         menu.Enable(confirm_identity.GetId(),
-                    has_specific_identity(box) and not (
-                        box.review_state == 'confirmed' and box.identity_confirmed))
-        menu.Bind(wx.EVT_MENU, lambda _evt: self.on_confirm_box(box) if self.on_confirm_box else None,
-                  id=confirm.GetId())
+                    has_identity and not (
+                        box.review_state == 'confirmed' and box.identity_confirmed
+                        and not box.identity_inferred))
+        if confirm is not None:
+            menu.Bind(wx.EVT_MENU,
+                      lambda _evt: self.on_confirm_box(box)
+                      if self.on_confirm_box else None,
+                      id=confirm.GetId())
         menu.Bind(wx.EVT_MENU,
                   lambda _evt: self.on_confirm_identity(box) if self.on_confirm_identity else None,
                   id=confirm_identity.GetId())
@@ -338,12 +379,16 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
         if not_pin is not None:
             menu.Bind(wx.EVT_MENU, lambda _evt: self.on_not_pin(box) if self.on_not_pin else None,
                       id=not_pin.GetId())
+        menu.Bind(wx.EVT_MENU,
+                  lambda _evt: self.on_attempt_detection(box)
+                  if self.on_attempt_detection else None,
+                  id=attempt.GetId())
         return menu
 
     def _make_replacement_menu(self, box: BoxData) -> wx.Menu | None:
         if self.on_rank_replacements is None:
             return None
-        choices = self.on_rank_replacements(box, 20)
+        choices = self.on_rank_replacements(box, 10)
         if not choices:
             return None
         menu = wx.Menu()
@@ -353,7 +398,12 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             if names.count(match.name) > 1:
                 name += f" ({match.pin_id.replace('&', '&&')})"
             score = f'{match.confidence:.0%} ' if match.confidence is not None else ''
-            item = menu.Append(wx.ID_ANY, score + name)
+            details = [str(match.year)] if match.year is not None else []
+            if match.show and match.show.strip():
+                details.append(match.show.strip())
+            context = f"[{'/'.join(details)}] " if details else ''
+            context = context.replace('&', '&&').replace('\t', ' ').replace('\n', ' ')
+            item = menu.Append(wx.ID_ANY, score + context + name)
             menu.Bind(wx.EVT_MENU,
                       lambda _event, chosen=match: self.on_replace_pin(box, chosen)
                       if self.on_replace_pin else None,
@@ -483,6 +533,12 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
             return
         updated = unrotate_rect(shown, self._source_size(), self.rotation_angle)
         if updated != box.coords:
+            box.bounds_direct = True
+            if box.source != 'user':
+                old = box.coords
+                adjustment = box.bounds_adjustment or (0, 0, 0, 0)
+                box.bounds_adjustment = tuple(
+                    adjustment[i] + updated[i] - old[i] for i in range(4))
             box.coords = updated
             wx.PostEvent(self, BoxEditedEvent(source=self, box=box))
             self.Refresh()
@@ -531,7 +587,8 @@ class ImagePanel(wx.Panel, wx.PyEventBinder):
     @staticmethod
     def get_box_colour(box: BoxData) -> wx.Colour:
         if box.review_state == 'confirmed':
-            return wx.Colour(0, 160, 60)
+            return (wx.Colour(0, 160, 60) if box.identity_confirmed else
+                    wx.Colour(230, 140, 0))
         if box.review_state == 'inherited':
             return wx.Colour(230, 140, 0)
         if has_specific_identity(box):

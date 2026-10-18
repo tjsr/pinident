@@ -18,7 +18,7 @@ def textured_frame() -> np.ndarray:
     return np.random.default_rng(81).integers(0, 255, (90, 120, 3), dtype=np.uint8)
 
 
-def test_training_uses_direct_reviews_and_preserves_identity_labels():
+def test_training_uses_each_linked_pin_frame_and_preserves_identity_labels():
     direct = BoxData((10, 10, 35, 35), ['Mario'], 'automatic', track_id='pin',
                      pin_id='pinpanion:7', review_state='confirmed',
                      identity_confirmed=True)
@@ -30,19 +30,49 @@ def test_training_uses_direct_reviews_and_preserves_identity_labels():
                        feedback_id='negative-id', feedback_label='negative')
     propagated_rejection = BoxData((60, 10, 35, 35), [], 'automatic',
                                    track_id='noise', review_state='rejected')
+    unconfirmed = BoxData((5, 50, 15, 15), [], 'automatic',
+                          track_id='guess', review_state='unconfirmed')
+    orphan = BoxData((25, 50, 15, 15), [], 'automatic',
+                     track_id='orphan', review_state='inherited')
     observations = reviewed_observations(
-        {0: [direct, rejected], 1: [inherited, propagated_rejection]}, 'video.mp4')
+        {0: [direct, rejected],
+         1: [inherited, propagated_rejection, unconfirmed, orphan]}, 'video.mp4')
     assert [(item.frame_index, item.label) for item in observations] == [
-        (0, 'positive'), (0, 'negative')]
+        (0, 'positive'), (0, 'negative'), (1, 'positive')]
+    assert len({item.example_id for item in observations}) == 3
     updates = []
     examples, skipped = build_training_examples(
-        observations, 'video.mp4', lambda _index: textured_frame(),
+        observations, 'video.mp4',
+        lambda index: np.random.default_rng(81 + index).integers(
+            0, 255, (90, 120, 3), dtype=np.uint8),
         lambda done, total, eta: updates.append((done, total, eta)))
     assert skipped == 0
-    assert updates[0][:2] == (0, 2) and updates[-1][:2] == (2, 2)
+    assert updates[0][:2] == (0, 3) and updates[-1][:2] == (3, 3)
     assert examples[0].pin_id == 'pinpanion:7'
     assert examples[0].tags == ('Mario',)
     assert examples[1].pin_id is None and examples[1].tags == ()
+    assert examples[2].frame_index == 1 and examples[2].label == 'positive'
+    assert examples[2].crop_png != examples[0].crop_png
+
+
+def test_linked_frame_training_delta_tracks_edits_and_removal():
+    direct = BoxData((10, 10, 35, 35), [], 'automatic', track_id='pin',
+                     review_state='confirmed', feedback_id='direct-1',
+                     feedback_label='positive')
+    linked = BoxData((11, 10, 35, 35), [], 'automatic', track_id='pin',
+                     review_state='inherited')
+    observations = reviewed_observations({0: [direct], 1: [linked]}, 'video.mp4')
+    stored = {item.example_id: (item.label, item.frame_index, item.track_id,
+                                item.pin_id, item.coords, item.tags)
+              for item in observations}
+    assert plan_training_delta(observations, stored).pending == []
+    linked.coords = (12, 10, 35, 35)
+    edited = reviewed_observations({0: [direct], 1: [linked]}, 'video.mp4')
+    delta = plan_training_delta(edited, stored)
+    assert [item.frame_index for item in delta.pending] == [1]
+    assert delta.updated_count == 1 and delta.new_count == 0
+    removed = plan_training_delta(reviewed_observations({0: [direct]}, 'video.mp4'), stored)
+    assert removed.removed_ids == {observations[1].example_id}
 
 
 def test_training_delta_skips_unchanged_and_detects_edits_and_deletions():
@@ -179,8 +209,8 @@ def test_training_button_indexes_session_and_reports_completion(tmp_path):
         window.Show()
         wx.Yield()
         panel = window._ScrubberFrame__tag_panel
-        panel.training_btn.ProcessEvent(wx.CommandEvent(
-            wx.EVT_BUTTON.typeId, panel.training_btn.GetId()))
+        window.GetEventHandler().ProcessEvent(wx.CommandEvent(
+            wx.EVT_MENU.typeId, window._training_add_item.GetId()))
         deadline = monotonic() + 5
         while window._training_future is not None and monotonic() < deadline:
             wx.Yield()
@@ -188,59 +218,114 @@ def test_training_button_indexes_session_and_reports_completion(tmp_path):
         wx.Yield()
         assert window._training_future is None
         assert panel.training_gauge.GetValue() == 100
-        assert '2 examples indexed' in panel.training_status.GetLabel()
-        assert window._feedback_model.sample_counts == {'positive': 1, 'negative': 1}
+        assert '3 examples indexed' in panel.training_status.GetLabel()
+        assert '2 pin crops (linked frames: 1' in panel.training_status.GetLabel()
+        assert window._feedback_model.sample_counts == {'positive': 2, 'negative': 1}
         assert window._feedback_store.examples()[0].tags == ('Mario',)
         assert (tmp_path / 'session.json').is_file()
+        assert not (tmp_path / 'feedback.svm.yml').exists()
+        window._seed_feedback_from_annotations()
+        assert window._feedback_store.counts() == {'positive': 2, 'negative': 1}
         revision = window._feedback_model.version
         with patch.object(window, 'read_frame_for_processing',
                           side_effect=AssertionError('decoded unchanged frame')):
-            panel.training_btn.ProcessEvent(wx.CommandEvent(
-                wx.EVT_BUTTON.typeId, panel.training_btn.GetId()))
+            window.GetEventHandler().ProcessEvent(wx.CommandEvent(
+                wx.EVT_MENU.typeId, window._training_add_item.GetId()))
             wx.Yield()
         assert window._training_future is None
         assert window._feedback_model.version == revision
         assert 'Up to date' in panel.training_status.GetLabel()
-        assert len(window._feedback_store.examples()) == 2
+        assert len(window._feedback_store.examples()) == 3
 
         new = BoxData((60, 10, 35, 35), ['Luigi'], 'automatic', track_id='new',
                       review_state='confirmed')
         window._ScrubberFrame__frame_boxes[2] = [new]
         with patch.object(window, 'read_frame_for_processing',
                           wraps=window.read_frame_for_processing) as reader:
-            panel.training_btn.ProcessEvent(wx.CommandEvent(
-                wx.EVT_BUTTON.typeId, panel.training_btn.GetId()))
+            window.GetEventHandler().ProcessEvent(wx.CommandEvent(
+                wx.EVT_MENU.typeId, window._training_add_item.GetId()))
             deadline = monotonic() + 5
             while window._training_future is not None and monotonic() < deadline:
                 wx.Yield()
                 sleep(0.005)
             wx.Yield()
             assert [call.args[0] for call in reader.call_args_list] == [2]
-        assert len(window._feedback_store.examples()) == 3
-        assert '1 added, 0 updated' in panel.training_status.GetLabel()
+        assert len(window._feedback_store.examples()) == 4
+        assert '1 added now, 0 updated' in panel.training_status.GetLabel()
 
         original = window._ScrubberFrame__frame_boxes[0][0]
         original.coords = (11, 10, 35, 35)
         with patch.object(window, 'read_frame_for_processing',
                           wraps=window.read_frame_for_processing) as reader:
-            panel.training_btn.ProcessEvent(wx.CommandEvent(
-                wx.EVT_BUTTON.typeId, panel.training_btn.GetId()))
+            window.GetEventHandler().ProcessEvent(wx.CommandEvent(
+                wx.EVT_MENU.typeId, window._training_add_item.GetId()))
             deadline = monotonic() + 5
             while window._training_future is not None and monotonic() < deadline:
                 wx.Yield()
                 sleep(0.005)
             wx.Yield()
             assert [call.args[0] for call in reader.call_args_list] == [0]
-        assert '0 added, 1 updated' in panel.training_status.GetLabel()
+        assert '0 added now, 1 updated' in panel.training_status.GetLabel()
 
         window._ScrubberFrame__frame_boxes[0].pop(1)
         with patch.object(window, 'read_frame_for_processing',
                           side_effect=AssertionError('decoded for deletion')):
-            panel.training_btn.ProcessEvent(wx.CommandEvent(
-                wx.EVT_BUTTON.typeId, panel.training_btn.GetId()))
+            window.GetEventHandler().ProcessEvent(wx.CommandEvent(
+                wx.EVT_MENU.typeId, window._training_add_item.GetId()))
         assert window._training_future is None
-        assert len(window._feedback_store.examples()) == 2
+        assert len(window._feedback_store.examples()) == 3
         assert '1 removed' in panel.training_status.GetLabel()
     finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_drawn_unidentified_pins_are_reported_and_used_for_training(tmp_path):
+    app = wx.App.Get() or wx.App(False)
+    image = textured_frame()
+    window = VideoScrubber(None, 'Unidentified pin training', '',
+                           image_array=[cv2.cvtColor(image, cv2.COLOR_RGB2BGR)],
+                           load_catalog=False,
+                           catalog_path=str(tmp_path / 'empty-catalog.sqlite3'),
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        window.Show()
+        wx.Yield()
+        panel = window._ScrubberFrame__image_panel
+        panel.add_new_box((5, 5, 30, 30))
+        panel.add_new_box((45, 5, 30, 30))
+        for coords in ((5, 45, 30, 30), (45, 45, 30, 30)):
+            box = BoxData(coords, [], 'automatic')
+            window._ScrubberFrame__frame_boxes[0].append(box)
+            window.mark_not_pin(box)
+        wx.Yield()
+
+        examples = window._feedback_store.examples()
+        positives = [item for item in examples if item.label == 'positive']
+        assert len(positives) == 2
+        assert all(item.pin_id is None and item.tags == () for item in positives)
+
+        tag_panel = window._ScrubberFrame__tag_panel
+        window.GetEventHandler().ProcessEvent(wx.CommandEvent(
+            wx.EVT_MENU.typeId, window._training_add_item.GetId()))
+        status = tag_panel.training_status.GetLabel()
+        assert '4 examples indexed' in status
+        assert '2 pin crops (linked frames: 0, 2 without verified ID)' in status
+        assert '0 added now' in status
+
+        window.GetEventHandler().ProcessEvent(wx.CommandEvent(
+            wx.EVT_MENU.typeId, window._training_run_item.GetId()))
+        deadline = monotonic() + 10
+        while window._model_training_future is not None and monotonic() < deadline:
+            wx.Yield()
+            sleep(0.005)
+        wx.Yield()
+        assert window._model_training_future is None
+        assert window._feedback_model.trained_model is not None
+        assert window._feedback_model.trained_model.sample_counts == {
+            'positive': 2, 'negative': 2}
+    finally:
+        window.pause_playback()
         window.Destroy()
         wx.Yield()

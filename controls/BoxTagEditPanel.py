@@ -88,6 +88,7 @@ class BoxTagPanelEdit(wx.Panel):
                  self.__box.review_state == 'inherited' else
                  'Identity confirmed' if self.__box.identity_confirmed and
                  self.__box.review_state == 'confirmed' else
+                 'Identity needs verification' if self.__box.identity_rejections else
                  'Pin confirmed' if self.__box.review_state == 'confirmed' else
                  'Pin confirmed in another frame' if self.__box.review_state == 'inherited' else
                  self.__box.review_state.title())
@@ -194,8 +195,16 @@ class BoxTagPanelEdit(wx.Panel):
 
         return new_label
 
+    def commit_pending_labels(self) -> None:
+        for row in list(self.__box_tags):
+            if not row.IsBeingDeleted():
+                row.commit_current_value()
+
     def __on_label_edited(self, event: BoxLabelEditedEvent) -> None:
         """Handle label updates."""
+        source = event.GetEventObject()
+        if isinstance(source, BoxTagLabelRow):
+            source.mark_edit_committed(event)
         getLog().debug(f'{event.label_index}={event.new_label}')
         current = (self.__box.get_tag(event.label_index)
                    if event.label_index < len(self.__box.tags or []) else '')
