@@ -1,9 +1,9 @@
 """Small, identity-preserving changes for frame annotation undo and redo."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
-from boxdata import BoxData
+from boxdata import BoxData, Coordinate, IdentityRejection
 from frame_presence import FramePresence
 
 
@@ -12,13 +12,36 @@ _FIELDS = ('coords', 'tags', 'source', 'track_id', 'pin_id',
            'match_confidence', 'identity_confirmed', 'identity_inferred',
            'identity_rejections', 'bounds_adjustment', 'bounds_direct')
 
+HistoryValue = (Coordinate | tuple[str, ...] | tuple[IdentityRejection, ...] |
+                str | float | bool | None)
+
+
+def _box_values(box: BoxData) -> dict[str, HistoryValue]:
+    return {
+        'coords': box.coords,
+        'tags': tuple(box.tags) if box.tags is not None else None,
+        'source': box.source,
+        'track_id': box.track_id,
+        'pin_id': box.pin_id,
+        'review_state': box.review_state,
+        'prev_box_id': box.prev_box_id,
+        'feedback_id': box.feedback_id,
+        'feedback_label': box.feedback_label,
+        'match_confidence': box.match_confidence,
+        'identity_confirmed': box.identity_confirmed,
+        'identity_inferred': box.identity_inferred,
+        'identity_rejections': box.identity_rejections,
+        'bounds_adjustment': box.bounds_adjustment,
+        'bounds_direct': box.bounds_direct,
+    }
+
 
 @dataclass(frozen=True)
 class BoxSnapshot:
     frame: int
     position: int
     box: BoxData
-    values: dict[str, Any]
+    values: dict[str, HistoryValue]
 
     @property
     def location(self) -> tuple[int, int]:
@@ -30,7 +53,7 @@ class BoxChange:
     box: BoxData
     before_location: tuple[int, int] | None
     after_location: tuple[int, int] | None
-    changed_fields: dict[str, tuple[Any, Any]]
+    changed_fields: dict[str, tuple[HistoryValue, HistoryValue]]
 
 
 @dataclass(frozen=True)
@@ -59,7 +82,11 @@ class HistoryEntry:
                     inserts.append((destination[0], destination[1], change.box))
             for field, (before, after) in change.changed_fields.items():
                 value = before if undo else after
-                setattr(change.box, field, list(value) if field == 'tags' and value is not None else value)
+                if field == 'tags':
+                    change.box.tags = (list(cast(tuple[str, ...], value))
+                                       if value is not None else None)
+                else:
+                    setattr(change.box, field, value)
         for frame, position, box in sorted(inserts, key=lambda item: item[:2]):
             boxes = frames.setdefault(frame, [])
             boxes.insert(min(position, len(boxes)), box)
@@ -75,9 +102,7 @@ def snapshot(frames: dict[int, list[BoxData]]) -> dict[int, BoxSnapshot]:
     result: dict[int, BoxSnapshot] = {}
     for frame, boxes in frames.items():
         for position, box in enumerate(boxes):
-            values = {field: getattr(box, field) for field in _FIELDS}
-            values['tags'] = tuple(box.tags) if box.tags is not None else None
-            result[id(box)] = BoxSnapshot(frame, position, box, values)
+            result[id(box)] = BoxSnapshot(frame, position, box, _box_values(box))
     return result
 
 
@@ -97,9 +122,7 @@ def make_entry(before: dict[int, BoxSnapshot], after: dict[int, BoxSnapshot],
         elif old:
             # A box can be edited and then merged away in one owner action.
             # Record those field changes so undo restores its pre-action state.
-            current = {field: getattr(old.box, field) for field in _FIELDS}
-            current['tags'] = (tuple(old.box.tags)
-                               if old.box.tags is not None else None)
+            current = _box_values(old.box)
             fields = {field: (old.values[field], current[field])
                       for field in _FIELDS
                       if old.values[field] != current[field]}

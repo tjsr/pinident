@@ -3,7 +3,7 @@ import os
 import tempfile
 from collections import defaultdict, deque
 from copy import copy, deepcopy
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from threading import Event
 from time import perf_counter
 from typing import Callable, List, Dict
@@ -21,7 +21,8 @@ from detection_feedback import (FeedbackModel, FeedbackStore,
 from frame_processing import FrameJob, FrameResult, process_frame
 from frame_presence import FramePresence, checkbox_values, marked_pin_count
 from controlspanel import ControlsPanel
-from settings_dialog import SettingsDialog
+from settings_dialog import (SettingsDialog, load_detection_resolution,
+                             save_detection_resolution)
 from shutdown_progress import ShutdownProgressDialog
 from trained_detection_model import (TrainedDetectionModel, examples_digest,
                                      metadata_path, model_path_for_feedback,
@@ -684,7 +685,15 @@ class ScrubberFrame(wx.Frame):
                                                HistoryEntry] | None = None
         self._feedback_source = feedback_source or f'session:{uuid4().hex}'
         self._feedback_store = FeedbackStore(feedback_path)
-        self._feedback_model = FeedbackModel(self._feedback_store)
+        self._feedback_deferred = (self._feedback_store.path != ':memory:' and
+                                   self._feedback_store.example_count() >= 1000)
+        self._feedback_model = FeedbackModel(self._feedback_store,
+                                             load=not self._feedback_deferred)
+        self._feedback_load_executor = (ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='pin-feedback')
+            if self._feedback_deferred else None)
+        self._feedback_load_future: Future[tuple[FeedbackModel, str | None]] | None = None
+        self._feedback_load_cancel = Event()
         self._pin_catalog = PinCatalog(catalog_path) if catalog_path else PinCatalog()
         self._training_future: Future | None = None
         self._model_training_future: Future | None = None
@@ -702,15 +711,16 @@ class ScrubberFrame(wx.Frame):
                 self._trained_model_path.is_file()):
             try:
                 saved_model = TrainedDetectionModel.load(self._trained_model_path)
-                if (saved_model.catalog_state ==
+                self._feedback_model.trained_model = saved_model
+                if self._feedback_deferred:
+                    getLog().info('Saved classifier freshness check queued with feedback load')
+                elif not (saved_model.catalog_state ==
                         self._pin_catalog.stock_training_state() and
                         saved_model.review_digest ==
                         examples_digest(self._feedback_store.examples())):
-                    self._feedback_model.trained_model = saved_model
-                else:
                     getLog().warning(
-                        'Saved classifier is stale for current reviews or Pinpanion catalog; '
-                        'run training again')
+                        'Using saved classifier trained on older reviews or Pinpanion '
+                        'catalog; run training again to include the latest')
             except (OSError, ValueError, KeyError, cv2.error):
                 getLog().exception('Could not load trained classifier from %s',
                                    self._trained_model_path)
@@ -731,6 +741,7 @@ class ScrubberFrame(wx.Frame):
         self._playback_step = False
         self._playing = False
         self._play_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pin-detection')
+        self._detection_resolution = load_detection_resolution()
         self._pending_frame_job: Future[FrameResult] | None = None
         self._pending_reconcile: Future[bool] | None = None
         self._pending_reconcile_index: int | None = None
@@ -833,6 +844,8 @@ class ScrubberFrame(wx.Frame):
         status = self.CreateStatusBar(2)
         status.SetStatusWidths([-3, -2])
         self._update_feedback_status()
+        if self._feedback_deferred:
+            status.SetStatusText('Loading reviewed-crop descriptors after window opens...', 0)
 
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key_down)
         self.Bind(wx.EVT_SHOW, self.on_show)
@@ -1153,6 +1166,8 @@ class ScrubberFrame(wx.Frame):
             return False
         matcher = self._pin_matcher
         feedback = self._feedback_model.snapshot_for_processing()
+        size_context = ([deepcopy(box) for box in self.__frame_boxes.get(index, [])]
+                        if target_box is None else None)
         revision = self._annotation_revision
         started = perf_counter()
         def scan() -> list[BoxData] | None:
@@ -1162,7 +1177,8 @@ class ScrubberFrame(wx.Frame):
             result = identify_candidates(
                 image, [copy for _, _, copy in candidates], matcher,
                 best_effort=best_effort, feedback_model=feedback,
-                prefer_reviewed_identity=best_effort)
+                prefer_reviewed_identity=best_effort,
+                size_context=size_context)
             getLog().info('frame=%d catalog=%.1fms candidates=%d thread=worker',
                           index, (perf_counter() - started) * 1000, len(result))
             return result
@@ -1226,8 +1242,14 @@ class ScrubberFrame(wx.Frame):
             getLog().debug('frame=%d catalog result skipped after box changed', index)
             return
         changed = False
-        for (original, _before, _worker_copy), result in zip(candidates, analyzed):
+        for (original, before, _worker_copy), result in zip(candidates, analyzed):
             if result.pin_id is None:
+                if (before.pin_id is not None and not result.identity_confirmed and
+                        not result.tags and original.pin_id is not None):
+                    original.pin_id = None
+                    original.tags = []
+                    original.match_confidence = None
+                    changed = True
                 continue
             if (original.pin_id, original.tags, original.match_confidence) != (
                     result.pin_id, result.tags, result.match_confidence):
@@ -1247,7 +1269,9 @@ class ScrubberFrame(wx.Frame):
                 self._sync_presence_ui()
             if target_only and best_effort:
                 self.SetStatusText(
-                    f'Frame {index}: suggested {(analyzed[0].tags or [analyzed[0].pin_id])[0]}'
+                    (f'Frame {index}: suggested {(analyzed[0].tags or [analyzed[0].pin_id])[0]}'
+                     if analyzed[0].pin_id else
+                     f'Frame {index}: cleared unverified identity suggestion')
                     if changed else
                     f'Frame {index}: no other pin identity match for selected area', 1)
             if not self._playing:
@@ -1328,10 +1352,19 @@ class ScrubberFrame(wx.Frame):
             self.SetStatusText(f'Frame {index}: could not decode selected area', 1)
             return
         if result.pin_id is None:
-            self.SetStatusText(
-                f'Frame {index}: no new identity match; current suggestion unchanged'
-                if box.pin_id else
-                f'Frame {index}: no pin identity match for selected area', 1)
+            if box.pin_id is not None and not box.identity_confirmed and not result.tags:
+                self._begin_history()
+                box.pin_id = None
+                box.tags = []
+                box.match_confidence = None
+                self._finish_history()
+                self.__image_panel.Refresh()
+                self.__tag_panel.boxes = self.__current_boxes
+                self._sync_presence_ui()
+                self._schedule_reconciliation(index)
+                self.SetStatusText(f'Frame {index}: cleared unverified identity suggestion', 1)
+            else:
+                self.SetStatusText(f'Frame {index}: no pin identity match for selected area', 1)
             return
         label = (result.tags or [result.pin_id])[0]
         if (box.identity_confirmed or
@@ -1490,7 +1523,76 @@ class ScrubberFrame(wx.Frame):
         if event.IsShown():
             self.GetChildren()[0].Layout()  # main_panel.Layout()
             self.display_image()
+            if self._feedback_deferred:
+                wx.CallAfter(self._start_feedback_load)
         event.Skip()
+
+    def _start_feedback_load(self) -> None:
+        if (self._closing or not self._feedback_deferred or
+                self._feedback_load_future is not None or
+                self._feedback_load_executor is None):
+            return
+        path = self._feedback_store.path
+        ui_changes = self._feedback_store.db.total_changes
+        trained = self._feedback_model.trained_model
+        self.SetStatusText('Loading reviewed-crop descriptors...', 0)
+
+        def progress(done: int, total: int) -> None:
+            if self._feedback_load_cancel.is_set():
+                raise CancelledError()
+            wx.CallAfter(self._feedback_load_progress, done, total)
+
+        def load() -> tuple[FeedbackModel, str | None]:
+            worker_store = FeedbackStore(path)
+            try:
+                model = FeedbackModel(worker_store, load=False)
+                model.reload(progress)
+                digest = (examples_digest(worker_store.examples())
+                          if isinstance(trained, TrainedDetectionModel) else None)
+                return model, digest
+            finally:
+                worker_store.close()
+
+        future = self._feedback_load_executor.submit(load)
+        self._feedback_load_future = future
+        future.add_done_callback(lambda done: wx.CallAfter(
+            self._finish_feedback_load, done, ui_changes))
+
+    def _feedback_load_progress(self, done: int, total: int) -> None:
+        if not self._closing and self._feedback_deferred:
+            self.SetStatusText(f'Loading reviewed crops: {done:,}/{total:,}', 0)
+
+    def _finish_feedback_load(self, future: Future[tuple[FeedbackModel, str | None]],
+                              ui_changes: int) -> None:
+        if self._closing or future is not self._feedback_load_future:
+            return
+        self._feedback_load_future = None
+        try:
+            model, digest = future.result()
+        except Exception:
+            getLog().exception('Could not load reviewed-crop descriptors')
+            self.SetStatusText('Feedback loading failed; see console log', 0)
+            return
+        if self._feedback_store.db.total_changes != ui_changes:
+            self._start_feedback_load()
+            return
+        model.store = self._feedback_store
+        model.trained_model = self._feedback_model.trained_model
+        model.version = max(model.version, self._feedback_model.version) + 1
+        self.pause_playback()
+        self._feedback_model = model
+        self._feedback_deferred = False
+        if (isinstance(model.trained_model, TrainedDetectionModel) and
+                (digest != model.trained_model.review_digest or
+                 model.trained_model.catalog_state !=
+                 self._pin_catalog.stock_training_state())):
+            getLog().warning(
+                'Using saved classifier trained on older reviews or Pinpanion catalog; '
+                'run training again to include the latest')
+        self._update_feedback_status()
+        if self._feedback_load_executor is not None:
+            self._feedback_load_executor.shutdown(wait=False)
+            self._feedback_load_executor = None
 
     def on_key_down(self, event: wx.KeyEvent):
         keycode = event.GetKeyCode()
@@ -1627,11 +1729,24 @@ class ScrubberFrame(wx.Frame):
                 changed = True
         return changed
 
-    def _sync_automatic_consolidation(self, *, invalidate: bool = True) -> None:
-        before = snapshot(self.__frame_boxes)
-        if not self._consolidate_frames():
-            return
-        entry = make_entry(before, snapshot(self.__frame_boxes),
+    def _sync_automatic_consolidation(self, *, invalidate: bool = True,
+                                      frame_index: int | None = None) -> None:
+        if frame_index is None:
+            before = snapshot(self.__frame_boxes)
+            if not self._consolidate_frames():
+                return
+            after = snapshot(self.__frame_boxes)
+        else:
+            # Playback changes only its destination frame. Avoid copying and
+            # scanning thousands of unrelated saved observations each frame.
+            boxes = self.__frame_boxes.get(frame_index, [])
+            kept, removed = consolidate_overlapping_boxes(boxes)
+            if not removed:
+                return
+            before = snapshot({frame_index: boxes})
+            boxes[:] = kept
+            after = snapshot({frame_index: boxes})
+        entry = make_entry(before, after,
                            self._rotation_angle, self._rotation_angle)
         self._sync_feedback_for_entry(entry)
         self._prune_linked_feedback()
@@ -1767,6 +1882,7 @@ class ScrubberFrame(wx.Frame):
                             box.review_state == 'confirmed'}
         stored = self._feedback_store.metadata_for_source(self._feedback_source)
         active_ids: set[str] = set()
+        changed_ids: set[str] = set()
         for frame_index, boxes in sorted(self.__frame_boxes.items()):
             for box in boxes:
                 if box.feedback_label is None:
@@ -1804,16 +1920,18 @@ class ScrubberFrame(wx.Frame):
                         tuple(tag for tag in box.tags or [] if tag.strip())
                         if box.feedback_label == 'positive' else ()))
                     active_ids.add(box.feedback_id)
+                    changed_ids.add(box.feedback_id)
                 except ValueError as error:
                     getLog().warning(f'Skipping invalid feedback crop: {error}')
         for item in reviewed_observations(self.__frame_boxes, self._feedback_source):
             if (item.example_id.startswith(LINKED_POSITIVE_PREFIX) and
                     stored.get(item.example_id) == observation_metadata(item)):
                 active_ids.add(item.example_id)
+        changed_ids.update(set(stored) - active_ids)
         self._feedback_store.delete_missing_source(self._feedback_source, active_ids)
-        self._feedback_model.reload()
-        self._discard_stale_local_classifier()
-        self._update_feedback_status()
+        if changed_ids:
+            self._feedback_model.refresh(changed_ids)
+            self._update_feedback_status()
 
     def _discard_stale_local_classifier(self) -> None:
         trained = self._feedback_model.trained_model
@@ -1902,9 +2020,14 @@ class ScrubberFrame(wx.Frame):
             cloud_status=self._cloud_status,
             cloud_cache_path=(self._trained_model_path.with_suffix('.cloud.json')
                               if self._trained_model_path is not None else None),
+            detection_resolution=self._detection_resolution,
         )
         try:
             dialog.ShowModal()
+            chosen = dialog.detection_resolution
+            if chosen in ('regular', 'low') and chosen != self._detection_resolution:
+                self._detection_resolution = chosen
+                save_detection_resolution(chosen)
         finally:
             dialog.Destroy()
 
@@ -1974,8 +2097,14 @@ class ScrubberFrame(wx.Frame):
             model, events, cursor, has_more = future.result()
             changed = apply_reviews(self._feedback_store, events, cursor) if self._cloud_config.token else 0
             if changed:
-                self._feedback_model.reload()
-                self._discard_stale_local_classifier()
+                if self._feedback_deferred:
+                    # The background loader will see the UI connection's changed
+                    # revision and retry. A synchronous reload here would decode
+                    # the full store before the startup window can respond.
+                    self._feedback_model.trained_model = None
+                else:
+                    self._feedback_model.reload()
+                    self._discard_stale_local_classifier()
                 self._update_feedback_status()
             if model is not None and model[0] > self._cloud_model_version:
                 version, classifier = model
@@ -2317,6 +2446,7 @@ class ScrubberFrame(wx.Frame):
             return
         event.Veto()
         self._closing = True
+        self._feedback_load_cancel.set()
         self._cloud_timer.Stop()
         self._shutdown_dialog = ShutdownProgressDialog(self)
         self._shutdown_timer = wx.Timer(self._shutdown_dialog)
@@ -2353,7 +2483,9 @@ class ScrubberFrame(wx.Frame):
             # thread before placing the final queue barriers.
             if (self._cloud_sync_future is not None or
                     self._training_future is not None or
-                    self._model_training_future is not None):
+                    self._model_training_future is not None or
+                    (self._feedback_load_future is not None and
+                     not self._feedback_load_future.done())):
                 dialog.set_percent(10)
                 return
             if self._shutdown_play_barrier is None:
@@ -2397,6 +2529,10 @@ class ScrubberFrame(wx.Frame):
                     dialog.Destroy()
                     self._shutdown_dialog = None
                     self._closing = False
+                    self._feedback_load_cancel.clear()
+                    if self._feedback_deferred:
+                        self._feedback_load_future = None
+                        self._start_feedback_load()
                     self._shutdown_stage = 0
                     self._shutdown_prepared = False
                     self._shutdown_save_future = None
@@ -2421,6 +2557,8 @@ class ScrubberFrame(wx.Frame):
             self._shutdown_reader_future.result()
             self._play_executor.shutdown(wait=False)
             self._sync_executor.shutdown(wait=False)
+            if self._feedback_load_executor is not None:
+                self._feedback_load_executor.shutdown(wait=False)
             if self._shutdown_save_executor is not None:
                 self._shutdown_save_executor.shutdown(wait=False)
             self._feedback_store.close()
@@ -2910,6 +3048,7 @@ class ScrubberFrame(wx.Frame):
             allow_motion_fallback=previous_index is not None,
             catalog_best_effort=catalog_best_effort,
             diagnostic_run_id=diagnostic_run_id,
+            low_resolution=self._detection_resolution == 'low',
         )
         generation = self._play_generation
         revision = self._annotation_revision
@@ -2917,11 +3056,13 @@ class ScrubberFrame(wx.Frame):
         self._pending_frame_job = future
         future.add_done_callback(
             lambda completed: wx.CallAfter(self._complete_play_job, completed,
-                                           generation, revision, requires_play))
+                                           generation, revision, requires_play,
+                                           started))
         getLog().info('frame=%d ui submit=%.1fms', target, (perf_counter()-started)*1000)
 
     def _complete_play_job(self, future: Future[FrameResult], generation: int,
-                           revision: int, requires_play: bool) -> None:
+                           revision: int, requires_play: bool,
+                           submitted_at: float) -> None:
         if self._closing or future is not self._pending_frame_job:
             return
         if (generation != self._play_generation or
@@ -3000,7 +3141,8 @@ class ScrubberFrame(wx.Frame):
         if not requires_play:
             propagate_rejections(self.__frame_boxes)
             propagate_confirmations(self.__frame_boxes)
-        self._sync_automatic_consolidation()
+        self._sync_automatic_consolidation(
+            frame_index=target if requires_play else None)
         self.__matched_frames.add(target)
         self.__detected_frames.add(target)
         if requires_play and not self.frame_has_boxes(target):
@@ -3026,7 +3168,17 @@ class ScrubberFrame(wx.Frame):
         if target >= self.__num_frames - 1:
             self.pause_playback()
         elif requires_play and self._playing:
-            self._play_timer.StartOnce(50)
+            elapsed_ms = (perf_counter() - submitted_at) * 1000
+            self._play_timer.StartOnce(self.playback_delay_ms(
+                self.playback_frame_interval_ms(), elapsed_ms))
+
+    def playback_frame_interval_ms(self) -> int:
+        return 50
+
+    @staticmethod
+    def playback_delay_ms(frame_interval_ms: int, elapsed_ms: float) -> int:
+        """Avoid an extra idle gap after a frame already missed its deadline."""
+        return max(1, round(frame_interval_ms - elapsed_ms))
 
     def _log_detection_display(self, result: FrameResult) -> None:
         """Record both coordinate spaces for an explicit Detect Pins run."""

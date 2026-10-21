@@ -1,4 +1,5 @@
 import type { Coords, PixelFrame } from './scanner.js';
+import type { JsonInput, JsonRecord } from './json_input.js';
 
 const GRID = 16;
 const FEATURE_LENGTH = GRID * GRID + 2;
@@ -14,17 +15,17 @@ export interface MobileModel {
   bias: number;
 }
 
-export function parseMobileModel(value: unknown): MobileModel {
+export function parseMobileModel(value: JsonInput): MobileModel {
   if (typeof value !== 'object' || value === null) throw new Error('Invalid mobile model.');
-  const row = value as Record<string, unknown>;
-  const counts = row.sample_counts as Record<string, unknown> | undefined;
+  const row = value as JsonRecord;
+  const counts = row.sample_counts as JsonRecord | undefined;
   if (row.format !== 'pinident-linear-svm' || row.version !== 1 ||
       row.feature_version !== 2 || typeof row.training_digest !== 'string' ||
       !/^[a-f0-9]{64}$/.test(row.training_digest) ||
       !counts || !Number.isInteger(counts.positive) || !Number.isInteger(counts.negative) ||
       (counts.positive as number) < 1 || (counts.negative as number) < 1 ||
       !Array.isArray(row.weights) || row.weights.length !== FEATURE_LENGTH ||
-      !row.weights.every((weight: unknown) => typeof weight === 'number' && Number.isFinite(weight)) ||
+      !row.weights.every((weight: JsonInput) => typeof weight === 'number' && Number.isFinite(weight)) ||
       typeof row.bias !== 'number' || !Number.isFinite(row.bias)) {
     throw new Error('Unsupported or damaged mobile model.');
   }
@@ -87,6 +88,6 @@ export async function loadMobileModel(): Promise<MobileModel | null> {
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`Model download failed (${response.status}).`);
   if (!response.headers.get('content-type')?.includes('application/json')) return null;
-  const model: unknown = await response.json();
+  const model = await response.json() as JsonInput;
   return parseMobileModel(model);
 }

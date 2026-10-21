@@ -1,9 +1,24 @@
-"""Read-only locations and status for the desktop editor's local data."""
+"""Local data locations, status, and detection resolution for the editor."""
 
 from datetime import datetime
 from pathlib import Path
 
 import wx
+
+DETECTION_RESOLUTIONS = ('regular', 'low')
+_RESOLUTION_LABELS = ('Regular (full video resolution)',
+                      'Low (faster; detect and track at 640 px)')
+
+
+def load_detection_resolution() -> str:
+    value = wx.Config('Pinident').Read('detection_resolution', 'regular')
+    return value if value in DETECTION_RESOLUTIONS else 'regular'
+
+
+def save_detection_resolution(value: str) -> None:
+    config = wx.Config('Pinident')
+    config.Write('detection_resolution', value)
+    config.Flush()
 
 
 def storage_location(path: str | Path | None) -> tuple[str, str]:
@@ -27,7 +42,8 @@ class SettingsDialog(wx.Dialog):
                  model_active: bool = False, model_current: bool = False,
                  catalog_training_summary: str = '',
                  cloud_origin: str | None = None, cloud_status: str = 'Not checked',
-                 cloud_cache_path: str | Path | None = None):
+                 cloud_cache_path: str | Path | None = None,
+                 detection_resolution: str = 'regular'):
         super().__init__(parent, title='Settings', size=(740, 660),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         layout = wx.BoxSizer(wx.VERTICAL)
@@ -85,8 +101,20 @@ class SettingsDialog(wx.Dialog):
             cloud.Wrap(690)
             layout.Add(cloud, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
         layout.AddStretchSpacer()
+        self.resolution_choice = wx.RadioBox(
+            self, label='Detection resolution during Play and Detect Pins',
+            choices=list(_RESOLUTION_LABELS), majorDimension=1,
+            style=wx.RA_SPECIFY_COLS)
+        self.resolution_choice.SetSelection(
+            DETECTION_RESOLUTIONS.index(detection_resolution)
+            if detection_resolution in DETECTION_RESOLUTIONS else 0)
+        layout.Add(self.resolution_choice, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
         close = self.CreateButtonSizer(wx.OK)
         layout.Add(close, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
         self.SetSizer(layout)
         self.SetMinSize((740, 600))
         self.Fit()
+
+    @property
+    def detection_resolution(self) -> str:
+        return DETECTION_RESOLUTIONS[self.resolution_choice.GetSelection()]

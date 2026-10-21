@@ -224,7 +224,11 @@ def test_training_button_indexes_session_and_reports_completion(tmp_path):
         assert window._feedback_store.examples()[0].tags == ('Mario',)
         assert (tmp_path / 'session.json').is_file()
         assert not (tmp_path / 'feedback.svm.yml').exists()
-        window._seed_feedback_from_annotations()
+        revision_before_import = window._feedback_model.version
+        with patch.object(window._feedback_model, 'reload',
+                          side_effect=AssertionError('reloaded unchanged feedback')):
+            window._seed_feedback_from_annotations()
+        assert window._feedback_model.version == revision_before_import
         assert window._feedback_store.counts() == {'positive': 2, 'negative': 1}
         revision = window._feedback_model.version
         with patch.object(window, 'read_frame_for_processing',
@@ -281,7 +285,8 @@ def test_training_button_indexes_session_and_reports_completion(tmp_path):
 
 
 @pytest.mark.gui
-def test_drawn_unidentified_pins_are_reported_and_used_for_training(tmp_path):
+def test_drawn_unidentified_pins_are_reported_and_used_for_training(tmp_path, monkeypatch):
+    monkeypatch.delenv('PINIDENT_SYNC_TOKEN', raising=False)
     app = wx.App.Get() or wx.App(False)
     image = textured_frame()
     window = VideoScrubber(None, 'Unidentified pin training', '',

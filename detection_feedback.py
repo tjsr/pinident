@@ -12,6 +12,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterator
 
 import cv2
 import numpy as np
@@ -22,6 +23,9 @@ from pin_catalog import PinMatch
 
 
 DEFAULT_FEEDBACK_DB = Path(__file__).with_name('detection_feedback.sqlite3')
+DESCRIPTOR_VERSION = 1
+_GRAY_BYTES = 32 * 32 * np.dtype(np.float32).itemsize
+_CHROMA_BYTES = 2 * np.dtype(np.float32).itemsize
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,10 @@ class FeedbackStore:
     def __init__(self, path: str | Path | None = None):
         self.path = str(path) if path is not None else ':memory:'
         self.db = sqlite3.connect(self.path)
+        if self.path != ':memory:':
+            # The wx connection must remain writable while the startup worker
+            # reads and upgrades descriptors through its own connection.
+            self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute("""CREATE TABLE IF NOT EXISTS feedback_examples (
             example_id TEXT PRIMARY KEY,
             label TEXT NOT NULL CHECK(label IN ('positive', 'negative')),
@@ -85,7 +93,22 @@ class FeedbackStore:
             crop_png BLOB NOT NULL,
             tags_json TEXT NOT NULL,
             rights_status TEXT NOT NULL DEFAULT 'unverified')""")
+        for table in ('feedback_examples', 'identity_rejections'):
+            columns = {row[1] for row in self.db.execute(f'PRAGMA table_info({table})')}
+            for name, kind in (('descriptor_version', 'INTEGER'),
+                               ('descriptor_gray', 'BLOB'),
+                               ('descriptor_chroma', 'BLOB')):
+                if name not in columns:
+                    self.db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {kind}')
         self.db.commit()
+
+    @staticmethod
+    def _descriptor_columns(crop_png: bytes) -> tuple[int, bytes | None, bytes | None]:
+        descriptor = _descriptor_from_png(crop_png)
+        if descriptor is None:
+            return DESCRIPTOR_VERSION, None, None
+        gray, chroma = descriptor
+        return DESCRIPTOR_VERSION, gray.tobytes(), chroma.tobytes()
 
     def save_identity_rejection(self, example: FeedbackExample) -> None:
         """Retain a wrong-name crop without treating it as a non-pin."""
@@ -95,17 +118,23 @@ class FeedbackStore:
             self._upsert_identity_rejection(example)
 
     def _upsert_identity_rejection(self, example: FeedbackExample) -> None:
+        version, gray, chroma = self._descriptor_columns(example.crop_png)
         self.db.execute("""INSERT INTO identity_rejections
             (example_id, source_path, frame_index, track_id, pin_id,
-             coords_json, crop_png, tags_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             coords_json, crop_png, tags_json, descriptor_version,
+             descriptor_gray, descriptor_chroma)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(example_id) DO UPDATE SET
             source_path=excluded.source_path, frame_index=excluded.frame_index,
             track_id=excluded.track_id, pin_id=excluded.pin_id,
             coords_json=excluded.coords_json, crop_png=excluded.crop_png,
-            tags_json=excluded.tags_json""",
+            tags_json=excluded.tags_json,
+            descriptor_version=excluded.descriptor_version,
+            descriptor_gray=excluded.descriptor_gray,
+            descriptor_chroma=excluded.descriptor_chroma""",
             (example.example_id, example.source_path, example.frame_index,
              example.track_id, example.pin_id, json.dumps(example.coords),
-             example.crop_png, json.dumps(example.tags)))
+             example.crop_png, json.dumps(example.tags), version, gray, chroma))
 
     def delete_identity_rejection(self, example_id: str) -> None:
         with self.db:
@@ -149,18 +178,79 @@ class FeedbackStore:
             self._upsert(example)
 
     def _upsert(self, example: FeedbackExample) -> None:
+        version, gray, chroma = self._descriptor_columns(example.crop_png)
         self.db.execute("""INSERT INTO feedback_examples
                 (example_id, label, source_path, frame_index, track_id, pin_id,
-                 coords_json, crop_png, rights_status, tags_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unverified', ?)
+                 coords_json, crop_png, rights_status, tags_json,
+                 descriptor_version, descriptor_gray, descriptor_chroma)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unverified', ?, ?, ?, ?)
                 ON CONFLICT(example_id) DO UPDATE SET
                 label=excluded.label, source_path=excluded.source_path,
                 frame_index=excluded.frame_index, track_id=excluded.track_id,
                 pin_id=excluded.pin_id, coords_json=excluded.coords_json,
-                crop_png=excluded.crop_png, tags_json=excluded.tags_json""",
+                crop_png=excluded.crop_png, tags_json=excluded.tags_json,
+                descriptor_version=excluded.descriptor_version,
+                descriptor_gray=excluded.descriptor_gray,
+                descriptor_chroma=excluded.descriptor_chroma""",
                 (example.example_id, example.label, example.source_path,
                  example.frame_index, example.track_id, example.pin_id,
-                 json.dumps(example.coords), example.crop_png, json.dumps(example.tags)))
+                 json.dumps(example.coords), example.crop_png, json.dumps(example.tags),
+                 version, gray, chroma))
+
+    def example_count(self) -> int:
+        return sum(int(self.db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0])
+                   for table in ('feedback_examples', 'identity_rejections'))
+
+    def descriptor_rows(self, progress: Callable[[int, int], None] | None = None
+                        ) -> Iterator[tuple[str, str, str | None, str,
+                                            np.ndarray, np.ndarray]]:
+        """Yield usable cached vectors, upgrading legacy crops in bounded batches."""
+        total = self.example_count()
+        done = 0
+        for table, label_column in (('feedback_examples', 'label'),
+                                    ('identity_rejections', "'wrong_identity'")):
+            upper_rowid = int(self.db.execute(
+                f'SELECT COALESCE(MAX(rowid), 0) FROM {table}').fetchone()[0])
+            last_rowid = 0
+            while batch := self.db.execute(f'''SELECT rowid, example_id,
+                {label_column}, pin_id, tags_json, descriptor_version,
+                descriptor_gray, descriptor_chroma FROM {table}
+                WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT 64''',
+                (last_rowid, upper_rowid)).fetchall():
+                last_rowid = batch[-1][0]
+                updates: list[tuple[int, bytes | None, bytes | None, str,
+                                    int, int, int]] = []
+                for (_rowid, example_id, label, pin_id, tags_json, version,
+                     gray_blob, chroma_blob) in batch:
+                    descriptor = _decode_descriptor(version, gray_blob, chroma_blob)
+                    if version != DESCRIPTOR_VERSION or descriptor is None and (
+                            gray_blob is not None or chroma_blob is not None):
+                        crop = self.db.execute(
+                            f'SELECT crop_png FROM {table} WHERE example_id = ?',
+                            (example_id,)).fetchone()
+                        if crop is not None:
+                            version, gray_blob, chroma_blob = self._descriptor_columns(crop[0])
+                            updates.append((version, gray_blob, chroma_blob,
+                                            example_id, DESCRIPTOR_VERSION,
+                                            _GRAY_BYTES, _CHROMA_BYTES))
+                            descriptor = _decode_descriptor(version, gray_blob, chroma_blob)
+                    if descriptor is not None:
+                        tags: tuple[str, ...] = tuple(json.loads(tags_json))
+                        name = next((tag for tag in tags if tag.strip()), pin_id or '')
+                        yield example_id, label, pin_id, name, *descriptor
+                    done += 1
+                if updates:
+                    with self.db:
+                        self.db.executemany(f'''UPDATE {table}
+                            SET descriptor_version = ?, descriptor_gray = ?,
+                                descriptor_chroma = ?
+                            WHERE example_id = ? AND
+                                (descriptor_version IS NULL OR descriptor_version != ?
+                                 OR COALESCE(length(descriptor_gray), -1) != ?
+                                 OR COALESCE(length(descriptor_chroma), -1) != ?)''',
+                            updates)
+                if progress is not None:
+                    progress(done, total)
 
     def replace_source(self, source_path: str, examples: list[FeedbackExample]) -> None:
         """Apply a complete annotation snapshot without leaving stale source crops."""
@@ -279,6 +369,21 @@ def _descriptor(crop: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
     return gray.ravel(), chroma
 
 
+def _descriptor_from_png(crop_png: bytes) -> tuple[np.ndarray, np.ndarray] | None:
+    bgr = cv2.imdecode(np.frombuffer(crop_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return _descriptor(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)) if bgr is not None else None
+
+
+def _decode_descriptor(version: int | None, gray_blob: bytes | None,
+                       chroma_blob: bytes | None
+                       ) -> tuple[np.ndarray, np.ndarray] | None:
+    if (version != DESCRIPTOR_VERSION or gray_blob is None or chroma_blob is None or
+            len(gray_blob) != _GRAY_BYTES or len(chroma_blob) != _CHROMA_BYTES):
+        return None
+    return (np.frombuffer(gray_blob, dtype=np.float32),
+            np.frombuffer(chroma_blob, dtype=np.float32))
+
+
 def _classifier_feature(descriptor: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
     gray, chroma = descriptor
     return np.concatenate((gray, chroma / 80.0 * 0.15)).astype(np.float32)
@@ -287,18 +392,20 @@ def _classifier_feature(descriptor: tuple[np.ndarray, np.ndarray]) -> np.ndarray
 class FeedbackModel:
     """Use reviewed crops to rank proposals and suppress very close negatives."""
 
-    def __init__(self, store: FeedbackStore):
+    def __init__(self, store: FeedbackStore, *, load: bool = True):
         self.store = store
         self.version = 0
         self.trained_model = None
-        self.reload()
-
-    def reload(self) -> None:
         self._samples: dict[str, tuple[str, str | None, str, np.ndarray, np.ndarray]] = {}
-        for example in self.store.examples():
-            self._load_example(example)
-        for example in self.store.identity_rejections():
-            self._load_example(example)
+        self._rebuild_vectors()
+        if load:
+            self.reload()
+
+    def reload(self, progress: Callable[[int, int], None] | None = None) -> None:
+        samples: dict[str, tuple[str, str | None, str, np.ndarray, np.ndarray]] = {}
+        for example_id, label, pin_id, name, gray, chroma in self.store.descriptor_rows(progress):
+            samples[example_id] = label, pin_id, name, gray, chroma
+        self._samples = samples
         self._rebuild_vectors()
         self.version += 1
 
@@ -331,11 +438,7 @@ class FeedbackModel:
         return snapshot
 
     def _load_example(self, example: FeedbackExample) -> None:
-        encoded = np.frombuffer(example.crop_png, dtype=np.uint8)
-        bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-        if bgr is None:
-            return
-        descriptor = _descriptor(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        descriptor = _descriptor_from_png(example.crop_png)
         if descriptor is not None:
             self._samples[example.example_id] = (
                 example.label, example.pin_id,
@@ -414,12 +517,28 @@ class FeedbackModel:
         colour = np.maximum(0.0, 1.0 - np.linalg.norm(colours - chroma, axis=1) / 80.0)
         return float(np.max(0.85 * texture + 0.15 * colour))
 
+    def _best_similarities(self, descriptors: list[tuple[np.ndarray, np.ndarray]],
+                           label: str) -> np.ndarray:
+        """Score proposal crops together against the stored review matrix."""
+        vectors, colours = self._vectors[label]
+        if vectors is None or colours is None or not descriptors:
+            return np.zeros(len(descriptors), dtype=np.float32)
+        grays = np.stack([gray for gray, _chroma in descriptors])
+        chromas = np.stack([chroma for _gray, chroma in descriptors])
+        texture = np.maximum(0.0, vectors @ grays.T)
+        colour = np.maximum(
+            0.0, 1.0 - np.linalg.norm(
+                colours[:, None, :] - chromas[None, :, :], axis=2) / 80.0)
+        return np.max(0.85 * texture + 0.15 * colour, axis=0)
+
     def filter_and_rank(self, image: np.ndarray,
                         boxes: list[Coordinate]) -> list[Coordinate]:
         scored: list[tuple[float, int, Coordinate]] = []
+        candidates: list[tuple[int, Coordinate, tuple[np.ndarray, np.ndarray], float]] = []
         suppressed = 0
         trained_negative = 0
         unscored = 0
+        trained = self.trained_model
         for index, coords in enumerate(boxes):
             x, y, width, height = coords
             if (width <= 0 or height <= 0 or x < 0 or y < 0 or
@@ -430,7 +549,6 @@ class FeedbackModel:
                 unscored += 1
                 scored.append((0.0, index, coords))
                 continue
-            trained = self.trained_model
             model_penalty = 0.0
             if trained is not None:
                 feature = trained.feature(image[y:y + height, x:x + width])
@@ -440,12 +558,16 @@ class FeedbackModel:
                     # evidence, but a hard veto loses visible pins entirely.
                     trained_negative += 1
                     model_penalty = 0.03
-            positive = self._best_similarity(descriptor, 'positive')
-            negative = self._best_similarity(descriptor, 'negative')
+            candidates.append((index, coords, descriptor, model_penalty))
+        descriptors = [descriptor for _index, _coords, descriptor, _penalty in candidates]
+        positives = self._best_similarities(descriptors, 'positive')
+        negatives = self._best_similarities(descriptors, 'negative')
+        for (index, coords, _descriptor_value, model_penalty), positive, negative in zip(
+                candidates, positives, negatives):
             if negative >= 0.88 and negative > positive + 0.06:
                 suppressed += 1
                 continue
-            scored.append((positive - negative - model_penalty, index, coords))
+            scored.append((float(positive - negative - model_penalty), index, coords))
         scored.sort(key=lambda item: (-item[0], item[1]))
         getLog().info(
             'feedback revision=%d samples=%d/%d proposals=%d suppressed=%d '

@@ -1,4 +1,5 @@
 import type { Coords, PixelFrame } from './scanner.js';
+import { jsonRecord, parseJson, type JsonInput } from './json_input.js';
 
 const GRID = 8;
 const CELLS = GRID * GRID;
@@ -33,9 +34,9 @@ export interface LearnedExamples {
   negative: number[][];
 }
 
-export function parseIdentityIndex(value: unknown): IdentityIndex {
+export function parseIdentityIndex(value: JsonInput): IdentityIndex {
   if (!value || typeof value !== 'object') throw new Error('Invalid catalog reference index.');
-  const row = value as Record<string, unknown>;
+  const row = value as Record<string, JsonInput>;
   if (row.format !== 'pinident-catalog-reference-index' || row.version !== 1 ||
       !Array.isArray(row.catalog_state) || row.catalog_state.length !== 3 ||
       !row.catalog_state.every(item => Number.isSafeInteger(item) && item >= 0) ||
@@ -44,7 +45,8 @@ export function parseIdentityIndex(value: unknown): IdentityIndex {
       !Array.isArray(row.references) || !row.references.length ||
       !row.references.every(value => {
         if (!value || typeof value !== 'object') return false;
-        const item = value as Record<string, unknown>;
+        const item = jsonRecord(value as JsonInput);
+        if (!item) return false;
         return typeof item.pin_id === 'string' && /^pinpanion:\d+$/.test(item.pin_id) &&
           typeof item.name === 'string' && !!item.name.trim() &&
           typeof item.source === 'string' && typeof item.rights === 'string' &&
@@ -130,19 +132,20 @@ export function matchProposal(index: IdentityIndex, frame: PixelFrame, coords: C
   return best;
 }
 
-function validFeature(value: unknown): value is number[] {
+function validFeature(value: JsonInput): value is number[] {
   return Array.isArray(value) && value.length === LENGTH &&
     value.every(part => typeof part === 'number' && Number.isFinite(part));
 }
 
 export function loadLearnedExamples(storage: Pick<Storage, 'getItem'> = localStorage): LearnedExamples {
   try {
-    const value: unknown = JSON.parse(storage.getItem(LEARNED_KEY) ?? 'null');
+    const value = parseJson(storage.getItem(LEARNED_KEY) ?? 'null');
     if (!value || typeof value !== 'object') return { positive: [], negative: [] };
-    const row = value as Record<string, unknown>;
+    const row = value as Record<string, JsonInput>;
     const positive = Array.isArray(row.positive) ? row.positive.filter(item => {
       if (!item || typeof item !== 'object') return false;
-      const reference = item as Record<string, unknown>;
+      const reference = jsonRecord(item as JsonInput);
+      if (!reference) return false;
       return typeof reference.pin_id === 'string' && /^pinpanion:\d+$/.test(reference.pin_id) &&
         typeof reference.name === 'string' && validFeature(reference.feature);
     }) as CatalogReference[] : [];
@@ -186,5 +189,5 @@ export async function loadIdentityIndex(): Promise<IdentityIndex | null> {
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`Catalog reference index download failed (${response.status}).`);
   if (!response.headers.get('content-type')?.includes('application/json')) return null;
-  return parseIdentityIndex(await response.json() as unknown);
+  return parseIdentityIndex(await response.json() as JsonInput);
 }

@@ -1,5 +1,13 @@
 /// <reference lib="webworker" />
 
+type JsonInput = undefined | null | boolean | number | string | object;
+type JsonRecord = Record<string, JsonInput>;
+function parseJson(text: string): JsonInput { return JSON.parse(text) as JsonInput; }
+function jsonRecord(value: JsonInput): JsonRecord | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as JsonRecord : null;
+}
+
 interface Statement {
   bind(...values: (string | number)[]): Statement;
   first<T>(): Promise<T | null>;
@@ -17,20 +25,16 @@ const HEADERS = { 'Content-Type': 'application/json; charset=utf-8',
 function authorized(request: Request, env: Env): boolean {
   return !!env.SYNC_TOKEN && request.headers.get('Authorization') === `Bearer ${env.SYNC_TOKEN}`;
 }
-async function limitedJson(request: Request, limit: number): Promise<unknown> {
+async function limitedJson(request: Request, limit: number): Promise<JsonInput> {
   if (!request.headers.get('Content-Type')?.startsWith('application/json') ||
       Number(request.headers.get('Content-Length')) > limit)
     throw new Error('Invalid or oversized JSON.');
   const body = await request.text();
   if (new TextEncoder().encode(body).byteLength > limit) throw new Error('Invalid or oversized JSON.');
-  return JSON.parse(body) as unknown;
+  return parseJson(body);
 }
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown> : null;
-}
-function validReview(value: unknown): boolean {
-  const row = record(value);
+function validReview(value: JsonInput): boolean {
+  const row = jsonRecord(value);
   const coords = row?.coords;
   return !!row && row.kind === 'training' && typeof row.id === 'string' &&
     /^[a-zA-Z0-9:_-]{8,100}$/.test(row.id) &&
@@ -50,8 +54,8 @@ function validReview(value: unknown): boolean {
     (row.label !== 'pin_identified' ||
       (typeof row.pin_id === 'string' && row.pin_id.length > 0));
 }
-function validAnnotation(value: unknown): boolean {
-  const row = record(value);
+function validAnnotation(value: JsonInput): boolean {
+  const row = jsonRecord(value);
   if (!row || row.kind !== 'annotation' || typeof row.id !== 'string' ||
       !/^[a-zA-Z0-9:_-]{8,100}$/.test(row.id) ||
       typeof row.created_at !== 'string' || Number.isNaN(Date.parse(row.created_at)) ||
@@ -66,7 +70,7 @@ function validAnnotation(value: unknown): boolean {
       row.image_data_url.length >= 900_000 ||
       !Array.isArray(row.boxes) || row.boxes.length > 100) return false;
   return row.boxes.every(value => {
-    const box = record(value);
+    const box = jsonRecord(value);
     const coords = box?.coords;
     return !!box && typeof box.track_id === 'string' &&
       /^[a-zA-Z0-9:_-]{1,100}$/.test(box.track_id) &&
@@ -80,16 +84,16 @@ function validAnnotation(value: unknown): boolean {
       coords[1] + coords[3] <= Number(row.height);
   });
 }
-function validDifficultyMark(value: unknown): value is { id: string; signature: number[] } {
-  const row = record(value);
+function validDifficultyMark(value: JsonInput): value is { id: string; signature: number[] } {
+  const row = jsonRecord(value);
   return !!row && typeof row.id === 'string' &&
     /^[a-zA-Z0-9:_-]{8,100}$/.test(row.id) &&
     Array.isArray(row.signature) && row.signature.length === 36 &&
     row.signature.every(item => typeof item === 'number' && Number.isFinite(item) &&
       item >= -1 && item <= 1);
 }
-function validModel(value: unknown): boolean {
-  const row = record(value), counts = record(row?.sample_counts);
+function validModel(value: JsonInput): boolean {
+  const row = jsonRecord(value), counts = jsonRecord(row?.sample_counts ?? null);
   return !!row && row.format === 'pinident-linear-svm' && row.version === 1 &&
     row.feature_version === 2 && typeof row.training_digest === 'string' &&
     /^[a-f0-9]{64}$/.test(row.training_digest) &&
@@ -121,7 +125,7 @@ async function catalog(): Promise<Response> {
     const body = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
-    const data: unknown = JSON.parse(new TextDecoder().decode(body));
+    const data = parseJson(new TextDecoder().decode(body));
     if (typeof data !== 'object' || data === null || !('pins' in data) ||
         !Array.isArray(data.pins)) throw new Error('Invalid catalog');
     return new Response(body, { headers: {
@@ -201,7 +205,7 @@ export default {
         ).bind(after).all<ReviewRow>();
         const reviews = result.results.map(row => ({
           revision: row.revision, submitted_at: row.submitted_at,
-          review: JSON.parse(row.payload) as unknown
+          review: parseJson(row.payload)
         }));
         return Response.json({ reviews, next: reviews.at(-1)?.revision ?? after }, { headers: HEADERS });
       }
@@ -223,7 +227,7 @@ export default {
       }
       if (url.pathname === '/api/model' && request.method === 'PUT') {
         if (!authorized(request, env)) return new Response('Unauthorized', { status: 401 });
-        const value = record(await limitedJson(request, 100_000));
+        const value = jsonRecord(await limitedJson(request, 100_000));
         if (!value || !validModel(value.model) || !Number.isSafeInteger(value.base_version) ||
             Number(value.base_version) < 0)
           return Response.json({ error: 'Invalid model upload.' }, { status: 400 });

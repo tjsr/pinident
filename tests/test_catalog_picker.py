@@ -54,6 +54,41 @@ def test_typing_east_waits_for_debounce_and_keeps_the_whole_query():
 
 
 @pytest.mark.gui
+def test_catalog_refresh_does_not_erase_name_being_typed() -> None:
+    app = wx.App.Get() or wx.App(False)
+    frame = wx.Frame(None, size=(500, 200))
+    box = BoxData((1, 1, 20, 20), [''], 'user')
+    panel = BoxTagPanelEdit(frame, box, catalog_options=[
+        ('pin:1', 'South East Pin'),
+    ])
+    frame.SetSizer(wx.BoxSizer(wx.VERTICAL))
+    frame.GetSizer().Add(panel, 1, wx.EXPAND)
+    try:
+        frame.Show()
+        frame.Layout()
+        wx.Yield()
+        row = panel.get_or_create_label(0)
+        picker = row._BoxTagLabelRow__text_entry
+        picker.SetValue('Eas')
+        wx.Yield()
+        assert row._edit_pending
+
+        panel.set_catalog_options([
+            ('pin:1', 'South East Pin'),
+            ('pin:2', 'Easter Pin'),
+        ])
+        assert picker.GetValue() == 'Eas'
+        picker.SetInsertionPointEnd()
+        picker.WriteText('ter Pin')
+        row.commit_current_value()
+        wx.Yield()
+        assert (box.tags, box.pin_id) == (['Easter Pin'], 'pin:2')
+    finally:
+        frame.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
 def test_catalog_picker_filters_by_name_and_id_without_losing_selection():
     app = wx.App.Get() or wx.App(False)
     frame = wx.Frame(None)
@@ -144,6 +179,33 @@ def test_catalog_picker_uses_autopopulated_label_as_initial_filter():
 
 
 @pytest.mark.gui
+def test_dropdown_keeps_name_field_ready_for_typing() -> None:
+    app = wx.App.Get() or wx.App(False)
+    frame = wx.Frame(None, size=(500, 240))
+    box = BoxData((1, 1, 20, 20), [''], 'user')
+    panel = BoxTagPanelEdit(frame, box, catalog_options=[('pin:1', 'Easter Pin')])
+    frame.SetSizer(wx.BoxSizer(wx.VERTICAL))
+    frame.GetSizer().Add(panel, 1, wx.EXPAND)
+    try:
+        frame.Show()
+        frame.Layout()
+        wx.Yield()
+        row = panel.get_or_create_label(0)
+        picker = row._BoxTagLabelRow__text_entry
+        button = row._BoxTagLabelRow__search_button
+        button.SetFocus()
+        wx.Yield()
+        assert button.HasFocus()
+        row._open_catalog(wx.CommandEvent())
+        wx.Yield()
+        assert row._popup is not None and row._popup.IsShown()
+        assert picker.HasFocus()
+    finally:
+        frame.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
 def test_catalog_picker_selects_result_with_mouse_click():
     app = wx.App.Get() or wx.App(False)
     frame = wx.Frame(None, size=(500, 240))
@@ -178,6 +240,45 @@ def test_catalog_picker_selects_result_with_mouse_click():
 
         assert box.tags == ['Mario Anniversary']
         assert box.pin_id == 'pinpanion:9'
+    finally:
+        frame.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_catalog_popup_stays_open_during_mouse_focus_transfer_to_result() -> None:
+    app = wx.App.Get() or wx.App(False)
+    frame = wx.Frame(None, size=(500, 240))
+    box = BoxData((1, 1, 20, 20), [''], 'user')
+    panel = BoxTagPanelEdit(frame, box, catalog_options=[
+        ('pinpanion:7', 'Mario'),
+        ('pinpanion:9', 'Mario Anniversary'),
+    ])
+    frame.SetSizer(wx.BoxSizer(wx.VERTICAL))
+    frame.GetSizer().Add(panel, 1, wx.EXPAND)
+    try:
+        frame.Show()
+        frame.Layout()
+        wx.Yield()
+        row = panel.get_or_create_label(0)
+        row._open_catalog(wx.CommandEvent())
+        assert row._popup is not None and row._popup.IsShown()
+        assert row._results is not None
+        screen_rect = row._results.GetScreenRect()
+        pointer = wx.Point(screen_rect.x + 12, screen_rect.y + 12)
+        with (patch('controls.boxtaglaberow.wx.Window.FindFocus', return_value=None),
+              patch('controls.boxtaglaberow.wx.GetMousePosition', return_value=pointer)):
+            row._hide_popup_if_unfocused()
+        assert row._popup.IsShown()
+
+        result_y = next(y for y in range(row._results.GetClientSize().height)
+                        if row._results.HitTest(wx.Point(12, y)) == 1)
+        click = wx.MouseEvent(wx.wxEVT_LEFT_DOWN)
+        click.SetPosition(wx.Point(12, result_y))
+        click.SetEventObject(row._results)
+        row._results.ProcessEvent(click)
+        wx.Yield()
+        assert (box.tags, box.pin_id) == (['Mario Anniversary'], 'pinpanion:9')
     finally:
         frame.Destroy()
         wx.Yield()

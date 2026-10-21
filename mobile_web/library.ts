@@ -1,3 +1,5 @@
+import { parseJson, type JsonInput } from './json_input.js';
+
 export const STORAGE_KEY = 'pinident.mobile.library.v1';
 
 export interface PinIdentity {
@@ -42,16 +44,16 @@ export function emptyLibrary(): Library {
   return { version: 1, activeId: id, collections: [{ id, name: 'My pins', items: [] }] };
 }
 
-function isLibrary(value: unknown): value is Library {
+function isLibrary(value: JsonInput): value is Library {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Partial<Library>;
   return candidate.version === 1 && typeof candidate.activeId === 'string' &&
     Array.isArray(candidate.collections) && candidate.collections.length > 0 &&
-    candidate.collections.every((collection: unknown) => {
+    candidate.collections.every((collection: JsonInput) => {
       if (typeof collection !== 'object' || collection === null) return false;
       const row = collection as Partial<Collection>;
       return typeof row.id === 'string' && typeof row.name === 'string' &&
-        Array.isArray(row.items) && row.items.every((item: unknown) => {
+        Array.isArray(row.items) && row.items.every((item: JsonInput) => {
           if (typeof item !== 'object' || item === null) return false;
           const pin = item as Partial<LibraryItem>;
           return typeof pin.pin_id === 'string' && typeof pin.name === 'string' &&
@@ -64,7 +66,7 @@ function isLibrary(value: unknown): value is Library {
 export function loadLibrary(storage: StorageLike = localStorage): Library {
   try {
     const raw = storage.getItem(STORAGE_KEY);
-    const value: unknown = raw ? JSON.parse(raw) : null;
+    const value: JsonInput = raw ? parseJson(raw) : null;
     if (isLibrary(value)) return value;
   } catch { /* A damaged local copy must not stop scanning. */ }
   return emptyLibrary();

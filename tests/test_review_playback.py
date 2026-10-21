@@ -342,7 +342,7 @@ def test_processing_saved_same_name_carries_confirmed_identity_without_rematchin
     assert saved.tags == ['Mario']
 
 
-def test_pin_presence_confirmation_tracks_without_approving_suggested_name():
+def test_pin_presence_confirmation_tracks_without_approving_suggested_name() -> None:
     image = np.random.default_rng(85).integers(0, 255, (100, 180, 3), dtype=np.uint8)
     source = BoxData((10, 15, 40, 40), ['Possible Mario'], 'automatic',
                      pin_id='pinpanion:7', review_state='confirmed',
@@ -361,7 +361,7 @@ def test_pin_presence_confirmation_tracks_without_approving_suggested_name():
     assert tracked.track_id == source.track_id
     assert tracked.review_state == 'inherited'
     assert not tracked.identity_confirmed
-    assert tracked.pin_id == 'pinpanion:8'
+    assert tracked.pin_id is None and tracked.tags == []
     assert ImagePanel.get_box_label_text(source) == 'Possible Mario?'
 
 

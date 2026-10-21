@@ -1,11 +1,16 @@
 /// <reference lib="webworker" />
 
-const sw = self as unknown as ServiceWorkerGlobalScope;
+function isServiceWorker(scope: WorkerGlobalScope): scope is ServiceWorkerGlobalScope {
+  return 'clients' in scope && 'skipWaiting' in scope &&
+    typeof scope.skipWaiting === 'function';
+}
+if (!isServiceWorker(self)) throw new Error('This script requires a service worker.');
+const sw: ServiceWorkerGlobalScope = self;
 
 const CACHE = 'pinident-mobile-v15';
 const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/library.js',
   '/scanner.js', '/stage_geometry.js', '/scan_session.js', '/model.js', '/identity.js',
-  '/catalog.js', '/reviews.js',
+  '/catalog.js', '/reviews.js', '/json_input.js',
   '/manifest.webmanifest', '/icon.svg',
   '/icon-192.png', '/icon-512.png'];
 

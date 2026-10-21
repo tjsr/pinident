@@ -32,6 +32,7 @@ class BoxTagLabelRow(wx.Panel):
         self._popup: wx.PopupWindow | None = None
         self._results: wx.ListBox | None = None
         self._edit_pending = False
+        self._focus_hide_call: wx.CallLater | None = None
 
         self.__text_entry = wx.TextCtrl(self, value=label)
         self.__text_entry.SetMinSize(wx.Size(280, -1))
@@ -109,11 +110,17 @@ class BoxTagLabelRow(wx.Panel):
         event.Skip()
 
     def _on_picker_focus_lost(self, event: wx.FocusEvent) -> None:
-        wx.CallAfter(self._hide_popup_if_unfocused)
+        # Windows can report no focused control between pressing a result and
+        # delivering its mouse event. Give the list time to receive that click.
+        if self._focus_hide_call is not None:
+            self._focus_hide_call.Stop()
+        self._focus_hide_call = wx.CallLater(200, self._hide_popup_if_unfocused)
         event.Skip()
 
     def _hide_popup_if_unfocused(self) -> None:
         if self._popup is None or not self._popup.IsShown():
+            return
+        if self._popup.GetScreenRect().Contains(wx.GetMousePosition()):
             return
         focus = wx.Window.FindFocus()
         while focus is not None:
@@ -150,12 +157,16 @@ class BoxTagLabelRow(wx.Panel):
         y = (origin.y if origin.y + height <= area.GetBottom() else
              origin.y - self.__text_entry.GetSize().height - height)
         self._popup.Move(wx.Point(x, max(area.y, y)))
+        editing = self.__text_entry.HasFocus()
         if not self._popup.IsShown():
             self._popup.Show()
+        if editing and not self.__text_entry.HasFocus():
+            self.__text_entry.SetFocus()
 
     def _open_catalog(self, _event: wx.CommandEvent) -> None:
         self._search_timer.Stop()
         self._show_matches(self.tag)
+        self.__text_entry.SetFocus()
 
     def _on_search_timer(self, _event: wx.TimerEvent) -> None:
         if self.__text_entry.HasFocus():
@@ -212,7 +223,7 @@ class BoxTagLabelRow(wx.Panel):
         if self.__text_entry.IsBeingDeleted():
             return
         display = self._display_by_catalog.get((pin_id, tag), tag)
-        if display is not None and display != self.tag:
+        if display is not None and display != self.tag and not self._edit_pending:
             self.timer.Stop()
             self._search_timer.Stop()
             self.__text_entry.ChangeValue(display)
@@ -265,4 +276,6 @@ class BoxTagLabelRow(wx.Panel):
         if event.GetEventObject() is self:
             self.timer.Stop()
             self._search_timer.Stop()
+            if self._focus_hide_call is not None:
+                self._focus_hide_call.Stop()
         event.Skip()

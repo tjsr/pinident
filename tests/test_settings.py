@@ -92,3 +92,42 @@ def test_settings_dialog_shows_copyable_paths_and_feedback_status(tmp_path):
         dialog.Destroy()
         parent.Destroy()
         wx.Yield()
+
+
+@pytest.mark.gui
+def test_settings_dialog_reports_selected_detection_resolution(tmp_path):
+    app = wx.App.Get() or wx.App(False)
+    parent = wx.Frame(None)
+    dialog = SettingsDialog(
+        parent, feedback_path=tmp_path / 'f.sqlite3', catalog_path=tmp_path / 'c.sqlite3',
+        annotations_path=None, feedback_counts={'positive': 0, 'negative': 0},
+        wrong_identity_count=0, model_revision=0, detection_resolution='regular')
+    try:
+        assert dialog.detection_resolution == 'regular'
+        dialog.resolution_choice.SetSelection(1)
+        assert dialog.detection_resolution == 'low'
+    finally:
+        dialog.Destroy()
+        parent.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_choosing_low_resolution_is_saved_and_used_by_frame_jobs(tmp_path):
+    app = wx.App.Get() or wx.App(False)
+    window = VideoScrubber(None, 'Resolution test', '',
+                           image_array=[np.zeros((20, 20, 3), dtype=np.uint8)],
+                           feedback_path=tmp_path / 'feedback.sqlite3',
+                           catalog_path=str(tmp_path / 'catalog.sqlite3'),
+                           load_catalog=False)
+    try:
+        item_id = window.GetMenuBar().FindMenuItem('File', 'Settings')
+        with (patch('scrubberframe.SettingsDialog') as dialog,
+              patch('scrubberframe.save_detection_resolution') as save):
+            dialog.return_value.detection_resolution = 'low'
+            window.GetEventHandler().ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, item_id))
+        save.assert_called_once_with('low')
+        assert window._detection_resolution == 'low'
+    finally:
+        window.Destroy()
+        wx.Yield()

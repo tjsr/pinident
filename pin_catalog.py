@@ -265,6 +265,10 @@ class PinMatcher:
         self._appearance_matrix = (np.stack([signature for _, signature in
                                              self._appearance_references])
                                    if self._appearance_references else None)
+        self._pattern_matrix = (np.stack([
+            self._pattern_vector(reference.image, reference.mask)
+            for reference, _signature in self._appearance_references])
+            if self._appearance_references else None)
         for reference in references:
             keypoints, descriptors = self._features(reference.image, reference.mask)
             if descriptors is not None and len(keypoints) >= 12:
@@ -289,12 +293,35 @@ class PinMatcher:
     @staticmethod
     def _appearance_vector(rgb: np.ndarray,
                            mask: np.ndarray | None = None) -> np.ndarray:
-        """Compact colour signature for a best-effort, rotation-tolerant guess."""
+        """Compact colour signature for catalog comparison."""
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         histogram = cv2.calcHist([hsv], [0, 1], mask, [12, 4], [0, 180, 0, 256])
         vector = histogram.ravel().astype(np.float32)
         length = float(np.linalg.norm(vector))
         return vector / length if length else vector
+
+    @staticmethod
+    def _pattern_vector(rgb: np.ndarray,
+                        mask: np.ndarray | None = None) -> np.ndarray:
+        """Normalized coarse layout; transparent stock margins use the pin's mean."""
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        if mask is not None and np.any(mask > 128):
+            gray = np.where(mask > 128, gray, float(np.mean(gray[mask > 128])))
+        pattern = cv2.resize(gray, (8, 8), interpolation=cv2.INTER_AREA).ravel()
+        pattern -= float(np.mean(pattern))
+        length = float(np.linalg.norm(pattern))
+        return pattern / length if length > 1e-4 else np.zeros(64, dtype=np.float32)
+
+    def _appearance_scores(self, crop: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compare colour and the best quarter-turn spatial layout in one batch."""
+        assert self._appearance_matrix is not None and self._pattern_matrix is not None
+        colour = np.clip(self._appearance_matrix @ self._appearance_vector(crop), 0.0, 1.0)
+        pattern = self._pattern_vector(crop).reshape(8, 8)
+        rotations = np.stack([np.rot90(pattern, turns).ravel()
+                              for turns in range(4)], axis=1)
+        layout = np.clip(np.max(self._pattern_matrix @ rotations, axis=1), 0.0, 1.0)
+        strength = 0.35 * colour + 0.65 * layout
+        return colour, layout, strength
 
     def _features(self, rgb: np.ndarray, mask: np.ndarray | None = None,
                   query: bool = False):
@@ -347,39 +374,41 @@ class PinMatcher:
     def suggest(self, crop: np.ndarray,
                 excluded_pin_ids: frozenset[str] = frozenset(),
                 excluded_names: frozenset[str] = frozenset()) -> PinMatch | None:
-        """Choose the strongest available catalog guess for a user-marked pin.
-
-        The fallback score is colour-histogram similarity, not a probability.
-        """
+        """Abstain unless stock artwork has a clear geometric or visual match."""
         strong = self.match(crop, excluded_pin_ids, excluded_names)
         if strong is not None:
             return strong
         if not self._appearance_references or crop.size == 0:
             return None
-        query = self._appearance_vector(crop)
-        ranked = ((float(np.dot(query, signature)), reference)
-                  for reference, signature in self._appearance_references
-                  if reference.pin_id not in excluded_pin_ids
-                  and reference.name.casefold() not in excluded_names)
-        best = max(ranked, key=lambda item: item[0], default=None)
-        if best is None:
+        colour, layout, strengths = self._appearance_scores(crop)
+        by_pin: dict[str, tuple[float, float, float, PinReference]] = {}
+        for index, (reference, _signature) in enumerate(self._appearance_references):
+            if (reference.pin_id in excluded_pin_ids or
+                    reference.name.casefold() in excluded_names):
+                continue
+            score = float(strengths[index])
+            previous = by_pin.get(reference.pin_id)
+            if previous is None or score > previous[0]:
+                by_pin[reference.pin_id] = (
+                    score, float(colour[index]), float(layout[index]), reference)
+        ranked = sorted(by_pin.values(), key=lambda item: item[0], reverse=True)
+        if not ranked:
             return None
-        similarity, reference = best
+        score, colour_score, layout_score, reference = ranked[0]
+        if (score < 0.85 or colour_score < 0.75 or layout_score < 0.82 or
+                (len(ranked) > 1 and score - ranked[1][0] < 0.08)):
+            return None
         return PinMatch(reference.pin_id, reference.name, 0,
-                        max(0.0, min(1.0, similarity)),
+                        score,
                         reference.year, reference.show)
 
     def rank_matches(self, crop: np.ndarray, limit: int = 20,
                      excluded_pin_ids: frozenset[str] = frozenset(),
                      excluded_names: frozenset[str] = frozenset()) -> list[PinMatch]:
-        """Rank distinct catalog pins by appearance for an interactive choice list.
-
-        Scores are colour-histogram similarity, not calibrated probabilities.
-        This uses the precomputed matrix so opening a menu does not run ORB.
-        """
+        """Rank distinct pins by colour and layout for an interactive choice list."""
         if self._appearance_matrix is None or crop.size == 0 or limit <= 0:
             return []
-        scores = self._appearance_matrix @ self._appearance_vector(crop)
+        _colour, _layout, scores = self._appearance_scores(crop)
         best_by_pin: dict[str, PinMatch] = {}
         for (reference, _signature), score in zip(self._appearance_references, scores):
             if (reference.pin_id in excluded_pin_ids or

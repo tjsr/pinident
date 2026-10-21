@@ -224,7 +224,7 @@ def test_trained_classifier_downranks_negative_without_erasing_proposals(tmp_pat
 
 
 @pytest.mark.gui
-def test_saved_classifier_with_changed_reviews_is_not_used_on_startup(tmp_path,
+def test_saved_classifier_with_changed_reviews_is_still_used_on_startup(tmp_path,
                                                                        monkeypatch):
     monkeypatch.delenv('PINIDENT_SYNC_TOKEN', raising=False)
     path = tmp_path / 'reviews.sqlite3'
@@ -247,7 +247,9 @@ def test_saved_classifier_with_changed_reviews_is_not_used_on_startup(tmp_path,
         load_catalog=False, feedback_path=path,
         catalog_path=str(tmp_path / 'empty-catalog.sqlite3'))
     try:
-        assert window._feedback_model.trained_model is None
+        assert isinstance(window._feedback_model.trained_model, TrainedDetectionModel)
+        assert (window._feedback_model.trained_model.review_digest !=
+                examples_digest(window._feedback_store.examples()))
     finally:
         window.Destroy()
         wx.Yield()

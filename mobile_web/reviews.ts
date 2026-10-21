@@ -1,5 +1,6 @@
 import { makeId, type PinIdentity } from './library.js';
 import type { Coords, ScanBox } from './scanner.js';
+import type { JsonInput } from './json_input.js';
 
 export type TrainingLabel = 'not_pin' | 'pin_unknown' | 'pin_identified';
 export interface TrainingReview {
@@ -160,7 +161,7 @@ async function postSharedRecord(record: TrainingReview | FrameAnnotation): Promi
     body: JSON.stringify(payload)
   });
   if (!response.ok) throw new Error(`Shared review upload failed (${response.status}).`);
-  const result: unknown = await response.json();
+  const result = await response.json() as JsonInput;
   if (typeof result !== 'object' || result === null ||
       !('revision' in result) || !Number.isSafeInteger(result.revision))
     throw new Error('Shared review upload returned an invalid revision.');
@@ -194,13 +195,13 @@ export async function postDifficultyMark(mark: DifficultyMark): Promise<void> {
 export async function loadSharedDifficultyHints(signal?: AbortSignal): Promise<DifficultyHint[]> {
   const response = await fetch('/api/difficulty-marks', { signal, cache: 'no-store' });
   if (!response.ok) throw new Error(`Difficulty hints unavailable (${response.status}).`);
-  const data: unknown = await response.json();
+  const data = await response.json() as JsonInput;
   if (typeof data !== 'object' || data === null || !('marks' in data) ||
       !Array.isArray(data.marks) || data.marks.length > 500 ||
-      !data.marks.every((mark: unknown) => typeof mark === 'object' && mark !== null &&
+      !data.marks.every((mark: JsonInput) => typeof mark === 'object' && mark !== null &&
         'id' in mark && typeof mark.id === 'string' &&
         'signature' in mark && Array.isArray(mark.signature) && mark.signature.length === 36 &&
-        mark.signature.every((value: unknown) => typeof value === 'number' && Number.isFinite(value))))
+        mark.signature.every((value: JsonInput) => typeof value === 'number' && Number.isFinite(value))))
     throw new Error('Invalid shared difficulty hints.');
   return data.marks as DifficultyHint[];
 }

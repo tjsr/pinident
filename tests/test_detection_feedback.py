@@ -1,6 +1,10 @@
 from io import StringIO
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from time import monotonic, sleep
 from unittest.mock import patch
 import json
+import sqlite3
 
 import cv2
 import numpy as np
@@ -69,6 +73,224 @@ def test_low_detail_feedback_is_saved_but_reported_as_unusable():
         assert model.sample_counts == {'positive': 0, 'negative': 0}
     finally:
         store.close()
+
+
+def test_batched_feedback_scoring_preserves_single_crop_scores():
+    store = FeedbackStore()
+    try:
+        model = FeedbackModel(store, load=False)
+        random = np.random.default_rng(51)
+        for index in range(64):
+            gray = random.normal(size=1024).astype(np.float32)
+            gray /= np.linalg.norm(gray)
+            chroma = random.uniform(40, 190, size=2).astype(np.float32)
+            model._samples[str(index)] = (
+                'positive' if index % 3 else 'negative', None, '', gray, chroma)
+        model._rebuild_vectors()
+        queries = []
+        for _ in range(12):
+            gray = random.normal(size=1024).astype(np.float32)
+            gray /= np.linalg.norm(gray)
+            queries.append((gray, random.uniform(40, 190, size=2).astype(np.float32)))
+        for label in ('positive', 'negative'):
+            expected = [model._best_similarity(query, label) for query in queries]
+            assert np.allclose(model._best_similarities(queries, label), expected,
+                               rtol=1e-5, atol=1e-6)
+    finally:
+        store.close()
+
+
+def test_stored_descriptors_load_without_decoding_crops(tmp_path):
+    path = tmp_path / 'feedback.sqlite3'
+    store = FeedbackStore(path)
+    image = sample_frame()
+    store.save(make_feedback_example('positive', 'positive', image, (10, 15, 40, 40),
+                                     'video.mp4', 0, 'pin', 'pin-7'))
+    store.save_identity_rejection(make_feedback_example(
+        'wrong', 'wrong_identity', image, (10, 15, 40, 40),
+        'video.mp4', 1, 'pin', 'pin-8'))
+    store.close()
+
+    reopened = FeedbackStore(path)
+    try:
+        with patch('detection_feedback.cv2.imdecode',
+                   side_effect=AssertionError('decoded cached crop')):
+            model = FeedbackModel(reopened)
+        assert model.sample_counts == {'positive': 1, 'negative': 0}
+        assert reopened.db.execute(
+            'SELECT descriptor_version FROM feedback_examples').fetchone() == (1,)
+        assert reopened.db.execute(
+            'SELECT descriptor_version FROM identity_rejections').fetchone() == (1,)
+    finally:
+        reopened.close()
+
+
+def test_legacy_descriptor_is_backfilled_only_once(tmp_path):
+    path = tmp_path / 'legacy.sqlite3'
+    store = FeedbackStore(path)
+    store.save(make_feedback_example('pin', 'positive', sample_frame(),
+                                     (10, 15, 40, 40), 'video.mp4', 0, 'pin', None))
+    store.db.execute('''UPDATE feedback_examples SET descriptor_version = NULL,
+        descriptor_gray = NULL, descriptor_chroma = NULL''')
+    with store.db:
+        for index in range(9):
+            store.db.execute('''INSERT INTO feedback_examples
+                (example_id, label, source_path, frame_index, track_id, pin_id,
+                 coords_json, crop_png, rights_status, tags_json)
+                SELECT ?, label, source_path, frame_index, track_id, pin_id,
+                       coords_json, crop_png, rights_status, tags_json
+                FROM feedback_examples WHERE example_id = 'pin' ''',
+                (f'legacy-{index}',))
+    store.db.commit()
+    store.close()
+
+    reopened = FeedbackStore(path)
+    try:
+        with patch('detection_feedback.cv2.imdecode',
+                   wraps=cv2.imdecode) as decode:
+            FeedbackModel(reopened)
+        assert decode.call_count == 10
+        with patch('detection_feedback.cv2.imdecode',
+                   side_effect=AssertionError('decoded migrated crop')):
+            FeedbackModel(reopened)
+    finally:
+        reopened.close()
+
+
+def test_review_write_does_not_wait_for_background_descriptor_decode(tmp_path):
+    path = tmp_path / 'concurrent-feedback.sqlite3'
+    ui_store = FeedbackStore(path)
+    assert ui_store.db.execute('PRAGMA journal_mode').fetchone() == ('wal',)
+    image = sample_frame()
+    for index in range(2):
+        ui_store.save(make_feedback_example(
+            f'legacy-{index}', 'positive', image, (10, 15, 40, 40),
+            'video.mp4', index, f'track-{index}', None))
+    ui_store.db.execute('''UPDATE feedback_examples SET descriptor_version = NULL,
+        descriptor_gray = NULL, descriptor_chroma = NULL''')
+    ui_store.db.commit()
+    ui_store.db.execute('PRAGMA busy_timeout = 100')
+    decoding = Event()
+    resume = Event()
+    calls = 0
+
+    def load() -> FeedbackModel:
+        nonlocal calls
+        worker_store = FeedbackStore(path)
+        original = worker_store._descriptor_columns
+
+        def decode(crop_png: bytes) -> tuple[int, bytes | None, bytes | None]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                decoding.set()
+                assert resume.wait(5)
+            return original(crop_png)
+
+        try:
+            with patch.object(worker_store, '_descriptor_columns', side_effect=decode):
+                return FeedbackModel(worker_store)
+        finally:
+            worker_store.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(load)
+            assert decoding.wait(5)
+            try:
+                ui_store.delete('legacy-1')
+                ui_store.save(make_feedback_example(
+                    'new-review', 'negative', image, (110, 15, 40, 40),
+                    'video.mp4', 2, 'new-track', None))
+            finally:
+                resume.set()
+            future.result(timeout=5)
+        assert ui_store.get('legacy-1') is None
+        assert ui_store.get('new-review') is not None
+    finally:
+        ui_store.close()
+
+
+def test_feedback_store_upgrades_pre_descriptor_schema(tmp_path):
+    path = tmp_path / 'old.sqlite3'
+    database = sqlite3.connect(path)
+    database.execute('''CREATE TABLE feedback_examples (
+        example_id TEXT PRIMARY KEY, label TEXT NOT NULL, source_path TEXT NOT NULL,
+        frame_index INTEGER NOT NULL, track_id TEXT NOT NULL, pin_id TEXT,
+        coords_json TEXT NOT NULL, crop_png BLOB NOT NULL,
+        rights_status TEXT NOT NULL DEFAULT 'unverified',
+        tags_json TEXT NOT NULL DEFAULT '[]')''')
+    example = make_feedback_example('legacy-pin', 'positive', sample_frame(),
+                                    (10, 15, 40, 40), 'video.mp4', 0, 'pin', None)
+    database.execute('''INSERT INTO feedback_examples
+        (example_id, label, source_path, frame_index, track_id, pin_id,
+         coords_json, crop_png, tags_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (example.example_id, example.label, example.source_path,
+         example.frame_index, example.track_id, example.pin_id,
+         json.dumps(example.coords), example.crop_png, json.dumps(example.tags)))
+    database.commit()
+    database.close()
+
+    store = FeedbackStore(path)
+    try:
+        assert FeedbackModel(store).sample_counts['positive'] == 1
+        assert store.db.execute(
+            'SELECT descriptor_version FROM feedback_examples').fetchone() == (1,)
+    finally:
+        store.close()
+
+
+@pytest.mark.gui
+def test_large_feedback_loads_after_window_shows_without_crop_decode(tmp_path):
+    path = tmp_path / 'large-feedback.sqlite3'
+    store = FeedbackStore(path)
+    store.save(make_feedback_example('seed', 'positive', sample_frame(),
+                                     (10, 15, 40, 40), 'other.mp4', 0, 'pin', None))
+    with store.db:
+        for index in range(1000):
+            store.db.execute('''INSERT INTO feedback_examples
+                (example_id, label, source_path, frame_index, track_id, pin_id,
+                 coords_json, crop_png, rights_status, tags_json,
+                 descriptor_version, descriptor_gray, descriptor_chroma)
+                SELECT ?, label, source_path, frame_index, track_id, pin_id,
+                       coords_json, crop_png, rights_status, tags_json,
+                       descriptor_version, descriptor_gray, descriptor_chroma
+                FROM feedback_examples WHERE example_id = 'seed' ''',
+                (f'copy-{index}',))
+    store.close()
+
+    app = wx.App.Get()
+    owns_app = app is None
+    if app is None:
+        app = wx.App(False)
+    image = cv2.cvtColor(sample_frame(), cv2.COLOR_RGB2BGR)
+    with patch('scrubberframe.ScrubberFrame._start_cloud_sync'), patch(
+            'detection_feedback.cv2.imdecode',
+            side_effect=AssertionError('decoded stored crop')):
+        window = VideoScrubber(None, 'Async feedback', '', image_array=[image],
+                               load_catalog=False, feedback_path=path,
+                               catalog_path=str(tmp_path / 'catalog.sqlite3'))
+        feedback_executor = window._feedback_load_executor
+        try:
+            assert window._feedback_model.sample_counts['positive'] == 0
+            window.Show()
+            deadline = monotonic() + 5
+            while window._feedback_deferred and monotonic() < deadline:
+                wx.Yield()
+                sleep(0.005)
+            assert not window._feedback_deferred
+            assert window._feedback_model.sample_counts['positive'] == 1001
+        finally:
+            window._cloud_timer.Stop()
+            if feedback_executor is not None:
+                feedback_executor.shutdown(wait=True)
+            window._play_executor.shutdown(wait=True)
+            window._sync_executor.shutdown(wait=True)
+            window.Destroy()
+            wx.Yield()
+            if owns_app:
+                app.Destroy()
 
 
 def test_identity_exemplars_use_confirmed_ids_and_rejected_names():

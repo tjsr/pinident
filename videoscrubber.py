@@ -1,8 +1,10 @@
-import cv2
-import wx
+from math import isfinite
 from pathlib import Path
 from threading import Condition, Thread, current_thread
 from time import perf_counter
+
+import cv2
+import wx
 from frame_cache import FrameCache
 from logutil import getLog
 
@@ -14,8 +16,15 @@ class VideoScrubber(ScrubberFrame):
     PREFETCH_FRAMES = 4
 
     @property
-    def current_index(self):
+    def current_index(self) -> int:
         return self._current_index
+
+    def playback_frame_interval_ms(self) -> int:
+        """Use the source frame rate to pace work that finishes quickly."""
+        if self.__cap is None:
+            return 50
+        fps = float(self.__cap.get(cv2.CAP_PROP_FPS))
+        return max(1, round(1000 / fps)) if isfinite(fps) and fps > 0 else 50
 
     def __init__(self, parent: wx.Panel | None, title: str, opencv_exe_path: str,
                  video_path=None, image_array=None, box_data: str | None = None,

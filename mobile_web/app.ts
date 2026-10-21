@@ -75,7 +75,9 @@ const facetFields: ReadonlyArray<{ id: string; key: FacetKey; all: string }> = [
   { id: 'filterGroup', key: 'groupId', all: 'All groups' }
 ];
 
-function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function errorText(error: Error | string): string {
+  return error instanceof Error ? error.message : String(error);
+}
 function setStatus(message: string): void { $('scanStatus').textContent = message; }
 function toast(message: string): void {
   const element = $('toast');
@@ -154,7 +156,7 @@ function savePin(pin: PinIdentity): void {
     persist();
     toast(`${pin.name} added to ${activeCollection(state).name}`);
     if ($<HTMLDialogElement>('tagDialog').open) $<HTMLDialogElement>('tagDialog').close();
-  } catch (error) { toast(errorText(error)); }
+  } catch (error) { toast(errorText(error instanceof Error ? error : String(error))); }
 }
 function choosePin(pin: PinIdentity, box: ScanBox | null = tagTarget): void {
   if (box && (!lastResult || !tagTrack(lastResult, box.track_id, pin))) {
@@ -315,7 +317,7 @@ async function startCamera(): Promise<void> {
     await video.play();
     setStatus('Scanning on this device. Move slowly and review suggested pin areas.');
     startLoop();
-  } catch (error) { stopSource(); setStatus(`Camera unavailable: ${errorText(error)}. Try a photo instead.`); }
+  } catch (error) { stopSource(); setStatus(`Camera unavailable: ${errorText(error instanceof Error ? error : String(error))}. Try a photo instead.`); }
 }
 function loadVideo(file?: File): void {
   if (!file) return;
@@ -579,7 +581,7 @@ function scanOne(force = false): void {
       ? `${count} area${count === 1 ? '' : 's'} above 50% visual match. Review before adding pins.`
       : 'Catalog matching is unavailable. Draw an area manually to annotate this frame.');
     updateAnnotationControls();
-  } catch (error) { setStatus(`Scan paused: ${errorText(error)}`); stopLoop(); }
+  } catch (error) { setStatus(`Scan paused: ${errorText(error instanceof Error ? error : String(error))}`); stopLoop(); }
 }
 
 function frameTime(): number | null {
@@ -752,10 +754,10 @@ async function markUnknown(): Promise<void> {
     renderTraining();
     void syncPendingReviews().then(() => syncPendingReviews())
       .then(() => refreshSavedReviews()).catch(error => {
-        toast(`Difficulty mark saved locally; cloud sync pending: ${errorText(error)}`);
+        toast(`Difficulty mark saved locally; cloud sync pending: ${errorText(error instanceof Error ? error : String(error))}`);
         renderTraining();
       });
-  } catch (error) { toast(`Difficulty mark could not be saved: ${errorText(error)}`); }
+  } catch (error) { toast(`Difficulty mark could not be saved: ${errorText(error instanceof Error ? error : String(error))}`); }
   finally { classificationSaving = false; }
 }
 async function classify(label: 'not_pin' | 'pin_unknown' | 'pin_identified',
@@ -783,7 +785,7 @@ async function classify(label: 'not_pin' | 'pin_unknown' | 'pin_identified',
     if (label === 'pin_identified' && identity) rememberPinSelection(identity);
     void syncPendingReviews().then(() => syncPendingReviews())
       .then(() => refreshSavedReviews()).catch(error => {
-      toast(`Review saved locally; cloud sync pending: ${errorText(error)}`);
+      toast(`Review saved locally; cloud sync pending: ${errorText(error instanceof Error ? error : String(error))}`);
       renderTraining();
     });
     if (lastResult && sourceName === item.source &&
@@ -796,7 +798,7 @@ async function classify(label: 'not_pin' | 'pin_unknown' | 'pin_identified',
       if (lastSnapshot) renderResults(lastResult, lastSnapshot);
     }
     trainingQueue.shift(); renderTraining();
-  } catch (error) { toast(`Review could not be saved: ${errorText(error)}`); }
+  } catch (error) { toast(`Review could not be saved: ${errorText(error instanceof Error ? error : String(error))}`); }
   finally { classificationSaving = false; }
 }
 async function saveCurrentFrame(): Promise<boolean> {
@@ -817,11 +819,11 @@ async function saveCurrentFrame(): Promise<boolean> {
     toast(`Frame saved (${record.boxes.length} areas). Cloud sync queued.`);
     void syncPendingReviews().then(() => syncPendingReviews())
       .then(() => refreshSavedReviews()).catch(error => {
-        toast(`Frame saved locally; cloud sync pending: ${errorText(error)}`);
+        toast(`Frame saved locally; cloud sync pending: ${errorText(error instanceof Error ? error : String(error))}`);
         renderTraining();
       });
     return true;
-  } catch (error) { toast(`Annotation could not be saved: ${errorText(error)}`); return false; }
+  } catch (error) { toast(`Annotation could not be saved: ${errorText(error instanceof Error ? error : String(error))}`); return false; }
   finally { frameSaving = false; updateAnnotationControls(); }
 }
 async function finishCurrentScan(): Promise<void> {
@@ -842,7 +844,7 @@ async function finishCurrentScan(): Promise<void> {
       setStatus('Frame could not be saved. Review it and tap OK again.');
     }
   } catch (error) {
-    setStatus(`Scan could not be finished: ${errorText(error)}. The frame remains open.`);
+    setStatus(`Scan could not be finished: ${errorText(error instanceof Error ? error : String(error))}. The frame remains open.`);
   } finally { finishingScan = false; updateAnnotationControls(); }
 }
 async function initializeCatalog(): Promise<void> {
@@ -865,7 +867,7 @@ async function initializeModel(): Promise<void> {
       : 'Pin/non-pin model not published. Using visual proposals only.';
   } catch (error) {
     if (revision !== modelLoadRevision) return;
-    $('modelStatus').textContent = `Pin/non-pin model unavailable: ${errorText(error)}`;
+    $('modelStatus').textContent = `Pin/non-pin model unavailable: ${errorText(error instanceof Error ? error : String(error))}`;
   }
 }
 async function initializeIdentityIndex(): Promise<void> {
@@ -885,7 +887,7 @@ async function initializeIdentityIndex(): Promise<void> {
   } catch (error) {
     if (revision !== identityLoadRevision) return;
     identityIndex = combineIdentityIndex(catalogIdentityIndex, learnedExamples);
-    $('identityStatus').textContent = `Catalog matching unavailable: ${errorText(error)}`;
+    $('identityStatus').textContent = `Catalog matching unavailable: ${errorText(error instanceof Error ? error : String(error))}`;
   }
 }
 let catalogRefreshing = false;
@@ -944,7 +946,7 @@ $<HTMLVideoElement>('videoPreview').addEventListener('ended', stopLoop);
 $('freezeButton').addEventListener('click', freezeCurrent);
 $('resumeButton').addEventListener('click', () => {
   frozen = false; updateAnnotationControls();
-  if (source instanceof HTMLVideoElement) void source.play().catch(error => setStatus(errorText(error)));
+  if (source instanceof HTMLVideoElement) void source.play().catch(error => setStatus(errorText(error instanceof Error ? error : String(error))));
 });
 $('queueTrainingButton').addEventListener('click', () => { void queueCurrentFrame(); });
 $('saveFrameButton').addEventListener('click', () => { void saveCurrentFrame(); });
@@ -1060,7 +1062,7 @@ $<HTMLSelectElement>('collectionSelect').addEventListener('change', event => {
 $('newCollectionButton').addEventListener('click', () => {
   const name = prompt('Name this collection');
   if (name === null) return;
-  try { createCollection(state, name); persist(); } catch (error) { toast(errorText(error)); }
+  try { createCollection(state, name); persist(); } catch (error) { toast(errorText(error instanceof Error ? error : String(error))); }
 });
 $('exportButton').addEventListener('click', () => {
   const blob = new Blob([exportLibrary(state)], { type: 'application/json' });
@@ -1098,7 +1100,7 @@ async function refreshSavedReviews(): Promise<void> {
 void refreshSavedReviews().then(() => {
   void syncPendingReviews().then(() => refreshSavedReviews()).catch(() => renderTraining());
 }).catch(error => {
-  $('trainingStatus').textContent = `Saved reviews unavailable: ${errorText(error)}`;
+  $('trainingStatus').textContent = `Saved reviews unavailable: ${errorText(error instanceof Error ? error : String(error))}`;
 });
 if ('serviceWorker' in navigator && window.isSecureContext) {
   void navigator.serviceWorker.register('/service-worker.js').catch(() => {});

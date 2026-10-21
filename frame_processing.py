@@ -10,7 +10,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from boxdata import BoxData, has_specific_identity
+from boxdata import BoxData, Coordinate, has_specific_identity
 from detection_feedback import FeedbackModel
 from frame_presence import marked_pin_count
 from logutil import getLog
@@ -23,6 +23,9 @@ from pin_detection import (add_adjacent_tracked_boxes, add_new_detections,
                            inherit_corrected_bounds,
                            inherit_confirmed_catalog_matches,
                            match_existing_candidates, match_rejected_candidates)
+
+LOW_RESOLUTION_SIDE = 640
+_SavedBox = tuple[Coordinate, Coordinate | None, Coordinate, Coordinate | None]
 
 
 @dataclass
@@ -41,6 +44,7 @@ class FrameJob:
     allow_motion_fallback: bool = False
     catalog_best_effort: bool = False
     diagnostic_run_id: str | None = None
+    low_resolution: bool = False
 
 
 @dataclass
@@ -79,6 +83,43 @@ def _near_frame_edge(box: BoxData, frame: np.ndarray) -> bool:
             y < 0.30 * frame_height or y + height > 0.70 * frame_height)
 
 
+def _scale_coords(coords: Coordinate, factor: float, minimum: int = 0) -> Coordinate:
+    x, y, w, h = coords
+    return (round(x * factor), round(y * factor),
+            max(minimum, round(w * factor)), max(minimum, round(h * factor)))
+
+
+def _shrink_boxes(boxes: list[BoxData], factor: float) -> dict[int, _SavedBox]:
+    """Scale boxes into working space, remembering the exact source values."""
+    saved: dict[int, _SavedBox] = {}
+    for box in boxes:
+        if id(box) in saved:
+            continue
+        original, adjustment = box.coords, box.bounds_adjustment
+        box.coords = _scale_coords(original, factor, 1)
+        if adjustment is not None:
+            box.bounds_adjustment = _scale_coords(adjustment, factor)
+        saved[id(box)] = (original, adjustment, box.coords, box.bounds_adjustment)
+    return saved
+
+
+def _expand_boxes(boxes: list[BoxData], saved: dict[int, _SavedBox], factor: float,
+                  width: int, height: int) -> None:
+    """Return working-space boxes to source pixels; untouched boxes keep exact values."""
+    for box in boxes:
+        entry = saved.get(id(box))
+        if entry is not None and box.coords == entry[2]:
+            box.coords = entry[0]
+        else:
+            x, y, w, h = _scale_coords(box.coords, 1 / factor, 1)
+            x, y = min(x, width - 1), min(y, height - 1)
+            box.coords = (x, y, min(w, width - x), min(h, height - y))
+        if entry is not None and box.bounds_adjustment == entry[3]:
+            box.bounds_adjustment = entry[1]
+        elif box.bounds_adjustment is not None:
+            box.bounds_adjustment = _scale_coords(box.bounds_adjustment, 1 / factor)
+
+
 def process_frame(job: FrameJob, read_frame: Callable[[int], np.ndarray | None]) -> FrameResult:
     """Analyze an immutable annotation snapshot; the GUI commits the result."""
     started = perf_counter()
@@ -86,12 +127,27 @@ def process_frame(job: FrameJob, read_frame: Callable[[int], np.ndarray | None])
     if frame is None:
         raise ValueError(f'Could not decode frame {job.index}')
     decoded = perf_counter()
+    full_frame = frame
+    factor = (min(1.0, LOW_RESOLUTION_SIDE / max(frame.shape[:2]))
+              if job.low_resolution else 1.0)
+    saved: dict[int, _SavedBox] = {}
+
+    def shrink(image: np.ndarray) -> np.ndarray:
+        if factor >= 1.0:
+            return image
+        return cv2.resize(image, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
+
+    if factor < 1.0:
+        frame = shrink(full_frame)
+        saved = _shrink_boxes([*job.previous_boxes, *job.existing_boxes,
+                               *job.rejected_next], factor)
     proposals = detect_pin_boxes(frame, feedback_model=job.feedback_model)
     detected = perf_counter()
     previous = None
     if job.previous_index is not None and (job.previous_boxes or job.allow_motion_fallback):
-        previous = (job.previous_frame if job.previous_frame is not None
-                    else read_frame(job.previous_index))
+        source_previous = (job.previous_frame if job.previous_frame is not None
+                           else read_frame(job.previous_index))
+        previous = shrink(source_previous) if source_previous is not None else None
     if job.previous_index is not None and job.previous_boxes:
         if previous is not None:
             for source, target in match_rejected_candidates(
@@ -137,7 +193,8 @@ def process_frame(job: FrameJob, read_frame: Callable[[int], np.ndarray | None])
         proposed = (associate_frame_boxes(previous, frame, job.previous_boxes, proposals)
                     if previous is not None else add_new_detections([], proposals))
     elif job.rejected_next:
-        following = read_frame(job.index + 1)
+        following_source = read_frame(job.index + 1)
+        following = shrink(following_source) if following_source is not None else None
         if following is not None:
             for source, target in match_rejected_candidates(
                     following, frame, job.rejected_next, job.existing_boxes):
@@ -160,12 +217,13 @@ def process_frame(job: FrameJob, read_frame: Callable[[int], np.ndarray | None])
     else:
         boxes = add_unique_boxes(job.existing_boxes, proposed)
     associated = perf_counter()
-    identify_candidates(frame, boxes, job.matcher,
-                        best_effort=job.catalog_best_effort,
-                        feedback_model=job.feedback_model)
     catalog_inherited = 0
-    if job.previous_index is not None:
-        catalog_inherited += inherit_confirmed_catalog_matches(job.previous_boxes, boxes)
+    if factor >= 1.0:
+        identify_candidates(frame, boxes, job.matcher,
+                            best_effort=job.catalog_best_effort,
+                            feedback_model=job.feedback_model)
+        if job.previous_index is not None:
+            catalog_inherited += inherit_confirmed_catalog_matches(job.previous_boxes, boxes)
     matched = perf_counter()
     relaxed_count = 0
     full_fallback = (marked_pin_count(boxes) < job.expected_pins or
@@ -200,12 +258,27 @@ def process_frame(job: FrameJob, read_frame: Callable[[int], np.ndarray | None])
         fallback_boxes = [box for box in boxes if id(box) not in prior_box_ids]
         fallback_catalog_started = perf_counter()
         fallback_detect_ms = (fallback_catalog_started - matched) * 1000
-        identify_candidates(frame, fallback_boxes, job.matcher,
+        if factor >= 1.0:
+            identify_candidates(frame, fallback_boxes, job.matcher,
+                                best_effort=job.catalog_best_effort,
+                                feedback_model=job.feedback_model,
+                                size_context=boxes)
+            if job.previous_index is not None:
+                catalog_inherited += inherit_confirmed_catalog_matches(job.previous_boxes, boxes)
+        fallback_catalog_ms = (perf_counter() - fallback_catalog_started) * 1000
+    if factor < 1.0:
+        height, width = full_frame.shape[:2]
+        everything = {id(box): box for box in (*job.previous_boxes, *job.existing_boxes,
+                                               *job.rejected_next, *boxes)}
+        _expand_boxes(list(everything.values()), saved, factor, width, height)
+        frame = full_frame
+        catalog_started = perf_counter()
+        identify_candidates(frame, boxes, job.matcher,
                             best_effort=job.catalog_best_effort,
                             feedback_model=job.feedback_model)
-        fallback_catalog_ms = (perf_counter() - fallback_catalog_started) * 1000
         if job.previous_index is not None:
             catalog_inherited += inherit_confirmed_catalog_matches(job.previous_boxes, boxes)
+        fallback_catalog_ms += (perf_counter() - catalog_started) * 1000
     finished = perf_counter()
     getLog().info(
         'frame=%d worker decode=%.1fms detect=%.1fms track=%.1fms catalog=%.1fms fallback=%.1fms fallback_detect=%.1fms fallback_catalog=%.1fms total=%.1fms proposals=%d relaxed=%d motion_search=%s size_filtered=%d boxes=%d catalog_inherited=%d',

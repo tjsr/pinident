@@ -1,4 +1,5 @@
 from io import StringIO
+from pathlib import Path
 import sqlite3
 from threading import Event
 from time import monotonic, sleep
@@ -77,6 +78,111 @@ def test_catalog_matching_merges_overlapping_candidates_for_same_pin(tmp_path):
         wx.Yield()
 
 
+@pytest.mark.gui
+def test_background_catalog_match_clears_tiny_saved_suggestion(tmp_path: Path) -> None:
+    class SamePinMatcher:
+        has_references = True
+
+        def match(self, _crop: np.ndarray) -> PinMatch:
+            return PinMatch('pinpanion:7', 'Mario', 12, 0.8)
+
+    app = wx.App.Get() or wx.App(False)
+    image = np.full((320, 700, 3), 145, dtype=np.uint8)
+    window = VideoScrubber(None, 'Tiny catalog suggestion', '',
+                           image_array=[cv2.cvtColor(image, cv2.COLOR_RGB2BGR)],
+                           load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        larger = [BoxData(coords, [], 'automatic') for coords in (
+            (20, 30, 65, 60), (120, 30, 100, 75), (270, 30, 135, 100))]
+        tiny = BoxData((500, 30, 10, 10), ['Old guess'], 'automatic',
+                       pin_id='old-id', match_confidence=0.7)
+        window._ScrubberFrame__frame_boxes[0] = [*larger, tiny]
+        window._pin_matcher = SamePinMatcher()
+        with patch.object(window, '_schedule_reconciliation'):
+            assert window._schedule_catalog_match(0, image, None)
+            wait_for_catalog(window)
+        assert window._ScrubberFrame__frame_boxes[0][-1] is tiny
+        assert (tiny.pin_id, tiny.tags, tiny.match_confidence) == (None, [], None)
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_background_catalog_abstention_clears_confirmed_provisional_name(
+        tmp_path: Path) -> None:
+    class AbstainingMatcher:
+        has_references = True
+
+        def suggest(self, _crop: np.ndarray) -> None:
+            return None
+
+        match = suggest
+
+    app = wx.App.Get() or wx.App(False)
+    image = reference_image(7)
+    window = VideoScrubber(None, 'Catalog abstention', '',
+                           image_array=[cv2.cvtColor(image, cv2.COLOR_RGB2BGR)],
+                           load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        box = BoxData((20, 20, 100, 100), ['Old guess'], 'automatic',
+                      review_state='confirmed', identity_confirmed=False,
+                      pin_id='old-id', match_confidence=0.95)
+        window._ScrubberFrame__frame_boxes[0] = [box]
+        window._pin_matcher = AbstainingMatcher()
+        with patch.object(window, '_schedule_reconciliation'):
+            assert window._schedule_catalog_match(0, image, None)
+            wait_for_catalog(window)
+        assert window._ScrubberFrame__frame_boxes[0][0] is box
+        assert box.review_state == 'confirmed'
+        assert (box.pin_id, box.tags, box.match_confidence) == (None, [], None)
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_attempt_detection_abstention_clears_old_guess_with_undo(
+        tmp_path: Path) -> None:
+    class AbstainingMatcher:
+        has_references = True
+
+        def suggest(self, _crop: np.ndarray) -> None:
+            return None
+
+        match = suggest
+
+    app = wx.App.Get() or wx.App(False)
+    image = reference_image(8)
+    window = VideoScrubber(None, 'Attempt abstention', '',
+                           image_array=[cv2.cvtColor(image, cv2.COLOR_RGB2BGR)],
+                           load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        box = BoxData((20, 20, 100, 100), ['Old guess'], 'automatic',
+                      pin_id='old-id', match_confidence=0.95)
+        window._ScrubberFrame__frame_boxes[0] = [box]
+        window._pin_matcher = AbstainingMatcher()
+        window.display_image(reconcile=False)
+        with patch.object(window, '_schedule_reconciliation'):
+            window.attempt_detection(box)
+            deadline = monotonic() + 5
+            while window._pending_attempt is not None and monotonic() < deadline:
+                wx.Yield()
+                sleep(0.005)
+        assert window._pending_attempt is None
+        assert (box.pin_id, box.tags, box.match_confidence) == (None, [], None)
+        assert 'cleared unverified identity' in window.GetStatusBar().GetStatusText(1)
+        window.undo_action()
+        assert (box.pin_id, box.tags, box.match_confidence) == (
+            'old-id', ['Old guess'], 0.95)
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
 def test_catalog_matches_reference_and_rejects_other_pin(tmp_path):
     db_path, image = make_catalog(tmp_path)
     matcher = PinMatcher(PinCatalog(db_path).references())
@@ -120,7 +226,7 @@ def test_stock_training_images_include_only_pinpanion_imports_with_provenance(tm
                                               len(encoded.tobytes()))
 
 
-def test_best_effort_suggestion_ranks_featureless_references_and_excludes_rejected_pin():
+def test_featureless_colour_alone_does_not_assign_a_pin_identity() -> None:
     red = np.full((90, 90, 3), (220, 30, 30), dtype=np.uint8)
     blue = np.full((90, 90, 3), (30, 30, 220), dtype=np.uint8)
     matcher = PinMatcher([
@@ -129,13 +235,40 @@ def test_best_effort_suggestion_ranks_featureless_references_and_excludes_reject
     ])
 
     assert matcher.match(red) is None
-    first = matcher.suggest(red)
-    assert first is not None and first.pin_id == 'pin-red'
-    assert first.confidence is not None and 0 <= first.confidence <= 1
-    second = matcher.suggest(red, excluded_pin_ids=frozenset({'pin-red'}))
-    assert second is not None and second.pin_id == 'pin-blue'
-    assert second.confidence is not None and 0 <= second.confidence <= 1
+    assert matcher.suggest(red) is None
+    assert matcher.suggest(red, excluded_pin_ids=frozenset({'pin-red'})) is None
     assert matcher.suggest(red, excluded_pin_ids=frozenset({'pin-red', 'pin-blue'})) is None
+    assert [match.pin_id for match in matcher.rank_matches(red)] == ['pin-red', 'pin-blue']
+
+
+def test_best_effort_uses_spatial_pattern_to_choose_between_similar_colours() -> None:
+    left_dark = np.full((96, 96, 3), 210, dtype=np.uint8)
+    left_dark[:, :48] = 35
+    center_dark = np.full((96, 96, 3), 210, dtype=np.uint8)
+    center_dark[:, 24:72] = 35
+    matcher = PinMatcher([
+        PinReference('pin-left', 'Left Dark', left_dark),
+        PinReference('pin-center', 'Center Dark', center_dark),
+    ])
+
+    with patch.object(matcher, 'match', return_value=None):
+        suggestion = matcher.suggest(left_dark)
+        assert suggestion is not None and suggestion.pin_id == 'pin-left'
+        assert matcher.suggest(left_dark, excluded_pin_ids=frozenset({'pin-left'})) is None
+        assert matcher.suggest(np.rot90(left_dark).copy()).pin_id == 'pin-left'
+    assert matcher.rank_matches(left_dark)[0].pin_id == 'pin-left'
+
+
+def test_best_effort_abstains_when_distinct_pins_look_equally_close() -> None:
+    pattern = np.full((96, 96, 3), 210, dtype=np.uint8)
+    pattern[:, :48] = 35
+    matcher = PinMatcher([
+        PinReference('pin-one', 'One', pattern),
+        PinReference('pin-two', 'Two', pattern.copy()),
+    ])
+
+    with patch.object(matcher, 'match', return_value=None):
+        assert matcher.suggest(pattern) is None
 
 
 def test_ranked_replacements_return_next_twenty_unique_unrejected_pins():
@@ -147,7 +280,7 @@ def test_ranked_replacements_return_next_twenty_unique_unrejected_pins():
 
     first = matcher.rank_matches(red, limit=20)
     assert [match.pin_id for match in first] == [f'pin-{index:02d}' for index in range(20)]
-    assert all(match.confidence == pytest.approx(1.0) for match in first)
+    assert all(match.confidence == pytest.approx(0.35) for match in first)
 
     following = matcher.rank_matches(
         red, limit=20, excluded_pin_ids=frozenset(match.pin_id for match in first))
@@ -208,9 +341,9 @@ def test_replacement_menu_displays_year_and_show_when_known(tmp_path):
                        if item.GetItemLabelText() == 'Replace with pin')
         labels = [item.GetItemLabelText() for item in submenu.GetMenuItems()
                   if not item.IsSeparator()]
-        assert '100% [2021/West] Some pin' in labels
-        assert '100% [2020] Year only' in labels
-        assert '100% Local pin' in labels
+        assert '35% [2021/West] Some pin' in labels
+        assert '35% [2020] Year only' in labels
+        assert '35% Local pin' in labels
         menu.Destroy()
     finally:
         window.Destroy()
@@ -246,7 +379,7 @@ def test_replace_with_pin_menu_rejects_one_page_then_confirms_a_later_choice(tmp
         assert len(items) == 12
         assert items[10].IsSeparator()
         assert items[11].GetItemLabelText() == 'none of these'
-        assert items[0].GetItemLabelText() == '100% Pin 00'
+        assert items[0].GetItemLabelText() == '35% Pin 00'
         submenu.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, items[11].GetId()))
         menu.Destroy()
         wait_for_catalog(window)
@@ -254,8 +387,8 @@ def test_replace_with_pin_menu_rejects_one_page_then_confirms_a_later_choice(tmp
         assert len(box.identity_rejections) == 10
         assert [review.pin_id for review in box.identity_rejections] == [
             f'pin-{index:02d}' for index in range(10)]
-        assert box.review_state == 'unconfirmed' and box.pin_id == 'pin-10'
-        assert box.tags == ['Pin 10'] and not box.identity_confirmed
+        assert box.review_state == 'unconfirmed' and box.pin_id is None
+        assert box.tags == [] and not box.identity_confirmed
         assert window._feedback_store.counts()['negative'] == 0
         assert len(window._feedback_store.identity_rejections_for_source(
             window._feedback_source)) == 10
@@ -272,7 +405,7 @@ def test_replace_with_pin_menu_rejects_one_page_then_confirms_a_later_choice(tmp
         items = list(submenu.GetMenuItems())
         assert len(items) == 7
         assert [item.GetItemLabelText() for item in items[:5]] == [
-            f'100% Pin {index:02d}' for index in range(10, 15)]
+            f'35% Pin {index:02d}' for index in range(10, 15)]
         submenu.ProcessEvent(wx.CommandEvent(wx.EVT_MENU.typeId, items[0].GetId()))
         menu.Destroy()
 
@@ -282,7 +415,7 @@ def test_replace_with_pin_menu_rejects_one_page_then_confirms_a_later_choice(tmp
         assert len(box.identity_rejections) == 10
 
         window.undo_action()
-        assert box.pin_id == 'pin-10' and not box.identity_confirmed
+        assert box.pin_id is None and not box.identity_confirmed
         assert len(box.identity_rejections) == 10
         window.undo_action()
         assert box.identity_rejections == ()
@@ -335,13 +468,13 @@ def test_none_of_these_retries_selected_area_with_next_identity(tmp_path):
         wait_for_catalog(window)
         assert [review.pin_id for review in box.identity_rejections] == [
             f'pin-{index:02d}' for index in range(10)]
-        assert (box.pin_id, box.tags) == ('pin-10', ['Pin 10'])
+        assert (box.pin_id, box.tags) == (None, [])
         assert box.review_state == 'unconfirmed' and not box.identity_confirmed
-        assert ImagePanel.get_box_label_text(box) == '100% Pin 10'
+        assert ImagePanel.get_box_label_text(box) == 'Candidate'
         editor = window._ScrubberFrame__tag_panel.find_panel_for_box(box)
         assert editor is not None
-        assert 'Match 100%' in editor._BoxTagPanelEdit__heading_text.GetLabel()
-        assert 'suggested Pin 10' in window.GetStatusBar().GetStatusText(1)
+        assert 'Match' not in editor._BoxTagPanelEdit__heading_text.GetLabel()
+        assert 'no other pin identity match' in window.GetStatusBar().GetStatusText(1)
         assert window._feedback_store.counts()['negative'] == 0
     finally:
         window.Destroy()
@@ -435,7 +568,7 @@ def test_each_full_none_of_these_page_saves_10_distinct_wrong_ids(tmp_path):
             assert len({item.example_id for item in stored}) == page * 10
             assert len({item.pin_id for item in stored}) == page * 10
             assert all(item.coords == box.coords and item.crop_png for item in stored)
-            assert box.pin_id == ('pin-10' if page == 1 else None)
+            assert box.pin_id is None
             assert f'10 wrong-ID examples saved ({page * 10} total)' in (
                 window._ScrubberFrame__tag_panel.training_status.GetLabel())
 
@@ -497,7 +630,7 @@ def test_none_of_these_reopens_the_replacement_list_with_next_matches(tmp_path):
                 sleep(0.005)
 
         assert len(shown) == 3
-        assert shown[1] == ['100% Pin 10', 'none of these']
+        assert shown[1] == ['35% Pin 10', 'none of these']
         assert shown[2] == ['No more catalog matches']
         assert len(box.identity_rejections) == 11
         assert '1 wrong-ID example saved (11 total)' in (
@@ -574,6 +707,37 @@ def test_confirmed_unidentified_areas_are_matched_before_auto_candidates():
     assert [kind for kind, _ in matcher.calls] == ['suggest', 'suggest', 'match']
     assert confirmed.pin_id == inherited.pin_id == 'pin-9'
     assert candidate.pin_id is None and named.tags == ['User supplied name']
+
+
+def test_catalog_abstention_clears_old_guesses_but_preserves_verified_identity() -> None:
+    image = reference_image(9)
+
+    class AbstainingMatcher:
+        def suggest(self, _crop: np.ndarray) -> None:
+            return None
+
+        match = suggest
+
+    provisional = BoxData((0, 0, 80, 80), ['Old guess'], 'automatic',
+                          pin_id='old-pin', match_confidence=0.95)
+    present = BoxData((80, 0, 80, 80), ['Another guess'], 'automatic',
+                      review_state='confirmed', pin_id='another-pin',
+                      match_confidence=0.95, identity_confirmed=False)
+    verified = BoxData((0, 80, 80, 80), ['Verified pin'], 'automatic',
+                       review_state='confirmed', identity_confirmed=True,
+                       pin_id='verified-pin', match_confidence=0.8)
+    identify_candidates(image, [provisional, present, verified],
+                        AbstainingMatcher(), best_effort=True)
+
+    for box in (provisional, present):
+        assert (box.pin_id, box.tags, box.match_confidence) == (None, [], None)
+    assert (verified.pin_id, verified.tags, verified.match_confidence) == (
+        'verified-pin', ['Verified pin'], 0.8)
+    present.pin_id = 'another-pin'
+    present.tags = ['Another guess']
+    present.match_confidence = 0.95
+    identify_candidates(image, [present], AbstainingMatcher())
+    assert (present.pin_id, present.tags, present.match_confidence) == (None, [], None)
 
 
 def test_reviewed_identity_model_can_identify_confirmed_pin_when_catalog_is_weak():
@@ -843,6 +1007,12 @@ def test_not_this_pin_retries_automatic_area_with_next_suggestion(tmp_path, sour
             wx.Yield()
             sleep(0.005)
         assert not window._pending_catalog
+        # Allow the saved-frame reconciliation queued by the retry to commit.
+        deadline = monotonic() + 2
+        while window._pending_reconcile is not None and monotonic() < deadline:
+            wx.Yield()
+            sleep(0.005)
+        assert window._pending_reconcile is None
         assert box.review_state == 'unconfirmed'
         assert (box.pin_id, box.tags, box.match_confidence) == (
             'pin-second', ['Second Pin'], 0.12)
@@ -1244,12 +1414,13 @@ def test_identification_persists_and_tracks_canonical_pin_id(tmp_path):
     assert tracked[0].tags == ['Known Pin']
 
 
-def test_detect_button_scores_best_available_catalog_match_for_each_candidate(tmp_path):
+def test_detect_button_leaves_visually_unmatched_candidate_unidentified(
+        tmp_path: Path) -> None:
     app = wx.App.Get() or wx.App(False)
     db_path, known = make_catalog(tmp_path)
     frame = np.zeros((300, 400, 3), dtype=np.uint8)
     frame[40:220, 30:210] = known
-    frame[40:220, 215:395] = reference_image(2)
+    frame[40:220, 215:395] = (20, 30, 220)
     window = VideoScrubber(None, 'Catalog test', '',
                            image_array=[cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)],
                            catalog_path=str(db_path))
@@ -1264,11 +1435,10 @@ def test_detect_button_scores_best_available_catalog_match_for_each_candidate(tm
         assert boxes[0].pin_id == 'pin-1'
         assert boxes[0].tags == ['Known Pin']
         assert panel.get_box_label_text(boxes[0]).split()[0].endswith('%')
-        assert boxes[1].pin_id == 'pin-1'
-        assert boxes[1].match_confidence is not None
-        assert panel.get_box_label_text(boxes[1]).split()[0].endswith('%')
+        assert boxes[1].pin_id is None
+        assert boxes[1].match_confidence is None
         assert panel.get_box_colour(boxes[0]) == wx.RED
-        assert panel.get_box_colour(boxes[1]) == wx.RED
+        assert panel.get_box_colour(boxes[1]) == wx.BLUE
         assert window._ScrubberFrame__tag_panel.boxes == boxes
 
         tag_panel = window._ScrubberFrame__tag_panel.find_panel_for_box(boxes[0])

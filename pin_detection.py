@@ -134,7 +134,10 @@ def propose_regions(image: np.ndarray, settings: DetectionSettings = DetectionSe
     # A second coarse cue catches colorful silhouettes whose outlines touch
     # printed artwork or the edge of a backing card.
     lab = cv2.cvtColor(working, cv2.COLOR_RGB2LAB).astype(np.float32)
-    background = cv2.GaussianBlur(lab, (0, 0), 24)
+    # Sigma 24 at full working size is costly; a quarter-size blur at sigma 6 is near-identical.
+    small = cv2.resize(lab, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    background = cv2.resize(cv2.GaussianBlur(small, (0, 0), 6),
+                            (lab.shape[1], lab.shape[0]), interpolation=cv2.INTER_LINEAR)
     difference = np.linalg.norm(lab - background, axis=2)
     color_mask = np.uint8(difference > 40) * 255
     color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE,
@@ -163,6 +166,9 @@ def propose_regions(image: np.ndarray, settings: DetectionSettings = DetectionSe
     return [rect for rect in proposals[:settings.max_candidates] if _has_local_contrast(image, rect)]
 
 
+_REFINE_MAX_SIDE = 256
+
+
 def refine_region(image: np.ndarray, region: Coordinate) -> Coordinate | None:
     """Find the main foreground component inside a coarse region.
 
@@ -176,7 +182,10 @@ def refine_region(image: np.ndarray, region: Coordinate) -> Coordinate | None:
     x1, y1 = min(width, x + w), min(height, y + h)
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None
-    crop = image[y0:y1, x0:x1]
+    full_crop = image[y0:y1, x0:x1]
+    factor = min(1.0, _REFINE_MAX_SIDE / max(full_crop.shape[:2]))
+    crop = (cv2.resize(full_crop, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
+            if factor < 1.0 else full_crop)
     lab = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
     rim = max(2, int(min(crop.shape[:2]) * 0.12))
     border = np.concatenate((lab[:rim].reshape(-1, 3), lab[-rim:].reshape(-1, 3),
@@ -198,11 +207,16 @@ def refine_region(image: np.ndarray, region: Coordinate) -> Coordinate | None:
         if area < max(20, 0.01 * crop.shape[0] * crop.shape[1]):
             continue
         distance_from_center = np.linalg.norm((centroids[index] - center) / np.array([crop.shape[1], crop.shape[0]]))
-        candidates.append((area / (1 + 4 * distance_from_center), (x0 + bx, y0 + by, bw, bh)))
+        candidates.append((area / (1 + 4 * distance_from_center), (bx, by, bw, bh)))
     if not candidates:
         return None
     bx, by, bw, bh = max(candidates, key=lambda candidate: candidate[0])[1]
-    return int(bx), int(by), int(bw), int(bh)
+    if factor < 1.0:
+        left, top = int(bx / factor), int(by / factor)
+        right = min(full_crop.shape[1], int(np.ceil((bx + bw) / factor)))
+        bottom = min(full_crop.shape[0], int(np.ceil((by + bh) / factor)))
+        bx, by, bw, bh = left, top, right - left, bottom - top
+    return int(x0 + bx), int(y0 + by), int(bw), int(bh)
 
 
 def detect_pin_boxes(image: np.ndarray, settings: DetectionSettings = DetectionSettings(),
@@ -755,30 +769,88 @@ def add_new_detections(existing: list[BoxData], detections: list[Coordinate]) ->
     return add_unique_boxes(existing, [BoxData(coords, [], 'automatic') for coords in detections])
 
 
+def _has_larger_pin_peers(image: np.ndarray, box: BoxData,
+                          frame_boxes: list[BoxData]) -> bool:
+    """Require three distinct, full-size peers before vetoing a tiny guess."""
+    if (box.source != 'automatic' or box.review_state != 'unconfirmed' or
+            box.prev_box_id is not None or box.identity_confirmed or
+            box.feedback_id is not None or box.is_set):
+        return False
+    height, width = image.shape[:2]
+    x, y, w, h = box.coords
+    if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > width or y + h > height:
+        return False
+    clipped_x = x <= 1 or x + w >= width - 1
+    clipped_y = y <= 1 or y + h >= height - 1
+    if clipped_x and clipped_y:
+        return False
+    larger: list[Coordinate] = []
+    for other in frame_boxes:
+        ox, oy, ow, oh = other.coords
+        if (other is box or other.review_state == 'rejected' or other.is_set or
+                ow <= 0 or oh <= 0 or ox <= 1 or oy <= 1 or
+                ox + ow >= width - 1 or oy + oh >= height - 1 or
+                _strongly_overlaps(box.coords, other.coords)):
+            continue
+        if ((not clipped_x and 2 * w >= ow) or
+                (not clipped_y and 2 * h >= oh)):
+            continue
+        if any(_strongly_overlaps(other.coords, peer) for peer in larger):
+            continue
+        larger.append(other.coords)
+        if len(larger) >= 3:
+            return True
+    return False
+
+
 def filter_new_candidates_by_pin_size(image: np.ndarray, existing: list[BoxData],
                                       proposed: list[BoxData]) -> list[BoxData]:
-    """Use directly confirmed, fully visible pins as a size prior.
+    """Use reviewed pin presence, linked observations, or proposal consensus.
 
-    New proposals should be within 75% to 133% of the median pin width and
+    New proposals should be within 50% to 150% of the reference width and
     height. A clipped proposal may be narrow along the clipped axis; saved
     annotations and tracked observations are never filtered by this prior.
     """
     height, width = image.shape[:2]
-    anchors = [box.coords for box in (*existing, *proposed)
-               if box.review_state == 'confirmed' and not box.is_set and
+    frame_boxes = [*existing, *proposed]
+    tiny_outliers = {id(box) for box in proposed
+                     if _has_larger_pin_peers(image, box, frame_boxes)}
+    visible = [box for box in (*existing, *proposed)
+               if box.review_state != 'rejected' and not box.is_set and
                box.coords[2] > 0 and box.coords[3] > 0 and
                box.coords[0] > 1 and box.coords[1] > 1 and
                box.coords[0] + box.coords[2] < width - 1 and
                box.coords[1] + box.coords[3] < height - 1]
+    # A direct pin-presence review is enough; a specific catalog identity is
+    # not required. On later frames, its inherited observation is the next
+    # best source of camera-scale evidence when no direct review is visible.
+    anchors = [box.coords for box in visible if box.review_state == 'confirmed']
     if not anchors:
-        return proposed
+        anchors = [box.coords for box in visible if box.review_state == 'inherited']
+    if not anchors:
+        # Unreviewed proposals can contain both backing-card details and true
+        # pins. Trust their common size only when at least three agree and form
+        # a strict majority of the fully visible observations in this frame.
+        candidates: list[Coordinate] = []
+        for box in visible:
+            if not any(_strongly_overlaps(box.coords, other) for other in candidates):
+                candidates.append(box.coords)
+        groups = [[other for other in candidates
+                   if 0.75 <= other[2] / seed[2] <= 4 / 3 and
+                   0.75 <= other[3] / seed[3] <= 4 / 3]
+                  for seed in candidates]
+        anchors = max(groups, key=len, default=[])
+        if len(anchors) < 3 or len(anchors) * 2 <= len(candidates):
+            return [box for box in proposed if id(box) not in tiny_outliers]
     typical_width = float(np.median([box[2] for box in anchors]))
     typical_height = float(np.median([box[3] for box in anchors]))
     typical_area = float(np.median([box[2] * box[3] for box in anchors]))
-    minimum_width, maximum_width = 0.75 * typical_width, 4 / 3 * typical_width
-    minimum_height, maximum_height = 0.75 * typical_height, 4 / 3 * typical_height
+    minimum_width, maximum_width = 0.5 * typical_width, 1.5 * typical_width
+    minimum_height, maximum_height = 0.5 * typical_height, 1.5 * typical_height
     kept: list[BoxData] = []
     for box in proposed:
+        if id(box) in tiny_outliers:
+            continue
         if (box.source != 'automatic' or box.review_state != 'unconfirmed' or
                 box.prev_box_id is not None):
             kept.append(box)
@@ -919,6 +991,10 @@ def needs_catalog_match(box: BoxData, best_effort: bool = False) -> bool:
          not (best_effort and box.source == 'processed')) or
             box.review_state == 'rejected' or box.identity_confirmed):
         return False
+    # A suggestion that survived a wrong-identity review came from the explicit
+    # retry; ordinary passes use weaker matching and would replace it.
+    if box.pin_id and box.identity_rejections and not best_effort:
+        return False
     # A typed free-form name is deliberate; do not replace it with a guess.
     if box.source == 'user' and has_specific_identity(box) and box.pin_id is None:
         return False
@@ -931,13 +1007,21 @@ def needs_catalog_match(box: BoxData, best_effort: bool = False) -> bool:
 def identify_candidates(image: np.ndarray, boxes: list[BoxData], matcher: PinMatcher,
                         best_effort: bool = False,
                         feedback_model: FeedbackModel | None = None,
-                        prefer_reviewed_identity: bool = False) -> list[BoxData]:
+                        prefer_reviewed_identity: bool = False,
+                        size_context: list[BoxData] | None = None) -> list[BoxData]:
     """Find a catalog suggestion for unverified pin boxes."""
     _validate_image(image)
     height, width = image.shape[:2]
     priority = {'confirmed': 0, 'inherited': 1, 'unconfirmed': 2}
+    frame_boxes = size_context if size_context is not None else boxes
     for box in sorted(boxes, key=lambda item: (priority.get(item.review_state, 3),
                                                item.source != 'user')):
+        if _has_larger_pin_peers(image, box, frame_boxes):
+            if box.pin_id is not None:
+                box.pin_id = None
+                box.tags = []
+                box.match_confidence = None
+            continue
         if not needs_catalog_match(box, best_effort=best_effort):
             continue
         x, y, w, h = box.coords
@@ -971,6 +1055,12 @@ def identify_candidates(image: np.ndarray, boxes: list[BoxData], matcher: PinMat
             box.pin_id = match.pin_id
             box.tags = [match.name]
             box.match_confidence = match.confidence if match.confidence is not None else 0.0
+        elif box.pin_id is not None and not box.identity_confirmed:
+            # A previous automatic suggestion is not a user decision. Remove
+            # it when fresh catalog and reviewed-crop checks both abstain.
+            box.pin_id = None
+            box.tags = []
+            box.match_confidence = None
     return boxes
 
 

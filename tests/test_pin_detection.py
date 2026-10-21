@@ -10,18 +10,25 @@ from unittest.mock import patch
 from boxdata import BoxData, IdentityRejection
 from detection_feedback import FeedbackModel, FeedbackStore
 from frame_processing import FrameJob, FrameResult, process_frame
+from pin_catalog import PinMatch, PinMatcher
 from pin_detection import (add_new_detections, add_unique_boxes, associate_frame_boxes,
                            consolidate_overlapping_boxes,
                            detect_pin_boxes, detect_pin_boxes_relaxed,
                            filter_new_candidates_by_pin_size,
-                           inherit_corrected_bounds, match_existing_candidates,
-                           refine_region)
-from scrubberframe import (load_boxes_from_stream, reconcile_saved_frames,
+                           identify_candidates, inherit_corrected_bounds,
+                           match_existing_candidates,
+                           needs_catalog_match, propose_regions, refine_region)
+from scrubberframe import (ScrubberFrame, load_boxes_from_stream, reconcile_saved_frames,
                            save_boxes_to_stream)
 from videoscrubber import VideoScrubber
 
 
 BACKGROUND = (145, 165, 185)
+
+
+def test_playback_paces_fast_frames_without_extra_delay_for_slow_frames():
+    assert ScrubberFrame.playback_delay_ms(17, 5) == 12
+    assert ScrubberFrame.playback_delay_ms(17, 130) == 1
 
 
 def make_frame(first_x=45, include_second=True):
@@ -111,24 +118,25 @@ def test_new_candidate_sizes_follow_confirmed_pins_but_keep_edge_fragments():
     assert [box.coords for box in kept] == [(150, 50, 62, 58), (0, 155, 15, 58)]
 
 
-def test_size_prior_uses_75_to_133_percent_on_each_full_dimension():
+def test_size_prior_uses_50_to_150_percent_on_each_full_dimension():
     frame = np.full((240, 500, 3), BACKGROUND, dtype=np.uint8)
     confirmed = BoxData((20, 20, 60, 60), [], 'user', review_state='confirmed')
+    assert not confirmed.identity_confirmed
     proposed = [BoxData(coords, [], 'automatic') for coords in (
-        (110, 20, 45, 45), (170, 20, 80, 80),
-        (270, 20, 44, 60), (330, 20, 81, 60),
-        (110, 125, 60, 44), (190, 125, 60, 81),
+        (110, 20, 30, 30), (170, 20, 90, 90),
+        (270, 20, 29, 60), (330, 20, 91, 60),
+        (110, 125, 60, 29), (190, 125, 60, 91),
         (0, 125, 20, 60), (270, 0, 60, 20),
-        (0, 0, 10, 10), (0, 125, 20, 44))]
+        (0, 0, 10, 10), (0, 125, 20, 29))]
 
     kept = filter_new_candidates_by_pin_size(frame, [confirmed], proposed)
 
     assert [box.coords for box in kept] == [
-        (110, 20, 45, 45), (170, 20, 80, 80),
+        (110, 20, 30, 30), (170, 20, 90, 90),
         (0, 125, 20, 60), (270, 0, 60, 20)]
 
 
-def test_size_filter_preserves_saved_and_tracked_boxes_and_needs_a_pin_reference():
+def test_size_filter_preserves_saved_boxes_and_uses_inherited_pin_reference():
     frame = np.full((240, 360, 3), BACKGROUND, dtype=np.uint8)
     saved = BoxData((130, 120, 170, 105), [], 'automatic')
     candidate = BoxData((255, 50, 9, 10), [], 'automatic')
@@ -141,7 +149,8 @@ def test_size_filter_preserves_saved_and_tracked_boxes_and_needs_a_pin_reference
 
     inherited = BoxData((45, 50, 60, 60), [], 'automatic',
                         review_state='inherited', identity_confirmed=True)
-    assert filter_new_candidates_by_pin_size(frame, [inherited], [candidate]) == [candidate]
+    assert filter_new_candidates_by_pin_size(frame, [inherited], [candidate]) == []
+    assert inherited.coords == (45, 50, 60, 60)
 
     confirmed = BoxData((45, 50, 60, 60), [], 'user',
                         review_state='confirmed')
@@ -149,6 +158,144 @@ def test_size_filter_preserves_saved_and_tracked_boxes_and_needs_a_pin_reference
                       review_state='inherited')
     assert filter_new_candidates_by_pin_size(frame, [confirmed, saved],
                                              [tracked, candidate]) == [tracked]
+
+
+def test_inherited_presence_only_pin_sets_size_reference_without_identity() -> None:
+    frame = np.full((240, 500, 3), BACKGROUND, dtype=np.uint8)
+    inherited = BoxData((30, 35, 60, 64), [], 'automatic',
+                        review_state='inherited', identity_confirmed=False)
+    proposed = [BoxData(coords, [], 'automatic') for coords in (
+        (140, 35, 64, 60), (250, 35, 10, 10), (320, 35, 160, 135))]
+
+    kept = filter_new_candidates_by_pin_size(frame, [inherited], proposed)
+
+    assert kept == proposed[:1]
+    assert inherited.review_state == 'inherited'
+    assert not inherited.identity_confirmed
+
+
+def test_direct_presence_review_takes_priority_over_inherited_size() -> None:
+    frame = np.full((300, 700, 3), BACKGROUND, dtype=np.uint8)
+    confirmed = BoxData((20, 20, 60, 60), [], 'user',
+                        review_state='confirmed', identity_confirmed=False)
+    inherited = BoxData((160, 20, 150, 150), [], 'automatic',
+                        review_state='inherited', identity_confirmed=False)
+    proposed = [BoxData((360, 20, 65, 65), [], 'automatic'),
+                BoxData((460, 20, 155, 150), [], 'automatic')]
+
+    assert filter_new_candidates_by_pin_size(
+        frame, [confirmed, inherited], proposed) == proposed[:1]
+
+
+def test_worker_filters_new_sizes_against_inherited_presence_only_pin() -> None:
+    frame = np.full((260, 520, 3), BACKGROUND, dtype=np.uint8)
+    inherited = BoxData((30, 35, 60, 64), [], 'automatic',
+                        review_state='inherited', identity_confirmed=False)
+
+    class NoMatch:
+        def suggest(self, _crop: np.ndarray) -> None:
+            return None
+
+        match = suggest
+
+    job = FrameJob(0, None, [], [inherited], [], frame, None, None, NoMatch(),
+                   expected_pins=2)
+    with (patch('frame_processing.detect_pin_boxes', return_value=[
+            (140, 35, 64, 60), (250, 35, 10, 10)]),
+          patch('frame_processing.detect_pin_boxes_relaxed', return_value=[
+              (320, 35, 160, 135), (140, 145, 62, 60)])):
+        result = process_frame(job, lambda _index: pytest.fail('decoded cached frame'))
+
+    assert [box.coords for box in result.boxes] == [
+        inherited.coords, (140, 35, 64, 60), (140, 145, 62, 60)]
+
+
+def test_size_prior_uses_an_unreviewed_majority_when_no_pin_is_confirmed():
+    frame = np.full((300, 600, 3), BACKGROUND, dtype=np.uint8)
+    proposed = [BoxData(coords, [], 'automatic') for coords in (
+        (20, 30, 60, 62), (110, 30, 63, 60), (210, 30, 58, 61),
+        (300, 30, 8, 8), (390, 30, 140, 145))]
+
+    kept = filter_new_candidates_by_pin_size(frame, [], proposed)
+
+    assert kept == proposed[:3]
+
+
+def test_size_prior_does_not_guess_from_scattered_unreviewed_boxes():
+    frame = np.full((300, 600, 3), BACKGROUND, dtype=np.uint8)
+    proposed = [BoxData(coords, [], 'automatic') for coords in (
+        (20, 30, 15, 15), (110, 30, 60, 60), (300, 30, 140, 140))]
+
+    assert filter_new_candidates_by_pin_size(frame, [], proposed) == proposed
+
+
+def test_overlapping_unreviewed_boxes_do_not_create_a_size_reference():
+    frame = np.full((300, 600, 3), BACKGROUND, dtype=np.uint8)
+    existing = [BoxData((20, 30, 60, 60), [], 'automatic'),
+                BoxData((22, 32, 60, 60), [], 'automatic')]
+    proposed = [BoxData((21, 31, 60, 60), [], 'automatic'),
+                BoxData((300, 30, 140, 140), [], 'automatic')]
+
+    assert filter_new_candidates_by_pin_size(frame, existing, proposed) == proposed
+
+
+def test_many_larger_boxes_reject_a_tiny_proposal_without_a_size_majority():
+    frame = np.full((320, 700, 3), BACKGROUND, dtype=np.uint8)
+    proposed = [BoxData(coords, [], 'automatic') for coords in (
+        (20, 30, 65, 60), (120, 30, 100, 75), (270, 30, 135, 100),
+        (500, 30, 10, 10))]
+
+    assert filter_new_candidates_by_pin_size(frame, [], proposed) == proposed[:3]
+
+
+def test_tiny_saved_automatic_box_does_not_receive_a_catalog_suggestion():
+    frame = np.full((320, 700, 3), BACKGROUND, dtype=np.uint8)
+    larger = [BoxData(coords, [], 'automatic') for coords in (
+        (20, 30, 65, 60), (120, 30, 100, 75), (270, 30, 135, 100))]
+    tiny = BoxData((500, 30, 10, 10), ['Old guess'], 'automatic',
+                   pin_id='old-id', match_confidence=0.7)
+    matcher = PinMatcher([])
+    with patch.object(PinMatcher, 'match',
+                      return_value=PinMatch('new-id', 'New guess', 12, 0.9)) as match:
+        identify_candidates(frame, [*larger, tiny], matcher)
+
+    assert match.call_count == 3
+    assert (tiny.pin_id, tiny.tags, tiny.match_confidence) == (None, [], None)
+    assert tiny.review_state == 'unconfirmed'
+
+
+def test_worker_clears_a_tiny_saved_suggestion_but_preserves_direct_reviews():
+    frame = np.full((320, 700, 3), BACKGROUND, dtype=np.uint8)
+    larger = [BoxData(coords, [], 'automatic') for coords in (
+        (20, 30, 65, 60), (120, 30, 100, 75), (270, 30, 135, 100))]
+    tiny = BoxData((500, 30, 10, 10), ['Old guess'], 'automatic',
+                   pin_id='old-id', match_confidence=0.7)
+    reviewed = BoxData((520, 60, 10, 10), ['Reviewed pin'], 'automatic',
+                       pin_id='reviewed-id', review_state='confirmed',
+                       identity_confirmed=True)
+    job = FrameJob(0, None, [], [*larger, tiny, reviewed], [],
+                   frame, None, None, PinMatcher([]))
+    with (patch('frame_processing.detect_pin_boxes', return_value=[]),
+          patch.object(PinMatcher, 'match',
+                       return_value=PinMatch('new-id', 'New guess', 12, 0.9))):
+        result = process_frame(job, lambda _index: pytest.fail('decoded cached frame'))
+
+    assert (result.boxes[3].pin_id, result.boxes[3].tags) == (None, [])
+    assert (result.boxes[4].pin_id, result.boxes[4].tags) == (
+        'reviewed-id', ['Reviewed pin'])
+
+
+def test_edge_fragment_can_still_receive_an_identity_with_large_peers():
+    frame = np.full((320, 700, 3), BACKGROUND, dtype=np.uint8)
+    larger = [BoxData(coords, [], 'automatic') for coords in (
+        (20, 30, 65, 60), (120, 30, 100, 75), (270, 30, 135, 100))]
+    fragment = BoxData((0, 180, 10, 60), [], 'automatic')
+    matcher = PinMatcher([])
+    with patch.object(PinMatcher, 'match',
+                      return_value=PinMatch('edge-id', 'Edge pin', 12, 0.9)):
+        identify_candidates(frame, [*larger, fragment], matcher)
+
+    assert fragment.pin_id == 'edge-id'
 
 
 def test_worker_filters_primary_and_fallback_candidates_using_confirmed_pin_size():
@@ -171,7 +318,19 @@ def test_worker_filters_primary_and_fallback_candidates_using_confirmed_pin_size
         confirmed.coords, (150, 50, 62, 58), (0, 155, 15, 58)]
 
 
-def test_worker_uses_tighter_size_prior_for_primary_and_relaxed_proposals():
+def test_worker_uses_size_consensus_without_a_confirmed_pin():
+    frame = np.full((300, 600, 3), BACKGROUND, dtype=np.uint8)
+    proposals = [(20, 30, 60, 62), (110, 30, 63, 60),
+                 (210, 30, 58, 61), (300, 30, 8, 8)]
+
+    job = FrameJob(0, None, [], [], [], frame, None, None, PinMatcher([]))
+    with patch('frame_processing.detect_pin_boxes', return_value=proposals):
+        result = process_frame(job, lambda _index: pytest.fail('decoded cached frame'))
+
+    assert [box.coords for box in result.boxes] == proposals[:3]
+
+
+def test_worker_uses_size_prior_for_primary_and_relaxed_proposals():
     frame = np.full((240, 500, 3), BACKGROUND, dtype=np.uint8)
     confirmed = BoxData((20, 20, 60, 60), [], 'user', review_state='confirmed')
 
@@ -182,14 +341,14 @@ def test_worker_uses_tighter_size_prior_for_primary_and_relaxed_proposals():
     job = FrameJob(0, None, [], [confirmed], [], frame, None, None, NoMatch(),
                    expected_pins=2)
     with (patch('frame_processing.detect_pin_boxes', return_value=[
-            (110, 20, 44, 60), (180, 20, 45, 60), (250, 20, 80, 60)]),
+            (110, 20, 29, 60), (180, 20, 30, 60), (250, 20, 90, 60)]),
           patch('frame_processing.detect_pin_boxes_relaxed', return_value=[
-              (110, 125, 60, 44), (200, 125, 60, 45), (290, 125, 60, 81)])):
+              (110, 125, 60, 29), (200, 125, 60, 30), (290, 125, 60, 91)])):
         result = process_frame(job, lambda _index: pytest.fail('decoded cached frame'))
 
     assert [box.coords for box in result.boxes] == [
-        confirmed.coords, (180, 20, 45, 60), (250, 20, 80, 60),
-        (200, 125, 60, 45)]
+        confirmed.coords, (180, 20, 30, 60), (250, 20, 90, 60),
+        (200, 125, 60, 30)]
 
 
 def test_fallback_matches_only_new_boxes_once(caplog):
@@ -421,6 +580,37 @@ def test_same_pin_overlapping_boxes_merge_without_losing_direct_review():
     assert reviewed.coords == (40, 40, 45, 45)
 
 
+@pytest.mark.gui
+def test_playback_consolidation_only_visits_changed_frame(tmp_path):
+    app = wx.App.Get() or wx.App(False)
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    window = VideoScrubber(None, 'Scoped playback merge', '',
+                           image_array=[frame, frame], load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        first = BoxData((40, 40, 45, 45), ['Mario'], 'user',
+                        pin_id='pinpanion:7', review_state='confirmed',
+                        identity_confirmed=True)
+        duplicate = BoxData((43, 42, 44, 46), ['Mario'], 'automatic',
+                            pin_id='pinpanion:7')
+        untouched = [BoxData((40, 40, 45, 45), ['Mario'], 'user',
+                             pin_id='pinpanion:7', review_state='confirmed',
+                             identity_confirmed=True),
+                     BoxData((43, 42, 44, 46), ['Mario'], 'automatic',
+                             pin_id='pinpanion:7')]
+        window._ScrubberFrame__frame_boxes.update({0: [duplicate, first],
+                                                   1: untouched})
+
+        window._sync_automatic_consolidation(frame_index=0)
+
+        assert window._ScrubberFrame__frame_boxes[0] == [first]
+        assert window._ScrubberFrame__frame_boxes[1] is untouched
+        assert len(untouched) == 2
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
 def test_conflicting_confirmed_pins_are_not_merged():
     first = BoxData((40, 40, 45, 45), ['Mario'], 'user',
                     pin_id='pinpanion:7', review_state='confirmed',
@@ -455,6 +645,96 @@ def test_wrong_identity_review_is_not_merged_into_rejected_catalog_id():
 
     assert consolidate_overlapping_boxes([reviewed, suggestion]) == (
         [reviewed, suggestion], [])
+
+
+def test_ordinary_catalog_pass_keeps_suggestion_after_wrong_identity_review():
+    review = IdentityRejection('wrong-1', 'pinpanion:1', ('Wrong',), (40, 40, 40, 40))
+    box = BoxData((40, 40, 40, 40), ['Right'], 'automatic', pin_id='pinpanion:2',
+                  identity_rejections=(review,))
+
+    assert not needs_catalog_match(box)
+    assert needs_catalog_match(box, best_effort=True)
+
+
+def test_ordinary_catalog_pass_rechecks_unverified_confirmed_suggestion() -> None:
+    strong = BoxData((40, 40, 40, 40), ['Right'], 'automatic', pin_id='pinpanion:2',
+                     match_confidence=0.7, review_state='confirmed',
+                     identity_confirmed=False)
+    weak = BoxData((40, 40, 40, 40), ['Maybe'], 'automatic', pin_id='pinpanion:3',
+                   match_confidence=0.2, review_state='confirmed',
+                   identity_confirmed=False)
+
+    assert needs_catalog_match(strong)
+    assert needs_catalog_match(strong, best_effort=True)
+    assert needs_catalog_match(weak)
+
+
+def test_color_cue_finds_discs_on_gradient_background_after_downscaled_blur():
+    ramp = np.linspace(100, 180, 640, dtype=np.uint8)
+    frame = np.dstack([np.tile(ramp, (480, 1))] * 3).copy()
+    centers = [(120, 120), (320, 300), (520, 140)]
+    for center, color in zip(centers, [(220, 30, 30), (30, 200, 40), (40, 40, 230)]):
+        cv2.circle(frame, center, 36, color, -1)
+
+    regions = propose_regions(frame)
+
+    for cx, cy in centers:
+        assert any(x <= cx <= x + w and y <= cy <= y + h and max(w, h) < 160
+                   for x, y, w, h in regions)
+
+
+def test_refine_region_on_large_crop_stays_within_a_few_pixels_of_full_resolution():
+    frame = np.full((1200, 1200, 3), BACKGROUND, dtype=np.uint8)
+    cv2.circle(frame, (600, 600), 300, (200, 40, 60), -1)
+
+    x, y, w, h = refine_region(frame, (200, 200, 800, 800))
+
+    assert all(abs(got - want) <= 4 for got, want in
+               zip((x, y, w, h), (300, 300, 601, 601)))
+
+
+def test_low_resolution_worker_returns_source_pixels_and_keeps_existing_boxes_exact():
+    frame = np.full((480, 720, 3), BACKGROUND, dtype=np.uint8)
+    cv2.circle(frame, (500, 300), 60, (30, 160, 40), -1)
+    saved = BoxData((41, 43, 77, 79), [], 'automatic', bounds_adjustment=(3, -5, 7, 9))
+    job = FrameJob(0, None, [], [saved], [], frame, None, None, None,
+                   low_resolution=True)
+    seen_shapes = []
+
+    def record_detection(image, **_kwargs):
+        seen_shapes.append(image.shape[:2])
+        return [(180, 100, 60, 60)]
+
+    with (patch('frame_processing.LOW_RESOLUTION_SIDE', 360),
+          patch('frame_processing.detect_pin_boxes', side_effect=record_detection),
+          patch('frame_processing.identify_candidates', side_effect=lambda _f, b, *_a, **_k: b)):
+        result = process_frame(job, lambda _index: pytest.fail('decoded cached frame'))
+
+    assert seen_shapes == [(240, 360)]
+    assert result.frame.shape == frame.shape
+    assert saved.coords == (41, 43, 77, 79)
+    assert saved.bounds_adjustment == (3, -5, 7, 9)
+    assert (360, 200, 120, 120) in [box.coords for box in result.boxes]
+    assert all(x + w <= 720 and y + h <= 480 for x, y, w, h in
+               (box.coords for box in result.boxes))
+
+
+def test_low_resolution_worker_runs_catalog_on_full_resolution_frame():
+    frame = np.full((480, 720, 3), BACKGROUND, dtype=np.uint8)
+    job = FrameJob(0, None, [], [], [], frame, None, None, None, low_resolution=True)
+    catalog_sizes = []
+
+    def record(image, boxes, *_args, **_kwargs):
+        catalog_sizes.append(image.shape[:2])
+        return boxes
+
+    with (patch('frame_processing.LOW_RESOLUTION_SIDE', 360),
+          patch('frame_processing.detect_pin_boxes', return_value=[(180, 100, 60, 60)]),
+          patch('frame_processing.identify_candidates', side_effect=record)):
+        result = process_frame(job, lambda _index: pytest.fail('decoded cached frame'))
+
+    assert catalog_sizes == [(480, 720)]
+    assert [box.coords for box in result.boxes] == [(360, 200, 120, 120)]
 
 
 def test_worker_keeps_reviewed_track_beside_unrelated_saved_proposal():

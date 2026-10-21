@@ -1,4 +1,5 @@
 import type { PinIdentity, StorageLike } from './library.js';
+import { jsonRecord, parseJson, type JsonInput } from './json_input.js';
 
 const DATABASE_NAME = 'pinident.mobile.catalog';
 const STORE = 'snapshot';
@@ -42,20 +43,21 @@ export function emptyFilters(): CatalogFilters {
   return { query: '', year: null, categoryId: null, setId: null, eventId: null, groupId: null };
 }
 
-function validId(value: unknown): value is number {
+function validId(value: JsonInput): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
-function optionalId(value: unknown): number | undefined {
+function optionalId(value: JsonInput): number | undefined {
   return validId(value) ? value : undefined;
 }
 
-function namedFacets(value: unknown): NamedFacet[] {
+function namedFacets(value: JsonInput): NamedFacet[] {
   if (!Array.isArray(value)) return [];
   const facets = new Map<number, string>();
-  for (const entry of value as unknown[]) {
+  for (const entry of value as JsonInput[]) {
     if (typeof entry !== 'object' || entry === null) continue;
-    const row = entry as Record<string, unknown>;
+    const row = jsonRecord(entry);
+    if (!row) continue;
     if (validId(row.id) && typeof row.name === 'string' && row.name.trim()) {
       facets.set(row.id, row.name.trim());
     }
@@ -63,15 +65,16 @@ function namedFacets(value: unknown): NamedFacet[] {
   return [...facets].map(([id, name]) => ({ id, name }));
 }
 
-export function parseFeed(value: unknown): CatalogSnapshot {
+export function parseFeed(value: JsonInput): CatalogSnapshot {
   if (typeof value !== 'object' || value === null || !('pins' in value) ||
       !Array.isArray(value.pins)) throw new Error('Unexpected Pinpanion catalog format.');
-  const feed = value as Record<string, unknown>;
+  const feed = value as Record<string, JsonInput>;
   const pins: CatalogPin[] = [];
   const seen = new Set<number>();
-  for (const row of feed.pins as unknown[]) {
+  for (const row of feed.pins as JsonInput[]) {
     if (typeof row !== 'object' || row === null) continue;
-    const pin = row as Record<string, unknown>;
+    const pin = jsonRecord(row);
+    if (!pin) continue;
     if (!validId(pin.id) || seen.has(pin.id) ||
         typeof pin.name !== 'string' || !pin.name.trim()) continue;
     seen.add(pin.id);
@@ -79,7 +82,7 @@ export function parseFeed(value: unknown): CatalogSnapshot {
       /^[^/\\?#]+$/.test(pin.image_name) && !['.', '..'].includes(pin.image_name)
       ? `https://pinpanion.com/imgs/${encodeURIComponent(pin.image_name)}` : undefined;
     const categories = Array.isArray(pin.categoryIds)
-      ? [...new Set((pin.categoryIds as unknown[]).filter(validId))] : [];
+      ? [...new Set((pin.categoryIds as JsonInput[]).filter(validId))] : [];
     pins.push({
       pin_id: `pinpanion:${pin.id}`,
       name: pin.name.trim(),
@@ -120,8 +123,8 @@ export function filterCatalog(snapshot: CatalogSnapshot, filters: CatalogFilters
 
 export function loadRecentPinIds(storage: Pick<StorageLike, 'getItem'> = localStorage): string[] {
   try {
-    const saved: unknown = JSON.parse(storage.getItem(RECENTS_KEY) ?? '[]');
-    return Array.isArray(saved) ? [...new Set(saved.filter((id: unknown) =>
+    const saved = parseJson(storage.getItem(RECENTS_KEY) ?? '[]');
+    return Array.isArray(saved) ? [...new Set(saved.filter((id: JsonInput) =>
       typeof id === 'string' && /^pinpanion:\d+$/.test(id)))].slice(0, 5) : [];
   } catch { return []; }
 }
@@ -190,7 +193,7 @@ export async function loadCachedCatalog(): Promise<CatalogSnapshot> {
       const transaction = database.transaction(STORE, 'readonly');
       const request = transaction.objectStore(STORE).get('pins');
       request.onsuccess = () => {
-        const saved: unknown = request.result;
+        const saved = request.result as JsonInput;
         if (Array.isArray(saved)) {
           // The first PWA version cached only IDs, names, and artwork URLs.
           resolve({ ...emptyCatalog(), pins: saved.map((pin: CatalogPin) =>
@@ -220,7 +223,7 @@ async function saveCatalog(snapshot: CatalogSnapshot): Promise<void> {
 export async function refreshCatalog(): Promise<CatalogSnapshot> {
   const response = await fetch('/catalog.json', { cache: 'no-store' });
   if (!response.ok) throw new Error('Catalog update unavailable.');
-  const snapshot = parseFeed(await response.json() as unknown);
+  const snapshot = parseFeed(await response.json() as JsonInput);
   if (!snapshot.pins.length) throw new Error('Catalog update was empty.');
   await saveCatalog(snapshot);
   return snapshot;

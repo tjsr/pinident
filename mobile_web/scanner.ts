@@ -304,10 +304,10 @@ export function similarSize(coords: Coords, reference: Coords,
                             frameWidth: number, frameHeight: number): boolean {
   const clippedX = coords[0] === 0 || coords[0] + coords[2] === frameWidth;
   const clippedY = coords[1] === 0 || coords[1] + coords[3] === frameHeight;
-  return (coords[2] <= reference[2] * 4 / 3 &&
-    (clippedX || coords[2] >= reference[2] * 0.75)) &&
-    (coords[3] <= reference[3] * 4 / 3 &&
-    (clippedY || coords[3] >= reference[3] * 0.75));
+  return (coords[2] <= reference[2] * 1.5 &&
+    (clippedX || coords[2] >= reference[2] * 0.5)) &&
+    (coords[3] <= reference[3] * 1.5 &&
+    (clippedY || coords[3] >= reference[3] * 0.5));
 }
 
 export function tagTrack(state: ScanState, trackId: string, pin: PinIdentity): boolean {

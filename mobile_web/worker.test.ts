@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import worker from './worker.ts';
+import type { JsonInput } from './json_input.js';
 
 test('Cloudflare catalog route forwards the exact Pinpanion JSON feed', async () => {
   const originalFetch = globalThis.fetch;
@@ -20,11 +21,16 @@ test('Cloudflare catalog route forwards the exact Pinpanion JSON feed', async ()
 
 test('missing model returns 404 when static assets fall through to SPA HTML', async () => {
   const env = {
-    DB: { prepare: () => ({ first: async () => null }) },
+    DB: { prepare: () => ({
+      bind() { return this; },
+      async first<T>(): Promise<T | null> { return null; },
+      async all<T>(): Promise<{ results: T[] }> { return { results: [] }; },
+      async run() { return { meta: { changes: 0, last_row_id: 0 } }; }
+    }) },
     ASSETS: { fetch: async () => new Response('<html>app</html>', {
       headers: { 'Content-Type': 'text/html' }
     }) }
-  } as unknown as Parameters<typeof worker.fetch>[1];
+  } satisfies Parameters<typeof worker.fetch>[1];
   const response = await worker.fetch(new Request('https://pinident.example/model.json'), env);
   assert.equal(response.status, 404);
 });
@@ -34,9 +40,9 @@ test('shared reviews are idempotent, ordered, and desktop-only to read', async (
   const models: Array<{ version: number; published_at: string; payload: string }> = [];
   const db = {
     prepare(sql: string) {
-      let values: unknown[] = [];
+      let values: (string | number)[] = [];
       return {
-        bind(...args: unknown[]) { values = args; return this; },
+        bind(...args: (string | number)[]) { values = args; return this; },
         async first() {
           if (sql.includes('FROM training_events'))
             return [...events].reverse().find(row => row.review_id === values[0]) ?? null;
@@ -63,7 +69,7 @@ test('shared reviews are idempotent, ordered, and desktop-only to read', async (
       };
     }
   };
-  const env = { DB: db, SYNC_TOKEN: 'desktop-secret' } as unknown as Parameters<typeof worker.fetch>[1];
+  const env = { DB: db, SYNC_TOKEN: 'desktop-secret' } as Parameters<typeof worker.fetch>[1];
   const origin = 'https://pinident.example';
   const review = { kind: 'training', id: 'review-123', created_at: new Date().toISOString(),
     source: 'photo.jpg', rights_status: 'unverified', time_seconds: null,
@@ -116,9 +122,9 @@ test('shared reviews are idempotent, ordered, and desktop-only to read', async (
 test('difficulty marks are shared for ranking but stay out of training events', async () => {
   const marks: Array<{ mark_id: string; signature: string }> = [];
   const db = { prepare(sql: string) {
-    let values: unknown[] = [];
+    let values: (string | number)[] = [];
     return {
-      bind(...args: unknown[]) { values = args; return this; },
+      bind(...args: (string | number)[]) { values = args; return this; },
       async all() {
         assert.match(sql, /FROM difficulty_marks/);
         return { results: [...marks].reverse() };
@@ -132,10 +138,10 @@ test('difficulty marks are shared for ranking but stay out of training events', 
       }
     };
   } };
-  const env = { DB: db } as unknown as Parameters<typeof worker.fetch>[1];
+  const env = { DB: db } as Parameters<typeof worker.fetch>[1];
   const origin = 'https://pinident.example';
   const signature = Array.from({ length: 36 }, (_, index) => index % 2 ? 0.2 : -0.2);
-  const post = (body: unknown, requestOrigin = origin) => worker.fetch(
+  const post = (body: JsonInput, requestOrigin = origin) => worker.fetch(
     new Request(origin + '/api/difficulty-marks', { method: 'POST',
       headers: { Origin: requestOrigin, 'Content-Type': 'application/json' },
       body: JSON.stringify(body) }), env);

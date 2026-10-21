@@ -101,7 +101,7 @@ test('automatic areas wait for a 50% catalog match and show a provisional name',
 
 test('the strongest later match replaces the size reference', () => {
   const candidates: Array<{ coords: Coords; strength: number }> = [
-    { coords: [8, 8, 20, 20], strength: 0.62 },
+    { coords: [8, 8, 12, 12], strength: 0.62 },
     { coords: [45, 8, 28, 28], strength: 0.91 },
     { coords: [90, 8, 27, 29], strength: 0.7 },
   ];
@@ -109,6 +109,8 @@ test('the strongest later match replaces the size reference', () => {
   assert.deepEqual(anchor, [45, 8, 28, 28]);
   assert.equal(similarSize(candidates[0]!.coords, anchor!, 160, 120), false);
   assert.equal(similarSize(candidates[2]!.coords, anchor!, 160, 120), true);
+  assert.equal(similarSize([8, 8, 14, 42], anchor!, 160, 120), true);
+  assert.equal(similarSize([8, 8, 43, 28], anchor!, 160, 120), false);
   assert.equal(similarSize([0, 8, 18, 28], anchor!, 160, 120), true);
 });
 
