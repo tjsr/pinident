@@ -1296,10 +1296,9 @@ class ScrubberFrame(wx.Frame):
         probe.identity_inferred = False
         if probe.source == 'processed':
             probe.source = 'automatic'
-        # The probe is only a matching input. An explicit attempt may compare
-        # any visible area with reviewed identity crops without confirming it.
-        if probe.review_state == 'unconfirmed':
-            probe.review_state = 'confirmed'
+        # The probe is only a matching input. Best-effort matching already
+        # checks reviewed crops for an unconfirmed area; keep its review state
+        # so the confirmed-presence ranking rule applies only after a review.
         matcher = self._pin_matcher
         feedback = self._feedback_model.snapshot_for_processing()
         if (not getattr(matcher, 'has_references', True) and

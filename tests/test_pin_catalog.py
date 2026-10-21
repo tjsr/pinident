@@ -387,8 +387,9 @@ def test_replace_with_pin_menu_rejects_one_page_then_confirms_a_later_choice(tmp
         assert len(box.identity_rejections) == 10
         assert [review.pin_id for review in box.identity_rejections] == [
             f'pin-{index:02d}' for index in range(10)]
-        assert box.review_state == 'unconfirmed' and box.pin_id is None
-        assert box.tags == [] and not box.identity_confirmed
+        assert box.review_state == 'unconfirmed' and box.pin_id == 'pin-10'
+        assert box.tags == ['Pin 10'] and not box.identity_confirmed
+        assert box.match_confidence is not None
         assert window._feedback_store.counts()['negative'] == 0
         assert len(window._feedback_store.identity_rejections_for_source(
             window._feedback_source)) == 10
@@ -415,7 +416,7 @@ def test_replace_with_pin_menu_rejects_one_page_then_confirms_a_later_choice(tmp
         assert len(box.identity_rejections) == 10
 
         window.undo_action()
-        assert box.pin_id is None and not box.identity_confirmed
+        assert box.pin_id == 'pin-10' and not box.identity_confirmed
         assert len(box.identity_rejections) == 10
         window.undo_action()
         assert box.identity_rejections == ()
@@ -468,13 +469,13 @@ def test_none_of_these_retries_selected_area_with_next_identity(tmp_path):
         wait_for_catalog(window)
         assert [review.pin_id for review in box.identity_rejections] == [
             f'pin-{index:02d}' for index in range(10)]
-        assert (box.pin_id, box.tags) == (None, [])
+        assert (box.pin_id, box.tags) == ('pin-10', ['Pin 10'])
         assert box.review_state == 'unconfirmed' and not box.identity_confirmed
-        assert ImagePanel.get_box_label_text(box) == 'Candidate'
+        assert ImagePanel.get_box_label_text(box) == '35% Pin 10'
         editor = window._ScrubberFrame__tag_panel.find_panel_for_box(box)
         assert editor is not None
-        assert 'Match' not in editor._BoxTagPanelEdit__heading_text.GetLabel()
-        assert 'no other pin identity match' in window.GetStatusBar().GetStatusText(1)
+        assert 'Match 35%' in editor._BoxTagPanelEdit__heading_text.GetLabel()
+        assert 'suggested Pin 10' in window.GetStatusBar().GetStatusText(1)
         assert window._feedback_store.counts()['negative'] == 0
     finally:
         window.Destroy()
@@ -568,7 +569,7 @@ def test_each_full_none_of_these_page_saves_10_distinct_wrong_ids(tmp_path):
             assert len({item.example_id for item in stored}) == page * 10
             assert len({item.pin_id for item in stored}) == page * 10
             assert all(item.coords == box.coords and item.crop_png for item in stored)
-            assert box.pin_id is None
+            assert box.pin_id == ('pin-10' if page == 1 else None)
             assert f'10 wrong-ID examples saved ({page * 10} total)' in (
                 window._ScrubberFrame__tag_panel.training_status.GetLabel())
 
@@ -740,6 +741,42 @@ def test_catalog_abstention_clears_old_guesses_but_preserves_verified_identity()
     assert (present.pin_id, present.tags, present.match_confidence) == (None, [], None)
 
 
+def test_confirmed_pin_gets_ranked_identity_when_strict_match_abstains(
+        tmp_path: Path) -> None:
+    db_path, _known = make_catalog(tmp_path)
+    matcher = PinMatcher(PinCatalog(db_path).references())
+    unrelated = reference_image(23)
+    assert matcher.suggest(unrelated) is None
+    box = BoxData((0, 0, 180, 180), [], 'automatic', review_state='confirmed')
+    unconfirmed = BoxData((0, 0, 180, 180), [], 'automatic')
+
+    identify_candidates(unrelated, [box], matcher)
+    identify_candidates(unrelated, [unconfirmed], matcher, best_effort=True)
+
+    assert box.pin_id == 'pin-1' and box.tags == ['Known Pin']
+    assert box.match_confidence is not None
+    assert 0.0 <= box.match_confidence <= 1.0
+    assert not box.identity_confirmed
+    assert unconfirmed.pin_id is None
+
+
+def test_confirmed_pin_best_fit_excludes_rejected_identity(tmp_path: Path) -> None:
+    db_path, known = make_catalog(tmp_path)
+    second_path = tmp_path / 'second.png'
+    cv2.imwrite(str(second_path), cv2.cvtColor(reference_image(29), cv2.COLOR_RGB2BGR))
+    PinCatalog(db_path).add_reference('pin-2', 'Second Pin', second_path,
+                                      'local test fixture', 'test use')
+    box = BoxData((0, 0, 180, 180), [], 'automatic', review_state='confirmed',
+                  identity_rejections=(IdentityRejection(
+                      'wrong-first', 'pin-1', ('Known Pin',), (0, 0, 180, 180), 0),))
+
+    identify_candidates(known, [box], PinMatcher(PinCatalog(db_path).references()))
+
+    assert box.pin_id == 'pin-2' and box.tags == ['Second Pin']
+    assert box.match_confidence is not None
+    assert not box.identity_confirmed
+
+
 def test_reviewed_identity_model_can_identify_confirmed_pin_when_catalog_is_weak():
     image = reference_image(10)
     store = FeedbackStore()
@@ -790,6 +827,36 @@ def test_rejected_automatic_suggestion_can_retry_reviewed_identity_model():
         assert box.review_state == 'unconfirmed' and not box.identity_confirmed
     finally:
         store.close()
+
+
+@pytest.mark.gui
+def test_confirm_presence_commits_weak_best_fit_on_original_box(
+        tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    db_path, _known = make_catalog(tmp_path)
+    image = reference_image(23)
+    matcher = PinMatcher(PinCatalog(db_path).references())
+    assert matcher.suggest(image) is None
+    window = VideoScrubber(None, 'Confirmed best fit', '',
+                           image_array=[image], load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        window.Show()
+        wx.Yield()
+        box = BoxData((0, 0, 180, 180), [], 'automatic')
+        window._ScrubberFrame__frame_boxes[0] = [box]
+        window._pin_matcher = matcher
+        window.display_image(reconcile=False)
+
+        window.confirm_box(box)
+        wait_for_catalog(window)
+
+        assert window._ScrubberFrame__frame_boxes[0][0] is box
+        assert box.review_state == 'confirmed' and not box.identity_confirmed
+        assert box.pin_id == 'pin-1' and box.match_confidence is not None
+    finally:
+        window.Destroy()
+        wx.Yield()
 
 
 @pytest.mark.gui
@@ -958,6 +1025,43 @@ def test_drawn_box_starts_as_pin_and_retries_scored_identity_after_rejection(tmp
         assert 'no other pin identity match' in window.GetStatusBar().GetStatusText(1)
         assert [review.pin_id for review in box.identity_rejections] == [
             'pin-first', 'pin-second']
+    finally:
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_not_this_pin_uses_next_ranked_reference_after_strong_match_abstains(
+        tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    db_path, _known = make_catalog(tmp_path)
+    second_path = tmp_path / 'second.png'
+    cv2.imwrite(str(second_path), cv2.cvtColor(reference_image(29), cv2.COLOR_RGB2BGR))
+    PinCatalog(db_path).add_reference('pin-2', 'Second Pin', second_path,
+                                      'local test fixture', 'test use')
+    image = reference_image(23)
+    matcher = PinMatcher(PinCatalog(db_path).references())
+    window = VideoScrubber(None, 'Rejected weak identity', '',
+                           image_array=[image], load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        window.Show()
+        wx.Yield()
+        box = BoxData((0, 0, 180, 180), ['Known Pin'], 'automatic',
+                      pin_id='pin-1', match_confidence=0.28)
+        window._ScrubberFrame__frame_boxes[0] = [box]
+        window._ScrubberFrame__matched_frames.add(0)
+        window._pin_matcher = matcher
+        window.display_image(reconcile=False)
+
+        window.mark_wrong_identity(box)
+        wait_for_catalog(window)
+
+        assert box.review_state == 'unconfirmed'
+        assert box.pin_id == 'pin-2' and box.tags == ['Second Pin']
+        assert box.match_confidence is not None
+        assert [review.pin_id for review in box.identity_rejections] == ['pin-1']
+        assert 'Unidentified' not in ImagePanel.get_box_label_text(box)
     finally:
         window.Destroy()
         wx.Yield()

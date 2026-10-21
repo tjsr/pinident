@@ -1051,6 +1051,18 @@ def identify_candidates(image: np.ndarray, boxes: list[BoxData], matcher: PinMat
                      (prefer_reviewed_identity or
                       (match.confidence or 0.0) < 0.60))):
                 match = learned
+        if match is None and (box.review_state in ('confirmed', 'inherited') or
+                              box.identity_rejections):
+            # Reviewed pin presence or an explicit wrong-identity decision
+            # warrants the next eligible suggestion when the conservative
+            # matcher abstains. This remains unverified visual match strength.
+            rank_matches = getattr(matcher, 'rank_matches', None)
+            if callable(rank_matches):
+                ranked = rank_matches(
+                    image[y:y + h, x:x + w], limit=1,
+                    excluded_pin_ids=excluded_ids, excluded_names=excluded_names)
+                if ranked:
+                    match = ranked[0]
         if match is not None:
             box.pin_id = match.pin_id
             box.tags = [match.name]
