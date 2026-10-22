@@ -339,8 +339,8 @@ class TagPanel(ScrolledPanel, wx.PyEventBinder):
         """Handle box removed event."""
         try:
             self.boxes = [box for box in self.boxes if not box.matches(event.box)]
-        except ValueError as e:
-            getLog().error(f'Error removing box {event.box}: {e}')
+        except ValueError:
+            getLog().exception('Error removing box %s', event.box)
 
     def bind_box_events(self, image_panel: ImagePanel) -> None:
         """Bind box events to the image panel."""

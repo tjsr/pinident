@@ -178,8 +178,9 @@ class BoxTagPanelEdit(wx.Panel):
         # self.Bind(EVT_BOX_LABEL_EDITED, self.__on_label_edited, current_label_row)
         try:
             current_label_row.Refresh()
-        except Exception as e:
-            getLog().error(f"Failed to refresh label row: {current_label_row}. It may have been destroyed.", exc_info=e)
+        except Exception:
+            getLog().exception('Failed to refresh label row: %s. It may have been destroyed.',
+                               current_label_row)
             return current_label_row
         return current_label_row
 

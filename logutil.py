@@ -1,11 +1,65 @@
 import logging
 import inspect
 import logging.config
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+import sys
+import threading
+from types import TracebackType
 
 import yaml
 import os
 
 DEFAULT_LOG_LEVEL = logging.DEBUG if __debug__ else logging.INFO
+_exception_file_handler: RotatingFileHandler | None = None
+
+
+class DynamicStreamHandler(logging.StreamHandler):
+    """Follow pytest's active capture stream without retaining a closed one."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        target = sys.stdout
+        if target is None or target.closed:
+            target = sys.__stderr__
+        if target is None or target.closed:
+            return
+        self.stream = target
+        super().emit(record)
+
+
+def install_exception_logging(log_path: Path | None = None) -> Path:
+    """Persist application errors, including exceptions raised by wx callbacks."""
+    global _exception_file_handler
+    if log_path is None:
+        data_dir = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'Pinident'
+        log_path = data_dir / 'pinident.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if _exception_file_handler is not None:
+        logging.getLogger().removeHandler(_exception_file_handler)
+        _exception_file_handler.close()
+    handler = RotatingFileHandler(log_path, maxBytes=5_000_000,
+                                  backupCount=3, encoding='utf-8')
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(name)s:%(funcName)s [%(levelname)s] %(message)s'))
+    logging.getLogger().addHandler(handler)
+    _exception_file_handler = handler
+
+    def report_exception(exc_type: type[BaseException], exc: BaseException,
+                         traceback: TracebackType | None) -> None:
+        logging.getLogger('Pinident').critical(
+            'Unhandled application exception', exc_info=(exc_type, exc, traceback))
+
+    def report_thread_exception(args: threading.ExceptHookArgs) -> None:
+        if args.exc_type is not SystemExit:
+            logging.getLogger('Pinident').critical(
+                'Unhandled exception in thread %s',
+                args.thread.name if args.thread is not None else '<unknown>',
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = report_exception
+    threading.excepthook = report_thread_exception
+    logging.getLogger('Pinident').info('Diagnostic log: %s', log_path)
+    return log_path
 
 def open_config_file(filename: str, start_dir: str = None):
     if start_dir is None:

@@ -2,9 +2,8 @@ version: 1
 
 handlers:
   console:
-    class: logging.StreamHandler
+    class: logutil.DynamicStreamHandler
     formatter: method
-    stream: ext://sys.stdout
 
 loggers:
   root:

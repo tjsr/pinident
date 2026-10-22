@@ -14,9 +14,8 @@ formatters:
 
 handlers:
   console:
-    class: logging.StreamHandler
+    class: logutil.DynamicStreamHandler
     formatter: simple
-    stream: ext://sys.stdout
 
 loggers:
   root:

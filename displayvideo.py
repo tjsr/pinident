@@ -1,10 +1,13 @@
-import wx
-
-from videoscrubber import VideoScrubber
-from pin_catalog import PinCatalog
-from pinpanion_sync import start_catalog_sync
+from logutil import install_exception_logging
 
 def main() -> None:
+    install_exception_logging()
+    import wx
+
+    from videoscrubber import VideoScrubber
+    from pin_catalog import PinCatalog
+    from pinpanion_sync import start_catalog_sync
+
     app = wx.App(False)
     with wx.FileDialog(None, 'Open a pin video or image',
                        wildcard=('Video and image files|*.mp4;*.avi;*.mov;*.mkv;'

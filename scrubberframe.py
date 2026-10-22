@@ -2,11 +2,12 @@ import json
 import os
 import tempfile
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from copy import copy, deepcopy
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from threading import Event
 from time import perf_counter
-from typing import Callable, List, Dict
+from typing import Callable, Iterator, List, Dict
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import cv2
@@ -15,8 +16,9 @@ import wx
 
 from boxdata import (BoxData, Coordinate, IdentityRejection, is_placeholder_tag,
                      has_specific_identity, rejects_identity, same_specific_name)
+from classifier_review import ReviewArea, saved_review_areas
 from annotation_history import BoxSnapshot, HistoryEntry, make_entry, snapshot
-from detection_feedback import (FeedbackModel, FeedbackStore,
+from detection_feedback import (FeedbackExample, FeedbackModel, FeedbackStore,
                                 make_feedback_example)
 from frame_processing import FrameJob, FrameResult, process_frame
 from frame_presence import FramePresence, checkbox_values, marked_pin_count
@@ -32,6 +34,7 @@ from cloud_sync import (CloudConfig, CloudSyncError, cloud_cursor, fetch_model, 
 from events.BoxSelectedEvent import BoxSelectedEvent
 from events.events import EVT_BOX_SELECTED
 from controls.imagepanel import ImagePanel
+from controls.classifierreviewdialog import ClassifierReviewDialog
 from logutil import getLog
 from controls.markerpanel import MarkerPanel  # Adjust import as needed
 from controls.tagpanel import TagPanel
@@ -125,6 +128,18 @@ def save_boxes_to_file(filename: str, frame_boxes: dict[int, list[BoxData]],
     finally:
         if temporary_name is not None and os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def save_review_feedback(path: str, source: str,
+                         changes: dict[str, FeedbackExample | None]) -> None:
+    """Commit reviewed crops with a worker-owned SQLite connection."""
+    store = FeedbackStore(path)
+    try:
+        store.apply_source_delta(
+            source, [example for example in changes.values() if example is not None],
+            {example_id for example_id, example in changes.items() if example is None})
+    finally:
+        store.close()
 
 def merge_duplicate_boxes(boxes: List[BoxData]) -> List[BoxData]:
     """Merge boxes with the same coordinates and tags."""
@@ -653,8 +668,8 @@ class ScrubberFrame(wx.Frame):
                 count = self.count_boxes()
                 getLog().info(f"Loaded {count} boxes in data from {self.box_data_filename}")
                 return self.__frame_boxes
-            except Exception as e:
-                getLog().error(f"Error loading box data: {e}")
+            except Exception:
+                getLog().exception('Error loading box data from %s', self.box_data_filename)
         else:
             getLog().warning("No box data file specified or file does not exist.")
         return {}
@@ -707,6 +722,18 @@ class ScrubberFrame(wx.Frame):
         self._cloud_ready_for_publish = False
         self._training_base_cloud_version = 0
         self._sync_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pin-cloud')
+        self._review_save_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='pin-review-save')
+        self._review_save_future: Future[None] | None = None
+        self._review_save_call: wx.CallLater | None = None
+        self._review_save_pending = False
+        self._review_autosave_active = False
+        self._review_action_active = False
+        self._review_feedback_changes: dict[str, FeedbackExample | None] = {}
+        self._review_feedback_future: Future[None] | None = None
+        self._review_feedback_inflight: dict[str, FeedbackExample | None] = {}
+        self._review_feedback_call: wx.CallLater | None = None
+        self._review_feedback_failed = False
         if (self._trained_model_path is not None and
                 self._trained_model_path.is_file()):
             try:
@@ -751,6 +778,7 @@ class ScrubberFrame(wx.Frame):
         self._annotation_revision = 0
         self._play_generation = 0
         self._closing = False
+        self._destroy_requested = False
         self._shutdown_dialog: ShutdownProgressDialog | None = None
         self._shutdown_stage = 0
         self._shutdown_prepared = False
@@ -861,6 +889,8 @@ class ScrubberFrame(wx.Frame):
         load_item = file_menu.Append(wx.ID_ANY, 'Load Annotations...')
 
         training_menu = wx.Menu()
+        review_areas_item = training_menu.Append(wx.ID_ANY, 'Review saved areas...')
+        training_menu.AppendSeparator()
         feedback_item = training_menu.Append(wx.ID_ANY, 'Feedback model...')
         self._training_add_item = training_menu.Append(wx.ID_ANY, 'Add to training data')
         self._training_run_item = training_menu.Append(wx.ID_ANY, 'Run training now')
@@ -875,6 +905,7 @@ class ScrubberFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.file_select, load_item)
         self.Bind(wx.EVT_MENU, self.save_annotations, save_item)
         self.Bind(wx.EVT_MENU, self.show_settings, settings_item)
+        self.Bind(wx.EVT_MENU, self.open_classifier_review, review_areas_item)
         self.Bind(wx.EVT_MENU, lambda _event: self.show_feedback_info(), feedback_item)
         self.Bind(wx.EVT_MENU, lambda _event: self.add_to_training_data(), self._training_add_item)
         self.Bind(wx.EVT_MENU, lambda _event: self.run_training_now(), self._training_run_item)
@@ -955,6 +986,13 @@ class ScrubberFrame(wx.Frame):
         self._annotation_revision += 1
         self._pending_rejection_history = None
 
+    @staticmethod
+    def _copy_box_for_worker(box: BoxData) -> BoxData:
+        """Give a worker an independent observation without recursive copying."""
+        result = copy(box)
+        result.tags = list(box.tags) if box.tags is not None else None
+        return result
+
     def _schedule_reconciliation(self, index: int,
                                  reference_index: int | None = None) -> None:
         if self._closing:
@@ -991,7 +1029,13 @@ class ScrubberFrame(wx.Frame):
             return
         if self._pending_reconcile is not None:
             self._cancel_reconciliation()
-        snapshot = deepcopy(self.__frame_boxes)
+        # Reconciliation only mutates scalar box fields and tags. Copy each
+        # observation and its tag list rather than recursively copying the
+        # entire annotation graph on the wx thread for every review.
+        snapshot = {
+            frame_index: [self._copy_box_for_worker(box) for box in boxes]
+            for frame_index, boxes in self.__frame_boxes.items()
+        }
         snapshot.setdefault(index, [])
         initial_counts = {frame_index: len(boxes) for frame_index, boxes in snapshot.items()}
         cancelled = Event()
@@ -1074,10 +1118,13 @@ class ScrubberFrame(wx.Frame):
             frame = (self._display_source_frame if self._display_source_frame is not None
                      else self.get_frame(index, 0))
             self._schedule_catalog_match(index, frame, None)
+        if self._review_autosave_active:
+            self.queue_review_save()
 
     def display_image(self, source_frame: np.ndarray | None = None,
                       reconcile: bool = True,
-                      reference_index: int | None = None):
+                      reference_index: int | None = None,
+                      catalog_matching: bool = True) -> None:
         started = perf_counter()
         if source_frame is None:
             img = self.get_frame(self._current_index, self._rotation_angle)
@@ -1111,7 +1158,7 @@ class ScrubberFrame(wx.Frame):
 
         if reconcile and not self._playing:
             self._schedule_reconciliation(self._current_index, reference_index)
-        if self._pending_reconcile_index != self._current_index:
+        if catalog_matching and self._pending_reconcile_index != self._current_index:
             self._schedule_catalog_match(
                 self._current_index,
                 img if self._rotation_angle == 0 else self.get_frame(self._current_index, 0),
@@ -1262,6 +1309,8 @@ class ScrubberFrame(wx.Frame):
         if changed:
             self._invalidate_reconciliation()
             self._sync_automatic_consolidation(invalidate=False)
+            if self._review_autosave_active:
+                self.queue_review_save()
         if self._current_index == index:
             if changed:
                 self.__image_panel.Refresh()
@@ -1699,7 +1748,24 @@ class ScrubberFrame(wx.Frame):
                  'identity_rejections'}
                & change.changed_fields.keys() for change in entry.boxes):
             propagate_confirmations(self.__frame_boxes)
-            consolidated = self._consolidate_frames()
+            affected_tracks: set[str] = set()
+            affected_frames: set[int] = set()
+            for change in entry.boxes:
+                affected_tracks.add(change.box.track_id)
+                if change.before_location is not None:
+                    affected_frames.add(change.before_location[0])
+                if change.after_location is not None:
+                    affected_frames.add(change.after_location[0])
+                old_track, new_track = change.changed_fields.get(
+                    'track_id', (change.box.track_id, change.box.track_id))
+                if isinstance(old_track, str):
+                    affected_tracks.add(old_track)
+                if isinstance(new_track, str):
+                    affected_tracks.add(new_track)
+            affected_frames.update(
+                frame_index for frame_index, boxes in self.__frame_boxes.items()
+                if any(box.track_id in affected_tracks for box in boxes))
+            consolidated = self._consolidate_frames(affected_frames)
             entry = make_entry(before, snapshot(self.__frame_boxes), rotation,
                                self._rotation_angle, presence,
                                dict(self._frame_presence))
@@ -1714,14 +1780,20 @@ class ScrubberFrame(wx.Frame):
             if any(change.box.identity_rejections or
                    'identity_rejections' in change.changed_fields
                    for change in entry.boxes):
-                self._sync_identity_feedback()
+                self._sync_identity_feedback_for_entry(entry)
             self._invalidate_reconciliation()
+            if self._review_autosave_active:
+                self.queue_review_save()
         self._sync_presence_ui()
 
-    def _consolidate_frames(self) -> bool:
+    def _consolidate_frames(self, frame_indices: set[int] | None = None) -> bool:
         """Remove overlapping automatic duplicates and same-pin observations."""
         changed = False
-        for boxes in self.__frame_boxes.values():
+        indices = self.__frame_boxes if frame_indices is None else frame_indices
+        for frame_index in indices:
+            boxes = self.__frame_boxes.get(frame_index)
+            if boxes is None:
+                continue
             kept, removed = consolidate_overlapping_boxes(boxes)
             if removed:
                 boxes[:] = kept
@@ -1750,7 +1822,7 @@ class ScrubberFrame(wx.Frame):
         self._sync_feedback_for_entry(entry)
         self._prune_linked_feedback()
         if any(change.box.identity_rejections for change in entry.boxes):
-            self._sync_identity_feedback()
+            self._sync_identity_feedback_for_entry(entry)
         if invalidate:
             self._invalidate_reconciliation()
 
@@ -1777,8 +1849,10 @@ class ScrubberFrame(wx.Frame):
                                            presence=self._frame_presence)
         self._invalidate_reconciliation()
         self._sync_feedback_for_entry(entry)
-        self._sync_identity_feedback()
+        self._sync_identity_feedback_for_entry(entry)
         self._redo_history.setdefault(self._current_index, []).append(entry)
+        if self._review_autosave_active:
+            self.queue_review_save()
         self.display_image()
 
     def redo_action(self) -> None:
@@ -1791,8 +1865,10 @@ class ScrubberFrame(wx.Frame):
                                            presence=self._frame_presence)
         self._invalidate_reconciliation()
         self._sync_feedback_for_entry(entry)
-        self._sync_identity_feedback()
+        self._sync_identity_feedback_for_entry(entry)
         self._undo_history.setdefault(self._current_index, []).append(entry)
+        if self._review_autosave_active:
+            self.queue_review_save()
         self.display_image()
 
     def _sync_feedback_for_entry(self, entry: HistoryEntry) -> None:
@@ -1806,6 +1882,33 @@ class ScrubberFrame(wx.Frame):
                 ids.add(change.box.feedback_id)
                 affected.append(change.box)
         if not ids:
+            return
+        if ((self._review_action_active or self._review_autosave_active) and
+                self._feedback_store.path != ':memory:'):
+            changes: dict[str, FeedbackExample | None] = {
+                example_id: None for example_id in ids}
+            for box in affected:
+                example_id = box.feedback_id
+                label = box.feedback_label
+                if example_id is None or label not in ('positive', 'negative'):
+                    continue
+                for frame_index, boxes in self.__frame_boxes.items():
+                    if any(existing is box for existing in boxes):
+                        frame = self.get_frame(frame_index, 0)
+                        if frame is not None:
+                            try:
+                                changes[example_id] = make_feedback_example(
+                                    example_id, label, frame,
+                                    box.coords, self._feedback_source, frame_index,
+                                    box.track_id,
+                                    box.pin_id if label == 'positive'
+                                    and box.identity_confirmed else None,
+                                    tuple(tag for tag in box.tags or [] if tag.strip())
+                                    if label == 'positive' else ())
+                            except ValueError as error:
+                                getLog().warning('Skipping invalid feedback crop: %s', error)
+                        break
+            self._queue_review_feedback_changes(changes)
             return
         for example_id in ids:
             self._feedback_store.delete(example_id)
@@ -1871,6 +1974,101 @@ class ScrubberFrame(wx.Frame):
             self._feedback_model.refresh(changed)
             self._update_feedback_status()
         getLog().info('identity feedback: %d wrong-name examples indexed', len(active))
+
+    def _sync_identity_feedback_for_entry(self, entry: HistoryEntry) -> None:
+        if ((self._review_action_active or self._review_autosave_active) and
+                self._feedback_store.path != ':memory:'):
+            self._queue_review_identity_feedback(entry)
+        else:
+            self._sync_identity_feedback()
+
+    def _queue_review_identity_feedback(self, entry: HistoryEntry) -> None:
+        """Stage only wrong-ID reviews touched by this classification action."""
+        ids: set[str] = set()
+        for change in entry.boxes:
+            ids.update(review.example_id for review in change.box.identity_rejections)
+            values = change.changed_fields.get('identity_rejections')
+            if values is not None:
+                for value in values:
+                    if isinstance(value, tuple):
+                        ids.update(item.example_id for item in value
+                                   if isinstance(item, IdentityRejection))
+        if not ids:
+            return
+        changes: dict[str, FeedbackExample | None] = {
+            example_id: None for example_id in ids}
+        remaining = set(ids)
+        frames: dict[int, np.ndarray | None] = {}
+        for frame_index, boxes in self.__frame_boxes.items():
+            for box in boxes:
+                for review in box.identity_rejections:
+                    if review.example_id not in remaining:
+                        continue
+                    remaining.remove(review.example_id)
+                    source_index = (review.frame_index if review.frame_index >= 0
+                                    else frame_index)
+                    if source_index not in frames:
+                        frames[source_index] = self.get_frame(source_index, 0)
+                    frame = frames[source_index]
+                    if frame is None:
+                        changes.pop(review.example_id, None)
+                        continue
+                    try:
+                        changes[review.example_id] = make_feedback_example(
+                            review.example_id, 'wrong_identity', frame,
+                            review.coords, self._feedback_source, source_index,
+                            box.track_id, review.pin_id, review.tags)
+                    except ValueError as error:
+                        getLog().warning('Skipping invalid wrong-identity crop: %s', error)
+                        changes.pop(review.example_id, None)
+        self._queue_review_feedback_changes(changes)
+
+    def _queue_review_feedback_changes(
+            self, changes: dict[str, FeedbackExample | None]) -> None:
+        if not changes:
+            return
+        self._review_feedback_changes.update(changes)
+        self._review_feedback_failed = False
+        if self._review_feedback_call is not None:
+            self._review_feedback_call.Stop()
+        self._review_feedback_call = wx.CallLater(1200, self._flush_review_feedback)
+
+    def _flush_review_feedback(self) -> None:
+        self._review_feedback_call = None
+        if not self._review_feedback_changes or self._review_feedback_future is not None:
+            return
+        changes = self._review_feedback_changes
+        self._review_feedback_changes = {}
+        self._review_feedback_inflight = changes
+        future = self._review_save_executor.submit(
+            save_review_feedback, self._feedback_store.path,
+            self._feedback_source, changes)
+        self._review_feedback_future = future
+        future.add_done_callback(lambda done: wx.CallAfter(
+            self._complete_review_feedback, done))
+
+    def _complete_review_feedback(self, future: Future[None]) -> bool:
+        if self._destroy_requested or future is not self._review_feedback_future:
+            return True
+        self._review_feedback_future = None
+        changes = self._review_feedback_inflight
+        self._review_feedback_inflight = {}
+        try:
+            future.result()
+        except Exception:
+            getLog().exception('Could not save reviewed feedback crops')
+            self._review_feedback_changes = {
+                **changes, **self._review_feedback_changes}
+            self._review_feedback_failed = True
+            self.SetStatusText('Background feedback save failed; use File → Save', 1)
+            return False
+        self._feedback_model.refresh(set(changes))
+        self._update_feedback_status()
+        self._review_feedback_failed = False
+        if self._review_feedback_changes and self._review_feedback_call is None:
+            self._review_feedback_call = wx.CallLater(
+                300, self._flush_review_feedback)
+        return True
 
     def _seed_feedback_from_annotations(self) -> None:
         """Import explicit and legacy reviewed boxes once per source observation."""
@@ -2038,15 +2236,161 @@ class ScrubberFrame(wx.Frame):
             return False
         try:
             self.__tag_panel.commit_pending_labels()
+            if self._review_feedback_call is not None:
+                self._review_feedback_call.Stop()
+                self._review_feedback_call = None
+            while self._review_feedback_changes or self._review_feedback_future is not None:
+                if self._review_feedback_future is None:
+                    if self._review_feedback_call is not None:
+                        self._review_feedback_call.Stop()
+                        self._review_feedback_call = None
+                    self._flush_review_feedback()
+                pending_feedback = self._review_feedback_future
+                if pending_feedback is None:
+                    break
+                if not self._complete_review_feedback_after_wait(pending_feedback):
+                    return False
+            if self._review_save_call is not None:
+                self._review_save_call.Stop()
+                self._review_save_call = None
+            if self._review_save_future is not None:
+                try:
+                    self._review_save_future.result()
+                except Exception:
+                    # The explicit save below retries from the current state.
+                    getLog().exception('Earlier background annotation save failed')
+                self._review_save_future = None
             save_boxes_to_file(filename, self.__frame_boxes, self._frame_presence)
         except Exception:
             getLog().exception('Could not save annotations to %s', filename)
             self.SetStatusText('Save failed; see console log', 1)
             return False
+        self._review_save_pending = False
         count = self.count_boxes()
         getLog().info('%d boxes saved to %s', count, filename)
         self.SetStatusText(f'Saved {count} areas to {os.path.basename(filename)}', 1)
         return True
+
+    def _complete_review_feedback_after_wait(self, future: Future[None]) -> bool:
+        """Finish an explicit save after its earlier feedback write finishes."""
+        try:
+            future.result()
+        except Exception:
+            pass  # The completion handler logs and retains the unsaved changes.
+        return self._complete_review_feedback(future)
+
+    def queue_review_save(self) -> None:
+        """Coalesce quick reviews and persist an immutable snapshot off the UI thread."""
+        if self.box_data_filename is None or self._closing:
+            return
+        self._review_autosave_active = True
+        self._review_save_pending = True
+        if self._review_save_call is not None:
+            self._review_save_call.Stop()
+        self._review_save_call = wx.CallLater(1200, self._flush_review_save)
+
+    def _flush_review_save(self) -> None:
+        self._review_save_call = None
+        if (self._closing or not self._review_save_pending or
+                self.box_data_filename is None or
+                self._review_save_future is not None):
+            return
+        snapshot = {
+            frame_index: [self._copy_box_for_worker(box) for box in boxes]
+            for frame_index, boxes in self.__frame_boxes.items()
+        }
+        presence = dict(self._frame_presence)
+        filename = self.box_data_filename
+        self._review_save_pending = False
+        future = self._review_save_executor.submit(
+            save_boxes_to_file, filename, snapshot, presence)
+        self._review_save_future = future
+        future.add_done_callback(lambda done: wx.CallAfter(
+            self._complete_review_save, done, filename))
+
+    def _complete_review_save(self, future: Future[None], filename: str) -> None:
+        if self._destroy_requested or future is not self._review_save_future:
+            return
+        self._review_save_future = None
+        try:
+            future.result()
+        except Exception:
+            getLog().exception('Could not save reviewed annotations to %s', filename)
+            self._review_save_pending = True
+            self.SetStatusText('Background save failed; use File → Save', 1)
+            return
+        if self._review_save_pending:
+            if self._review_save_call is None:
+                self._review_save_call = wx.CallLater(300, self._flush_review_save)
+        else:
+            self.SetStatusText(
+                f'Reviewed areas saved to {os.path.basename(filename)}', 1)
+
+    def classifier_review_areas(self) -> list[ReviewArea]:
+        return saved_review_areas(self.__frame_boxes)
+
+    @contextmanager
+    def classifier_review_action(self) -> Iterator[None]:
+        """Stage feedback I/O while one review action updates annotations."""
+        self._review_action_active = True
+        try:
+            yield
+        finally:
+            self._review_action_active = False
+
+    def classifier_review_catalog_options(self) -> list[tuple[str, str]]:
+        return self._pin_catalog.list_pins()
+
+    def classifier_review_rank(self, crop: np.ndarray, box: BoxData,
+                               limit: int = 10) -> list[PinMatch]:
+        """Rank the crop itself, without the replacement menu's ID injection."""
+        return self._pin_matcher.rank_matches(
+            crop, limit=limit,
+            excluded_pin_ids=frozenset(item.pin_id for item in box.identity_rejections
+                                       if item.pin_id),
+            excluded_names=frozenset(tag.casefold()
+                                     for item in box.identity_rejections
+                                     if item.pin_id is None for tag in item.tags))
+
+    def classifier_review_open(self, area: ReviewArea) -> np.ndarray | None:
+        """Show only an already saved frame and return this area's RGB crop."""
+        index, box = area.frame_index, area.box
+        if not any(existing is box for existing in self.__frame_boxes.get(index, [])):
+            return None
+        frame = self.get_frame(index, 0)
+        if frame is None:
+            return None
+        x, y, width, height = box.coords
+        if (x < 0 or y < 0 or width <= 0 or height <= 0 or
+                x + width > frame.shape[1] or y + height > frame.shape[0]):
+            return None
+        self._current_index = index
+        self.slider.SetValue(index)
+        self.display_image(frame, reconcile=False, catalog_matching=False)
+        return frame[y:y + height, x:x + width].copy()
+
+    def classifier_review_pending(self, index: int) -> bool:
+        """Wait for a review's catalog retry and linked-frame reconciliation."""
+        return (index in self._pending_catalog or
+                (self._pending_reconcile_index == index and
+                 self._pending_reconcile is not None))
+
+    def open_classifier_review(self, _event: wx.CommandEvent | None = None) -> None:
+        self.pause_playback()
+        self.__tag_panel.commit_pending_labels()
+        if self.box_data_filename is None:
+            self.SetStatusText('Select an annotation JSON file before reviewing saved areas', 1)
+            return
+        areas = self.classifier_review_areas()
+        if not areas:
+            self.SetStatusText('No saved rectangles to review', 1)
+            return
+        dialog = ClassifierReviewDialog(self, areas,
+                                        self.classifier_review_catalog_options())
+        try:
+            dialog.ShowModal()
+        finally:
+            dialog.Destroy()
 
     def _on_cloud_timer(self, _event: wx.TimerEvent) -> None:
         if self._training_future is None and self._model_training_future is None:
@@ -2087,7 +2431,8 @@ class ScrubberFrame(wx.Frame):
         future.add_done_callback(lambda done: wx.CallAfter(self._finish_cloud_sync, done))
 
     def _finish_cloud_sync(self, future: Future) -> None:
-        if future is not self._cloud_sync_future:
+        if (getattr(self, '_destroy_requested', False) or not self or
+                future is not self._cloud_sync_future):
             return
         self._cloud_sync_future = None
         then_train = self._cloud_train_after_sync
@@ -2171,9 +2516,10 @@ class ScrubberFrame(wx.Frame):
                 self._model_training_future is not None):
             return
         self.pause_playback()
-        if self.box_data_filename:
-            save_boxes_to_file(self.box_data_filename, self.__frame_boxes,
-                               self._frame_presence)
+        if self.box_data_filename and not self.save_annotations():
+            self._set_training_progress(
+                0, 'Could not save reviews before training; see console log.', False)
+            return
         observations = reviewed_observations(self.__frame_boxes, self._feedback_source)
         observations_by_id = {item.example_id: item for item in observations}
         try:
@@ -2445,6 +2791,12 @@ class ScrubberFrame(wx.Frame):
             return
         event.Veto()
         self._closing = True
+        if self._review_save_call is not None:
+            self._review_save_call.Stop()
+            self._review_save_call = None
+        if self._review_feedback_call is not None:
+            self._review_feedback_call.Stop()
+            self._review_feedback_call = None
         self._feedback_load_cancel.set()
         self._cloud_timer.Stop()
         self._shutdown_dialog = ShutdownProgressDialog(self)
@@ -2456,12 +2808,57 @@ class ScrubberFrame(wx.Frame):
         self._shutdown_timer.Start(150)
         wx.CallAfter(self._shutdown_tick)
 
+    def Destroy(self) -> bool:
+        """Stop callbacks when a test or parent destroys the frame directly."""
+        self._destroy_requested = True
+        self._closing = True
+        self._feedback_load_cancel.set()
+        self._cloud_timer.Stop()
+        self._play_timer.Stop()
+        if self._review_save_call is not None:
+            self._review_save_call.Stop()
+            self._review_save_call = None
+        if self._review_feedback_call is not None:
+            self._review_feedback_call.Stop()
+            self._review_feedback_call = None
+        self._shutdown_stop_prefetch()
+        self._play_executor.shutdown(wait=False, cancel_futures=True)
+        self._sync_executor.shutdown(wait=False, cancel_futures=True)
+        self._review_save_executor.shutdown(wait=False, cancel_futures=True)
+        if self._feedback_load_executor is not None:
+            self._feedback_load_executor.shutdown(wait=False, cancel_futures=True)
+        return super().Destroy()
+
     def _shutdown_stop_prefetch(self) -> bool:
         """Overridden by VideoScrubber, which owns the prefetch thread."""
         return True
 
     def _shutdown_resume_prefetch(self) -> None:
         """Restore optional prefetch after a failed close save."""
+
+    def _abort_failed_close(self, message: str) -> None:
+        dialog = self._shutdown_dialog
+        if dialog is None:
+            return
+        if self._shutdown_save_executor is not None:
+            self._shutdown_save_executor.shutdown(wait=False)
+            self._shutdown_save_executor = None
+        if self._shutdown_timer is not None:
+            self._shutdown_timer.Stop()
+        self.Enable(True)
+        dialog.Destroy()
+        self._shutdown_dialog = None
+        self._closing = False
+        self._feedback_load_cancel.clear()
+        if self._feedback_deferred:
+            self._feedback_load_future = None
+            self._start_feedback_load()
+        self._shutdown_stage = 0
+        self._shutdown_prepared = False
+        self._shutdown_save_future = None
+        self._cloud_timer.Start(5 * 60 * 1000)
+        self._shutdown_resume_prefetch()
+        wx.MessageBox(message, 'Close failed', wx.OK | wx.ICON_ERROR)
 
     def _shutdown_tick(self, _event: wx.TimerEvent | None = None) -> None:
         dialog = self._shutdown_dialog
@@ -2478,6 +2875,20 @@ class ScrubberFrame(wx.Frame):
             dialog.advance()
             self._shutdown_stage = 1
         if self._shutdown_stage == 1:
+            if self._review_feedback_failed:
+                self._abort_failed_close(
+                    'Reviewed feedback could not be saved. Pinident remains open; '
+                    'use File → Save and try closing again.')
+                return
+            if self._review_feedback_future is None and self._review_feedback_changes:
+                self._flush_review_feedback()
+            if self._review_feedback_future is not None:
+                if not self._review_feedback_future.done():
+                    dialog.set_percent(10)
+                    return
+                self._complete_review_feedback(self._review_feedback_future)
+                if self._review_feedback_failed or self._review_feedback_changes:
+                    return
             # Let a requested training/indexing run finish and commit on the wx
             # thread before placing the final queue barriers.
             if (self._cloud_sync_future is not None or
@@ -2492,8 +2903,10 @@ class ScrubberFrame(wx.Frame):
                 self._shutdown_cloud_barrier = self._sync_executor.submit(lambda: None)
             complete = sum(future.done() for future in
                            (self._shutdown_play_barrier, self._shutdown_cloud_barrier))
-            dialog.set_percent(10 + 45 * complete)
-            if complete != 2:
+            review_saved = (self._review_save_future is None or
+                            self._review_save_future.done())
+            dialog.set_percent(10 + 30 * (complete + review_saved))
+            if complete != 2 or not review_saved:
                 return
             dialog.set_percent(100)
             dialog.advance()
@@ -2520,26 +2933,9 @@ class ScrubberFrame(wx.Frame):
                     self._shutdown_save_future.result()
                 except Exception:
                     getLog().exception('Could not save annotations during close')
-                    if self._shutdown_save_executor is not None:
-                        self._shutdown_save_executor.shutdown(wait=False)
-                        self._shutdown_save_executor = None
-                    self._shutdown_timer.Stop()
-                    self.Enable(True)
-                    dialog.Destroy()
-                    self._shutdown_dialog = None
-                    self._closing = False
-                    self._feedback_load_cancel.clear()
-                    if self._feedback_deferred:
-                        self._feedback_load_future = None
-                        self._start_feedback_load()
-                    self._shutdown_stage = 0
-                    self._shutdown_prepared = False
-                    self._shutdown_save_future = None
-                    self._cloud_timer.Start(5 * 60 * 1000)
-                    self._shutdown_resume_prefetch()
-                    wx.MessageBox('Annotations could not be saved. Pinident remains open; '
-                                  'use File → Save and try closing again.',
-                                  'Close failed', wx.OK | wx.ICON_ERROR)
+                    self._abort_failed_close(
+                        'Annotations could not be saved. Pinident remains open; '
+                        'use File → Save and try closing again.')
                     return
                 getLog().info('%d boxes saved to %s', self.count_boxes(),
                               self.box_data_filename)
@@ -2556,6 +2952,7 @@ class ScrubberFrame(wx.Frame):
             self._shutdown_reader_future.result()
             self._play_executor.shutdown(wait=False)
             self._sync_executor.shutdown(wait=False)
+            self._review_save_executor.shutdown(wait=False)
             if self._feedback_load_executor is not None:
                 self._feedback_load_executor.shutdown(wait=False)
             if self._shutdown_save_executor is not None:
@@ -2711,6 +3108,33 @@ class ScrubberFrame(wx.Frame):
         """Confirm pin presence without approving a suggested name."""
         self.confirm_boxes([box])
 
+    def classifier_review_restore_pin(self, box: BoxData) -> bool:
+        """Correct one negative crop into a positive pin-presence review."""
+        if (box.source != 'automatic' or box.review_state != 'rejected' or
+                all(existing is not box for existing in self.__current_boxes)):
+            return False
+        self.pause_playback()
+        self._begin_history()
+        box.track_id = uuid4().hex
+        box.prev_box_id = None
+        box.review_state = 'confirmed'
+        box.pin_id = None
+        box.tags = []
+        box.match_confidence = None
+        box.identity_confirmed = False
+        box.identity_inferred = False
+        box.feedback_id = box.feedback_id or uuid4().hex
+        box.feedback_label = 'positive'
+        self.__image_panel.boxes = self.__current_boxes
+        self.__tag_panel.boxes = self.__current_boxes
+        self.__image_panel.Refresh()
+        self._finish_history()
+        self.__matched_frames.discard(self._current_index)
+        self._schedule_catalog_match(
+            self._current_index, self.get_frame(self._current_index, 0), None,
+            target_box=box)
+        return True
+
     def confirm_boxes(self, selected: list[BoxData]) -> None:
         """Confirm multiple areas as pins in one undoable review."""
         self.pause_playback()
@@ -2730,7 +3154,6 @@ class ScrubberFrame(wx.Frame):
             box.identity_inferred = False
             box.feedback_id = box.feedback_id or uuid4().hex
             box.feedback_label = 'positive'
-        propagate_confirmations(self.__frame_boxes)
         self.__tag_panel.boxes = self.__current_boxes
         self.__image_panel.Refresh()
         self._finish_history()
@@ -2786,7 +3209,6 @@ class ScrubberFrame(wx.Frame):
             box.identity_inferred = False
             box.feedback_id = box.feedback_id or uuid4().hex
             box.feedback_label = 'positive'
-        propagate_confirmations(self.__frame_boxes)
         self.__tag_panel.boxes = self.__current_boxes
         self.__image_panel.Refresh()
         self._finish_history()
@@ -2801,6 +3223,14 @@ class ScrubberFrame(wx.Frame):
             return
         self._reject_pin_identities(box, [(box.pin_id, tuple(box.tags or []))],
                                     retry_catalog=True)
+
+    def classifier_review_reject_identity(self, box: BoxData) -> bool:
+        """Review this crop as a pin while recording its suggested ID as wrong."""
+        if not has_specific_identity(box):
+            return False
+        return self._reject_pin_identities(
+            box, [(box.pin_id, tuple(box.tags or []))], retry_catalog=True,
+            confirm_presence=True)
 
     def rank_pin_replacements(self, box: BoxData, limit: int = 10) -> list[PinMatch]:
         """Rank catalog choices for the visible rectangle without changing it."""
@@ -2860,7 +3290,6 @@ class ScrubberFrame(wx.Frame):
         box.identity_inferred = False
         box.feedback_id = box.feedback_id or uuid4().hex
         box.feedback_label = 'positive'
-        propagate_confirmations(self.__frame_boxes)
         self.__tag_panel.boxes = self.__current_boxes
         self.__image_panel.Refresh()
         self._finish_history()
@@ -2877,7 +3306,8 @@ class ScrubberFrame(wx.Frame):
 
     def _reject_pin_identities(self, box: BoxData,
                                candidates: list[tuple[str | None, tuple[str, ...]]],
-                               retry_catalog: bool) -> bool:
+                               retry_catalog: bool,
+                               confirm_presence: bool = False) -> bool:
         self.pause_playback()
         if (all(existing is not box for existing in self.__current_boxes) or
                 box.review_state == 'rejected'):
@@ -2902,6 +3332,12 @@ class ScrubberFrame(wx.Frame):
             return False
         stored_before = self._feedback_store.identity_rejection_count(self._feedback_source)
         self._begin_history()
+        if confirm_presence:
+            box.review_state = 'confirmed'
+            box.feedback_id = box.feedback_id or uuid4().hex
+            box.feedback_label = 'positive'
+            box.identity_confirmed = False
+            box.identity_inferred = False
         self._apply_identity_rejections(box, reviews)
         self.__matched_frames.discard(self._current_index)
         self.__image_panel.Refresh()

@@ -2,6 +2,9 @@
 
 This folder contains wxPython panels used by `scrubberframe.py`. Read the parent `AGENTS.md` first, then [../docs/PROJECT_SPEC.md](../docs/PROJECT_SPEC.md) for the current action/data contract and [../docs/IMPLEMENTATION_GUIDE.md](../docs/IMPLEMENTATION_GUIDE.md) for owner and worker boundaries.
 
+`classifierreviewdialog.py` displays each saved rectangle as an isolated source-image crop. Keep rejected **Not a pin** areas behind all remaining non-rejected areas, including when a review changes a later queued box. Its action availability comes from `classifier_review.py`; it calls `ScrubberFrame` review methods, queues idle background saves for JSON and feedback, and advances without waiting for worker follow-up or disk I/O. The dialog must not write `BoxData`, SQLite, or JSON directly. **Confirm identity** and Y use an explicitly selected catalog result or one exact search name/ID; with no selection or search they confirm the saved suggestion. A nonempty ambiguous search must not silently confirm the old suggestion. Keep Y/N shortcuts available outside the catalog search field. Report background save failures in the frame status and log; File → Save and normal close can retry.
+Keep detailed tooltips on **Pin only** and **Restore as pin** explaining their different feedback labels and identity effects.
+
 - Type panel callbacks, box data, and owner interfaces precisely. Do not use `typing.Any` or suppress Pylance warnings; resolve diagnostics at their cause and run the relevant Python checks.
 
 - Follow an annotation edit from input event to `BoxData`, frame ownership in `ScrubberFrame`, repaint, and JSON save/load. A panel-only change can appear correct while leaving the saved frame unchanged.

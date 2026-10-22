@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
 from unittest.mock import patch
@@ -8,6 +9,7 @@ import pytest
 import wx
 
 from boxdata import BoxData
+from detection_feedback import FeedbackStore
 from shutdown_progress import format_duration, remaining_seconds
 from videoscrubber import VideoScrubber
 
@@ -98,3 +100,45 @@ def test_failed_close_save_keeps_editor_open(tmp_path):
         assert window.IsShown()
     finally:
         window.Destroy()
+
+
+@pytest.mark.gui
+def test_close_flushes_pending_classifier_feedback_and_annotations(
+        tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    feedback_path = tmp_path / 'feedback.sqlite3'
+    annotations = tmp_path / 'video.json'
+    window = VideoScrubber(None, 'Close reviewed area', '',
+                           image_array=[np.zeros((60, 60, 3), dtype=np.uint8)],
+                           load_catalog=False, feedback_path=feedback_path)
+    window.box_data_filename = str(annotations)
+    window.Show()
+    wx.Yield()
+    box = BoxData((5, 5, 30, 30), [], 'automatic')
+    window._ScrubberFrame__frame_boxes[0] = [box]
+    window.display_image(reconcile=False, catalog_matching=False)
+    with window.classifier_review_action():
+        window.confirm_box(box)
+    assert window._feedback_store.counts()['positive'] == 0
+    closed = False
+    try:
+        window.Close()
+        deadline = monotonic() + 5
+        while window._shutdown_dialog is not None and monotonic() < deadline:
+            window._shutdown_tick()
+            wx.Yield()
+            sleep(0.01)
+        assert window._shutdown_dialog is None
+        closed = True
+        saved = json.loads(annotations.read_text(encoding='utf-8'))
+        assert saved['0'][0]['review_state'] == 'confirmed'
+        store = FeedbackStore(feedback_path)
+        try:
+            assert store.counts()['positive'] == 1
+        finally:
+            store.close()
+    finally:
+        if not closed:
+            if window._shutdown_dialog is not None:
+                window._shutdown_dialog.Destroy()
+            window.Destroy()

@@ -1,4 +1,5 @@
 from concurrent.futures import Future
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.error import URLError
@@ -73,3 +74,23 @@ def test_window_opens_with_early_resize_and_unavailable_cloud(tmp_path, capsys):
             window.Destroy()
             wx.Yield()
     assert 'AttributeError' not in capsys.readouterr().err
+
+
+@pytest.mark.gui
+def test_destroyed_window_ignores_queued_cloud_result(tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    with patch.object(ScrubberFrame, '_start_cloud_sync'):
+        window = VideoScrubber(
+            None, 'Queued sync', '',
+            image_array=[np.zeros((40, 60, 3), dtype=np.uint8)],
+            load_catalog=False, feedback_path=tmp_path / 'feedback.sqlite3')
+    window.Show()
+    future = Future()
+    future.set_exception(CloudSyncError('network unavailable'))
+    window._cloud_sync_future = future
+    window.Destroy()
+    wx.Yield()
+
+    window._finish_cloud_sync(future)
+    assert window._closing
+    assert app is not None
