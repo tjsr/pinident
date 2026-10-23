@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import wx
+from pathlib import Path
 from unittest.mock import patch
 
 from boxdata import BoxData
@@ -242,6 +243,39 @@ def test_catalog_picker_selects_result_with_mouse_click():
         assert box.pin_id == 'pinpanion:9'
     finally:
         frame.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_confirm_identity_uses_edited_catalog_pin_in_right_pane(tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    window = VideoScrubber(
+        None, 'Confirm edited catalog pin', '',
+        image_array=[np.full((90, 90, 3), 80, dtype=np.uint8)],
+        load_catalog=False, feedback_path=tmp_path / 'feedback.sqlite3')
+    try:
+        window.Show()
+        wx.Yield()
+        box = BoxData((10, 10, 50, 50), ['Wrong pin'], 'automatic',
+                      pin_id='pin-wrong')
+        window._ScrubberFrame__frame_boxes[0] = [box]
+        tags = window._ScrubberFrame__tag_panel
+        tags.set_catalog_options([
+            ('pin-wrong', 'Wrong pin'), ('pin-right', 'Right pin')])
+        window.display_image(reconcile=False, catalog_matching=False)
+        editor = tags.find_panel_for_box(box)
+        assert editor is not None
+        row = editor._BoxTagPanelEdit__box_tags[0]
+        picker = row._BoxTagLabelRow__text_entry
+        picker.SetValue('Right pin')
+        assert box.pin_id == 'pin-wrong'
+        button = editor.confirm_identity_button
+        button.ProcessEvent(wx.CommandEvent(wx.EVT_BUTTON.typeId, button.GetId()))
+        wx.Yield()
+        assert (box.tags, box.pin_id, box.identity_confirmed) == (
+            ['Right pin'], 'pin-right', True)
+    finally:
+        window.Destroy()
         wx.Yield()
 
 

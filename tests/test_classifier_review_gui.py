@@ -284,9 +284,10 @@ def test_review_mode_handles_negative_restore_and_catalog_choice(
 
 @pytest.mark.gui
 @pytest.mark.parametrize('selection_mode', [
-    'ranked', 'search', 'exact-search', 'partial-search'])
+    'ranked', 'search', 'exact-search', 'partial-search', 'ambiguous-search'])
+@pytest.mark.parametrize('confirmation', ['identity-button', 'selection-button'])
 def test_confirm_identity_uses_explicit_catalog_selection(
-        tmp_path: Path, selection_mode: str) -> None:
+        tmp_path: Path, selection_mode: str, confirmation: str) -> None:
     app = wx.App.Get() or wx.App(False)
     window = VideoScrubber(
         None, 'Correct suggested identity', '',
@@ -304,10 +305,13 @@ def test_confirm_identity_uses_explicit_catalog_selection(
             ('pin-wrong', 'Wrong pin'), ('pin-right', 'Right pin')])
         dialog.Show()
         wx.Yield()
-        if selection_mode in ('search', 'exact-search', 'partial-search'):
-            dialog._search.SetValue('Right' if selection_mode == 'partial-search'
-                                    else 'Right pin')
-            assert [choice.pin_id for choice in dialog._choices] == ['pin-right']
+        if selection_mode != 'ranked':
+            query = ('Right' if selection_mode == 'partial-search' else
+                     'pin' if selection_mode == 'ambiguous-search' else 'Right pin')
+            dialog._search.SetValue(query)
+            assert [choice.pin_id for choice in dialog._choices] == (
+                ['pin-wrong', 'pin-right'] if selection_mode == 'ambiguous-search'
+                else ['pin-right'])
             if selection_mode == 'search':
                 dialog._results.SetSelection(0)
             else:
@@ -319,12 +323,19 @@ def test_confirm_identity_uses_explicit_catalog_selection(
             dialog._results.SetItems(['Wrong pin', 'Right pin'])
             dialog._results.SetSelection(1)
 
-        if selection_mode == 'partial-search':
-            dialog._act('confirm_identity')
+        if selection_mode == 'ambiguous-search':
+            button = dialog._action_buttons[
+                'choose_identity' if confirmation == 'selection-button'
+                else 'confirm_identity']
+            button.ProcessEvent(wx.CommandEvent(wx.EVT_BUTTON.typeId, button.GetId()))
             assert box.pin_id == 'pin-wrong'
             assert dialog._position == 0
-            dialog._results.SetSelection(0)
-        dialog._act('confirm_identity')
+            dialog._results.SetSelection(1)
+        button = dialog._action_buttons[
+            'choose_identity' if confirmation == 'selection-button'
+            else 'confirm_identity']
+        button.ProcessEvent(wx.CommandEvent(wx.EVT_BUTTON.typeId, button.GetId()))
+        assert dialog._position == 1
         assert box.pin_id == 'pin-right'
         assert box.tags == ['Right pin']
         assert box.identity_confirmed

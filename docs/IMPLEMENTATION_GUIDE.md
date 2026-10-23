@@ -8,7 +8,7 @@ Read the root [AGENTS.md](../AGENTS.md) before edits, then the local `controls/A
 | --- | --- |
 | Desktop entry/media | `displayvideo.py` chooser; `videoscrubber.py` video and still-image frames; `scrubberframe.py` owner of frame data, actions, navigation, history coordination, JSON save/load, settings and training commands. |
 | GUI | `controlspanel.py`, `controls/imagepanel.py`, `controls/tagpanel.py`, `controls/BoxTagEditPanel.py`, `controls/boxtaglaberow.py`, `events/`; geometry in `controls/boxgeometry.py`. |
-| Saved-area review | `classifier_review.py` orders and classifies saved rectangles; `controls/classifierreviewdialog.py` displays isolated crops and resolves an explicit catalog selection or exact search before routing confirmation to `ScrubberFrame`. |
+| Saved-area review | `classifier_review.py` orders and classifies saved rectangles; `controls/classifierreviewdialog.py` displays isolated crops and resolves an explicit catalog selection or a search with one result before routing confirmation to `ScrubberFrame`. |
 | Detection and tracking | `pin_detection.py` proposals/association; `frame_processing.py` worker scheduling and result data; `frame_presence.py` frame assertions. |
 | Reviews and training | `detection_feedback.py` SQLite reviewed crops and nearest-neighbour ranker; `trained_detection_model.py` OpenCV pin/non-pin SVM; `mobile_model_features.py` feature parity; `export_mobile_model.py` static portable export. |
 | Catalog and sync | `pin_catalog.py` local references; `pinpanion_sync.py` public catalog import; `cloud_sync.py` desktop review/model HTTP sync; `settings_dialog.py` active paths/status and detection resolution. |

@@ -29,7 +29,7 @@ _KIND_LABELS = {
 _ACTION_TOOLTIPS = {
     'confirm_identity': (
         'Confirm the selected catalog result as this rectangle\'s pin identity. '
-        'An exact name or ID typed in the search field also selects that pin. '
+        'A search with one matching pin also selects that pin. '
         'With no selection or search, confirm the saved suggested identity. '
         'Correcting a suggestion records the old identity as a wrong-ID review.'),
     'confirm_pin': (
@@ -63,6 +63,7 @@ class ClassifierReviewDialog(wx.Dialog):
         self._position = 0
         self._current_area: ReviewArea | None = None
         self._choices: list[PinMatch] = []
+        self._choices_query = ''
         self._ranked: list[PinMatch] = []
         self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
 
@@ -201,6 +202,7 @@ class ClassifierReviewDialog(wx.Dialog):
         if area is None:
             return
         query = self._search.GetValue().strip().casefold()
+        self._choices_query = query
         if query:
             self._choices = [
                 PinMatch(pin_id, name, 0)
@@ -222,17 +224,19 @@ class ClassifierReviewDialog(wx.Dialog):
         match = self._selected_identity()
         if match is not None:
             self._act('choose_identity', match=match)
+        else:
+            self._status.SetLabel('Choose a catalog result or narrow the search to one pin.')
 
     def _selected_identity(self) -> PinMatch | None:
+        query = self._search.GetValue().strip().casefold()
+        if query != self._choices_query:
+            self._refresh_choices()
         selected = self._results.GetSelection()
         if 0 <= selected < len(self._choices):
             return self._choices[selected]
-        query = self._search.GetValue().strip().casefold()
         if not query:
             return None
-        exact = [match for match in self._choices
-                 if query in (match.name.casefold(), match.pin_id.casefold())]
-        return exact[0] if len(exact) == 1 else None
+        return self._choices[0] if len(self._choices) == 1 else None
 
     def _act(self, action: str, _event: wx.CommandEvent | None = None,
              *, match: PinMatch | None = None) -> None:
@@ -243,12 +247,14 @@ class ClassifierReviewDialog(wx.Dialog):
         selected_identity = self._selected_identity() if action == 'confirm_identity' else None
         if (action == 'confirm_identity' and selected_identity is None and
                 self._search.GetValue().strip()):
-            self._status.SetLabel('Select a catalog result before confirming this search.')
+            self._status.SetLabel('Choose a catalog result or narrow the search to one pin.')
             return
         with self._owner.classifier_review_action():
             if action == 'confirm_identity':
                 if selected_identity is not None:
-                    self._owner.replace_with_pin(box, selected_identity)
+                    if not self._owner.replace_with_pin(box, selected_identity):
+                        self._status.SetLabel('This catalog identity cannot be confirmed for this area.')
+                        return
                 else:
                     self._owner.confirm_pin_identity(box)
             elif action == 'reject_identity':
@@ -262,7 +268,9 @@ class ClassifierReviewDialog(wx.Dialog):
                 if not self._owner.classifier_review_restore_pin(box):
                     return
             elif action == 'choose_identity' and match is not None:
-                self._owner.replace_with_pin(box, match)
+                if not self._owner.replace_with_pin(box, match):
+                    self._status.SetLabel('This catalog identity cannot be confirmed for this area.')
+                    return
             else:
                 return
         self._owner.queue_review_save()

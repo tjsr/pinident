@@ -3265,13 +3265,13 @@ class ScrubberFrame(wx.Frame):
             return [current, *choices[:max(0, limit - 1)]]
         return choices
 
-    def replace_with_pin(self, box: BoxData, match: PinMatch) -> None:
+    def replace_with_pin(self, box: BoxData, match: PinMatch) -> bool:
         """Treat the user's menu choice as a direct identity confirmation."""
         self.pause_playback()
         if (all(existing is not box for existing in self.__current_boxes) or
                 box.review_state == 'rejected' or
                 rejects_identity(box, match.pin_id, [match.name])):
-            return
+            return False
         self._begin_history()
         if (has_specific_identity(box) and
                 (box.pin_id != match.pin_id or
@@ -3296,6 +3296,7 @@ class ScrubberFrame(wx.Frame):
         if any(self.__frame_boxes.get(neighbour)
                for neighbour in (self._current_index - 1, self._current_index + 1)):
             self._schedule_reconciliation(self._current_index)
+        return True
 
     def reject_pin_replacements(self, box: BoxData,
                                 matches: list[PinMatch]) -> bool:
