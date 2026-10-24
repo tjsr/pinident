@@ -5,6 +5,8 @@ from pathlib import Path
 
 import wx
 
+from false_positive_log import false_positive_path
+
 DETECTION_RESOLUTIONS = ('regular', 'low')
 _RESOLUTION_LABELS = ('Regular (full video resolution)',
                       'Low (faster; detect and track at 640 px)')
@@ -66,9 +68,13 @@ class SettingsDialog(wx.Dialog):
              'Downloaded portable model used when it is newer than the local classifier.'),
             ('annotations', 'Video annotations', annotations_path,
              'Frame boxes and direct review decisions are saved in this JSON file.'),
+            ('false_positives', 'Incorrect pin suggestions',
+             false_positive_path(str(annotations_path))
+             if annotations_path is not None else None,
+             'Directly rejected pin suggestions are logged beside the annotation file.'),
         ):
             location, status = (storage_location(path) if path is not None or
-                                key == 'annotations' else
+                                key in ('annotations', 'false_positives') else
                                 ('No persistent feedback database', 'No classifier file'))
             layout.Add(wx.StaticText(self, label=title), 0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
             field = wx.TextCtrl(self, value=location, style=wx.TE_READONLY)

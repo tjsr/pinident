@@ -10,7 +10,9 @@ import numpy as np
 import wx
 
 from boxdata import rejects_identity
-from classifier_review import ReviewArea, review_actions, review_kind
+from classifier_review import (ReviewArea, confirmed_identity_counts,
+                               incorrect_identity_counts, order_review_areas,
+                               review_actions, review_kind)
 from pin_catalog import PinMatch
 
 if TYPE_CHECKING:
@@ -28,10 +30,15 @@ _KIND_LABELS = {
 
 _ACTION_TOOLTIPS = {
     'confirm_identity': (
-        'Confirm the selected catalog result as this rectangle\'s pin identity. '
-        'A search with one matching pin also selects that pin. '
-        'With no selection or search, confirm the saved suggested identity. '
+        'With no catalog selection or search, confirm the identity shown under '
+        'Saved annotation. The Model best visual match is for comparison and '
+        'is not confirmed automatically. A selected catalog result or a search '
+        'with one matching pin is confirmed instead. '
         'Correcting a suggestion records the old identity as a wrong-ID review.'),
+    'choose_identity': (
+        'Confirm the selected catalog result, or the only result of a narrowed '
+        'search. This can replace the saved annotation. The Model best visual '
+        'match is not selected automatically.'),
     'confirm_pin': (
         'Confirm that this rectangle contains a pin in this frame, without '
         'confirming its suggested name or catalog ID. This records a positive '
@@ -62,6 +69,7 @@ class ClassifierReviewDialog(wx.Dialog):
         self._catalog_options = catalog_options
         self._position = 0
         self._current_area: ReviewArea | None = None
+        self._shown_pin_ids: dict[int, str | None] = {}
         self._choices: list[PinMatch] = []
         self._choices_query = ''
         self._ranked: list[PinMatch] = []
@@ -111,6 +119,7 @@ class ClassifierReviewDialog(wx.Dialog):
         layout.Add(self._results, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         choose = wx.Button(panel, label='Confirm selected catalog pin')
         choose.Bind(wx.EVT_BUTTON, self._on_choose)
+        choose.SetToolTip(_ACTION_TOOLTIPS['choose_identity'])
         layout.Add(choose, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         self._action_buttons['choose_identity'] = choose
 
@@ -134,16 +143,17 @@ class ClassifierReviewDialog(wx.Dialog):
         self.SetSizer(outer)
         self._show_position()
 
-    def _show_position(self) -> None:
+    def _show_position(self, *, resort: bool = True) -> None:
+        if resort:
+            remaining = self._areas[self._position:]
+            counts = confirmed_identity_counts(self._areas)
+            errors = incorrect_identity_counts(self._areas)
+            shown_ids = [pin_id for area in self._areas[:self._position]
+                         if (pin_id := self._shown_pin_ids.get(id(area))) is not None]
+            self._areas[self._position:] = order_review_areas(
+                remaining, counts, shown_ids, errors)
         while self._position < len(self._areas):
             area = self._areas[self._position]
-            if area.box.review_state == 'rejected' and any(
-                    later.box.review_state != 'rejected'
-                    for later in self._areas[self._position + 1:]):
-                # A review can reject linked future observations after the
-                # initial queue was built. Move those behind remaining work.
-                self._areas.append(self._areas.pop(self._position))
-                continue
             crop = self._owner.classifier_review_open(area)
             if crop is not None:
                 self._current_area = area
@@ -164,6 +174,7 @@ class ClassifierReviewDialog(wx.Dialog):
 
     def _render(self, area: ReviewArea, crop: np.ndarray) -> None:
         box = area.box
+        self._shown_pin_ids.setdefault(id(area), box.pin_id)
         self._position_label.SetLabel(
             f'Area {self._position + 1:,} of {len(self._areas):,}  |  '
             f'Frame {area.frame_index}  |  Rectangle {box.coords}')
@@ -172,14 +183,21 @@ class ClassifierReviewDialog(wx.Dialog):
         pin_id = f' [{box.pin_id}]' if box.pin_id else ''
         score = (f' ({box.match_confidence:.0%} match strength)'
                  if box.match_confidence is not None else '')
-        self._current_label.SetLabel(f'Saved annotation: {name}{pin_id}{score}')
+        self._current_label.SetLabel(
+            f'Saved annotation (Confirm identity default): {name}{pin_id}{score}')
+        self._current_label.SetToolTip(
+            'Confirm identity applies this saved identity when no catalog result '
+            'is selected and the search is empty.')
         self._ranked = self._owner.classifier_review_rank(crop, box)
         best = self._ranked[0] if self._ranked else None
         self._best_label.SetLabel(
-            f'Model best visual match: {best.name} [{best.pin_id}] '
+            f'Model best visual match (reference only): {best.name} [{best.pin_id}] '
             f'({best.confidence:.0%} match strength)'
             if best is not None and best.confidence is not None else
-            'Model best visual match: no eligible catalog reference')
+            'Model best visual match (reference only): no eligible catalog reference')
+        self._best_label.SetToolTip(
+            'This visual match is not applied by Confirm identity unless you '
+            'select it from the catalog results.')
         image = wx.Image(crop.shape[1], crop.shape[0], crop.tobytes())
         scale = min(520 / crop.shape[1], 400 / crop.shape[0])
         width = max(1, round(crop.shape[1] * scale))
@@ -280,7 +298,7 @@ class ClassifierReviewDialog(wx.Dialog):
     def _on_previous(self, _event: wx.CommandEvent) -> None:
         if self._position > 0:
             self._position -= 1
-            self._show_position()
+            self._show_position(resort=False)
 
     def _on_next(self, _event: wx.CommandEvent) -> None:
         self._position += 1

@@ -10,6 +10,7 @@ import wx
 from boxdata import BoxData
 from controls.classifierreviewdialog import ClassifierReviewDialog
 from detection_feedback import FeedbackExample
+from false_positive_log import load_false_positives
 from frame_presence import FramePresence
 from pin_catalog import PinMatch
 from scrubberframe import (load_boxes_from_file, save_boxes_to_file,
@@ -46,6 +47,138 @@ def test_review_mode_defers_boxes_rejected_after_queue_opened(tmp_path: Path) ->
         dialog._on_next(wx.CommandEvent())
         assert dialog._current_area is not None
         assert dialog._current_area.box is newly_rejected
+    finally:
+        if dialog is not None:
+            dialog.Destroy()
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_review_mode_starts_at_current_frame_and_defers_new_confirmations(
+        tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    frames = [np.full((80, 80, 3), value, dtype=np.uint8)
+              for value in (30, 60, 90)]
+    window = VideoScrubber(None, 'Current frame review', '', image_array=frames,
+                           load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    dialog: ClassifierReviewDialog | None = None
+    try:
+        window.Show()
+        wx.Yield()
+        before = BoxData((5, 5, 25, 25), [], 'automatic')
+        remaining = BoxData((35, 5, 25, 25), [], 'automatic')
+        current = BoxData((5, 5, 25, 25), [], 'automatic')
+        later = BoxData((5, 5, 25, 25), [], 'automatic')
+        window._ScrubberFrame__frame_boxes.update({
+            0: [before, remaining], 1: [current], 2: [later]})
+        window._current_index = 1
+        dialog = ClassifierReviewDialog(window, window.classifier_review_areas(), [])
+        dialog.Show()
+        wx.Yield()
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is current
+
+        dialog._on_next(wx.CommandEvent())
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is later
+        before.review_state = 'confirmed'
+        dialog._on_next(wx.CommandEvent())
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is remaining
+        dialog._on_next(wx.CommandEvent())
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is before
+    finally:
+        if dialog is not None:
+            dialog.Destroy()
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_review_mode_reorders_equal_scores_after_identity_confirmation(
+        tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    frames = [np.full((80, 80, 3), value, dtype=np.uint8)
+              for value in (30, 60, 90)]
+    window = VideoScrubber(None, 'Review rare pins next', '', image_array=frames,
+                           load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    window.box_data_filename = str(tmp_path / 'video.json')
+    dialog: ClassifierReviewDialog | None = None
+    try:
+        window.Show()
+        wx.Yield()
+        first_common = BoxData((5, 5, 30, 30), ['Common'], 'automatic',
+                               pin_id='pin-common', match_confidence=0.8)
+        next_common = BoxData((5, 5, 30, 30), ['Common'], 'automatic',
+                              pin_id='pin-common', match_confidence=0.8)
+        rare = BoxData((5, 5, 30, 30), ['Rare'], 'automatic',
+                       pin_id='pin-rare', match_confidence=0.8)
+        window._ScrubberFrame__frame_boxes.update({
+            0: [first_common], 1: [next_common], 2: [rare]})
+        dialog = ClassifierReviewDialog(window, window.classifier_review_areas(), [])
+        dialog.Show()
+        wx.Yield()
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is first_common
+
+        dialog._act('confirm_identity')
+        assert first_common.identity_confirmed
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is rare
+        dialog._on_previous(wx.CommandEvent())
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is first_common
+        dialog._on_next(wx.CommandEvent())
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is rare
+        dialog._on_next(wx.CommandEvent())
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is next_common
+    finally:
+        if dialog is not None:
+            dialog.Destroy()
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_review_mode_keeps_unseen_pin_ahead_of_repeat_after_skip(
+        tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    frames = [np.full((80, 80, 3), value, dtype=np.uint8)
+              for value in (30, 60, 90)]
+    window = VideoScrubber(None, 'Review each pin', '', image_array=frames,
+                           load_catalog=False,
+                           feedback_path=tmp_path / 'feedback.sqlite3')
+    window.box_data_filename = str(tmp_path / 'video.json')
+    dialog: ClassifierReviewDialog | None = None
+    try:
+        window.Show()
+        wx.Yield()
+        first_a = BoxData((5, 5, 30, 30), ['A'], 'automatic',
+                          pin_id='pin-a', match_confidence=0.99)
+        second_a = BoxData((5, 5, 30, 30), ['A'], 'automatic',
+                           pin_id='pin-a', match_confidence=0.98)
+        first_b = BoxData((5, 5, 30, 30), ['B'], 'automatic',
+                          pin_id='pin-b', match_confidence=0.97)
+        window._ScrubberFrame__frame_boxes.update({
+            0: [first_a], 1: [second_a], 2: [first_b]})
+        dialog = ClassifierReviewDialog(window, window.classifier_review_areas(), [])
+        dialog.Show()
+        wx.Yield()
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is first_a
+
+        dialog._on_next(wx.CommandEvent())
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is first_b
+        dialog._on_next(wx.CommandEvent())
+        assert dialog._current_area is not None
+        assert dialog._current_area.box is second_a
     finally:
         if dialog is not None:
             dialog.Destroy()
@@ -171,6 +304,10 @@ def test_review_mode_rejects_suggested_identity_but_keeps_positive_pin(
         assert saved.feedback_label == 'positive'
         assert [review.pin_id for review in saved.identity_rejections] == [
             'pin-wrong']
+        false_positives = load_false_positives(str(tmp_path / 'video.json'))
+        assert false_positives is not None
+        assert [(record.kind, record.pin_id) for record in false_positives] == [
+            ('wrong_identity', 'pin-wrong')]
         assert window._feedback_store.counts()['positive'] == 1
         assert window._feedback_store.identity_rejection_count(
             window._feedback_source) == 1
@@ -275,6 +412,52 @@ def test_review_mode_handles_negative_restore_and_catalog_choice(
             'rejected', 'confirmed', 'confirmed']
         assert [box.feedback_label for box in saved] == [
             'negative', 'positive', 'positive']
+    finally:
+        if dialog is not None:
+            dialog.Destroy()
+        window.Destroy()
+        wx.Yield()
+
+
+@pytest.mark.gui
+def test_confirm_identity_defaults_to_saved_annotation_not_model_best(
+        tmp_path: Path) -> None:
+    app = wx.App.Get() or wx.App(False)
+    window = VideoScrubber(
+        None, 'Confirm saved identity', '',
+        image_array=[np.full((90, 90, 3), 90, dtype=np.uint8)],
+        load_catalog=False, feedback_path=tmp_path / 'feedback.sqlite3')
+    window.box_data_filename = str(tmp_path / 'video.json')
+    dialog: ClassifierReviewDialog | None = None
+    try:
+        window.Show()
+        wx.Yield()
+        box = BoxData((10, 10, 50, 50), ['Saved pin'], 'automatic',
+                      pin_id='pin-saved', match_confidence=0.7)
+        window._ScrubberFrame__frame_boxes[0] = [box]
+        with patch.object(window, 'classifier_review_rank', return_value=[
+                PinMatch('pin-model', 'Model pin', 0, 0.95)]):
+            dialog = ClassifierReviewDialog(
+                window, window.classifier_review_areas(), [
+                    ('pin-saved', 'Saved pin'), ('pin-model', 'Model pin')])
+        dialog.Show()
+        wx.Yield()
+
+        assert 'Confirm identity default' in dialog._current_label.GetLabel()
+        assert 'Saved pin [pin-saved]' in dialog._current_label.GetLabel()
+        assert 'reference only' in dialog._best_label.GetLabel()
+        assert 'Model pin [pin-model]' in dialog._best_label.GetLabel()
+        assert 'not confirmed automatically' in dialog._action_buttons[
+            'confirm_identity'].GetToolTipText()
+        assert 'not selected automatically' in dialog._action_buttons[
+            'choose_identity'].GetToolTipText()
+        assert dialog._results.GetSelection() == wx.NOT_FOUND
+
+        button = dialog._action_buttons['confirm_identity']
+        button.ProcessEvent(wx.CommandEvent(wx.EVT_BUTTON.typeId, button.GetId()))
+        assert box.pin_id == 'pin-saved'
+        assert box.identity_confirmed
+        assert box.identity_rejections == ()
     finally:
         if dialog is not None:
             dialog.Destroy()

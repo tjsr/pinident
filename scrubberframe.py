@@ -17,6 +17,8 @@ import wx
 from boxdata import (BoxData, Coordinate, IdentityRejection, is_placeholder_tag,
                      has_specific_identity, rejects_identity, same_specific_name)
 from classifier_review import ReviewArea, saved_review_areas
+from false_positive_log import (collect_false_positives, false_positive_path,
+                                load_false_positives, write_false_positives)
 from annotation_history import BoxSnapshot, HistoryEntry, make_entry, snapshot
 from detection_feedback import (FeedbackExample, FeedbackModel, FeedbackStore,
                                 make_feedback_example)
@@ -108,6 +110,7 @@ def save_boxes_to_file(filename: str, frame_boxes: dict[int, list[BoxData]],
                        progress: Callable[[int], None] | None = None) -> None:
     """Replace the sidecar only after the complete JSON has reached disk."""
     temporary_name: str | None = None
+    log_temporary_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
                 mode='w', encoding='utf-8', delete=False,
@@ -120,14 +123,26 @@ def save_boxes_to_file(filename: str, frame_boxes: dict[int, list[BoxData]],
                 save_boxes_to_stream(stream, frame_boxes, presence, progress)
             stream.flush()
             os.fsync(stream.fileno())
+        with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', delete=False,
+                dir=os.path.dirname(os.path.abspath(filename)),
+                prefix='.pinident-errors-', suffix='.tmp') as stream:
+            log_temporary_name = stream.name
+            write_false_positives(stream, collect_false_positives(frame_boxes))
+            stream.flush()
+            os.fsync(stream.fileno())
         if progress:
             progress(95)
+        os.replace(log_temporary_name, false_positive_path(filename))
+        log_temporary_name = None
         os.replace(temporary_name, filename)
         if progress:
             progress(100)
     finally:
         if temporary_name is not None and os.path.exists(temporary_name):
             os.unlink(temporary_name)
+        if log_temporary_name is not None and os.path.exists(log_temporary_name):
+            os.unlink(log_temporary_name)
 
 
 def save_review_feedback(path: str, source: str,
@@ -644,6 +659,18 @@ class ScrubberFrame(wx.Frame):
         if self.box_data_filename and os.path.exists(self.box_data_filename):
             try:
                 boxes = load_boxes_from_file(self.box_data_filename)
+                try:
+                    saved_false_positives = load_false_positives(self.box_data_filename)
+                except (OSError, ValueError, TypeError, KeyError):
+                    getLog().exception('Could not load false-positive log for %s',
+                                       self.box_data_filename)
+                    saved_false_positives = None
+                current_false_positives = collect_false_positives(boxes)
+                if (saved_false_positives is not None and
+                        saved_false_positives != current_false_positives):
+                    getLog().warning(
+                        'False-positive log differs from annotations for %s; '
+                        'current direct reviews take precedence', self.box_data_filename)
                 self._invalidate_reconciliation()
                 self._frame_presence = load_presence_from_file(self.box_data_filename)
                 self.__frame_boxes = filter_zero_sized_boxes(boxes)
@@ -2327,7 +2354,7 @@ class ScrubberFrame(wx.Frame):
                 f'Reviewed areas saved to {os.path.basename(filename)}', 1)
 
     def classifier_review_areas(self) -> list[ReviewArea]:
-        return saved_review_areas(self.__frame_boxes)
+        return saved_review_areas(self.__frame_boxes, self._current_index)
 
     @contextmanager
     def classifier_review_action(self) -> Iterator[None]:

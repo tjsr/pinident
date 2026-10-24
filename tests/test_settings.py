@@ -73,6 +73,8 @@ def test_settings_dialog_shows_copyable_paths_and_feedback_status(tmp_path):
             (tmp_path / 'catalog.sqlite3').resolve())
         assert dialog.locations['annotations'].GetValue() == str(
             (tmp_path / 'video.json').resolve())
+        assert dialog.locations['false_positives'].GetValue() == str(
+            (tmp_path / 'video.false_positive_pins.json').resolve())
         assert dialog.locations['model'].GetValue() == str(
             (tmp_path / 'feedback.svm.yml').resolve())
         assert dialog.locations['model_metadata'].GetValue() == str(
