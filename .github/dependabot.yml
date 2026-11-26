@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: 'npm'
+    directory: '/mobile_web'
+    schedule:
+      interval: 'daily'
+    groups:
+      development:
+        applies-to: version-updates
+        dependency-type: development
+        patterns:
+          - '*'
